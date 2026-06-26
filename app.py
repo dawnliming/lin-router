@@ -82,6 +82,9 @@ class RequestLog:
     status: str
     detail: str = ""
     duration_ms: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 class ConfigStore:
@@ -244,8 +247,28 @@ class ArkProxyRouter:
         self.store = store
         self.logs: List[RequestLog] = []
 
-    def add_log(self, path: str, model: str, status: str, detail: str = "", duration_ms: int = 0) -> None:
-        self.logs.insert(0, RequestLog(self._now(), path, model, status, detail[:300], duration_ms))
+    def add_log(
+        self,
+        path: str,
+        model: str,
+        status: str,
+        detail: str = "",
+        duration_ms: int = 0,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+    ) -> None:
+        self.logs.insert(0, RequestLog(
+            self._now(),
+            path,
+            model,
+            status,
+            detail[:300],
+            duration_ms,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        ))
         del self.logs[80:]
 
     def recent_logs(self) -> List[Dict[str, str]]:
@@ -257,9 +280,19 @@ class ArkProxyRouter:
     def export_logs_csv(self) -> str:
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["time", "path", "model", "status", "duration_ms", "detail"])
+        writer.writerow(["time", "path", "model", "status", "duration_ms", "prompt_tokens", "completion_tokens", "total_tokens", "detail"])
         for item in self.logs:
-            writer.writerow([item.time, item.path, item.model, item.status, item.duration_ms, item.detail])
+            writer.writerow([
+                item.time,
+                item.path,
+                item.model,
+                item.status,
+                item.duration_ms,
+                item.prompt_tokens,
+                item.completion_tokens,
+                item.total_tokens,
+                item.detail,
+            ])
         return output.getvalue()
 
     @staticmethod
@@ -303,6 +336,20 @@ class ArkProxyRouter:
         if suffix.startswith("v1/"):
             suffix = suffix[3:]
         return f"{base}/{suffix}"
+
+    @staticmethod
+    def _usage_from_response(data: bytes) -> Tuple[int, int, int]:
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except Exception:
+            return 0, 0, 0
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        if not isinstance(usage, dict):
+            return 0, 0, 0
+        prompt_tokens = int(usage.get("prompt_tokens") or 0)
+        completion_tokens = int(usage.get("completion_tokens") or 0)
+        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+        return prompt_tokens, completion_tokens, total_tokens
 
     def default_model(self) -> Optional[ModelConfig]:
         return next((m for m in self.store.models if m.usable), None)
@@ -376,8 +423,18 @@ class ArkProxyRouter:
                 with urlopen(request, timeout=120) as resp:
                     data = resp.read()
                     duration_ms = int((time.perf_counter() - started_at) * 1000)
+                    prompt_tokens, completion_tokens, total_tokens = self._usage_from_response(data)
                     self._set_success(idx)
-                    self.add_log(path, model.name, str(resp.status), f"hit={model.ep_id}; requested={requested_label}; ok", duration_ms)
+                    self.add_log(
+                        path,
+                        model.name,
+                        str(resp.status),
+                        f"hit={model.ep_id}; requested={requested_label}; ok",
+                        duration_ms,
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                    )
                     return resp.status, dict(resp.headers.items()), data
             except HTTPError as err:
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
@@ -393,8 +450,18 @@ class ArkProxyRouter:
                         with urlopen(request, timeout=120) as resp:
                             data = resp.read()
                             retry_duration_ms = int((time.perf_counter() - retry_started_at) * 1000)
+                            prompt_tokens, completion_tokens, total_tokens = self._usage_from_response(data)
                             self._set_success(idx)
-                            self.add_log(path, model.name, str(resp.status), f"hit={model.ep_id}; requested={requested_label}; retry ok", retry_duration_ms)
+                            self.add_log(
+                                path,
+                                model.name,
+                                str(resp.status),
+                                f"hit={model.ep_id}; requested={requested_label}; retry ok",
+                                retry_duration_ms,
+                                prompt_tokens,
+                                completion_tokens,
+                                total_tokens,
+                            )
                             return resp.status, dict(resp.headers.items()), data
                     except Exception as retry_err:
                         last_error = retry_err
@@ -567,7 +634,7 @@ PAGE_HTML = r"""<!doctype html>
       <div>
         <h2>Hermes 接入</h2>
         <div class="heroUrl" id="hermesUrl">加载中...</div>
-        <div class="muted tiny" style="margin-top:8px">Base URL 填这里；API Key 填 lin-router 表示全局调度；填连接组卡片里的 Key 表示只调度该组模型。</div>
+        <div class="muted tiny" style="margin-top:8px">Base URL 填这里；API Key 必须填右侧连接组里的 Hermes Key，请求会严格按 Key 限定到对应连接组。</div>
       </div>
       <button type="button" id="copyHermesBtn">复制地址</button>
     </section>
@@ -668,7 +735,7 @@ PAGE_HTML = r"""<!doctype html>
           <button type="button" id="exportLogsBtn">导出 CSV</button>
         </div>
         <table>
-          <thead><tr><th>时间</th><th>模型</th><th>状态</th><th>耗时</th><th>详情</th></tr></thead>
+          <thead><tr><th>时间</th><th>模型</th><th>状态</th><th>耗时</th><th>Token</th><th>详情</th></tr></thead>
           <tbody id="logTbody"></tbody>
         </table>
         </div>
@@ -702,6 +769,17 @@ PAGE_HTML = r"""<!doctype html>
     }
     function selectedModelId() {
       return $('testModel').value || (state.auto_model_name || AUTO_MODEL_NAME);
+    }
+    function selectedRouteKey() {
+      const selected = $('testModel').value;
+      if (selected && selected !== (state.auto_model_name || AUTO_MODEL_NAME)) {
+        const model = state.models.find(m => m.name === selected || m.ep_id === selected || m.id === selected);
+        const group = state.groups.find(g => g.id === model?.group_id);
+        return group?.route_key || '';
+      }
+      const firstUsable = state.models.find(m => m.usable);
+      const group = state.groups.find(g => g.id === firstUsable?.group_id) || state.groups[0];
+      return group?.route_key || '';
     }
     function applyTestTemplate() {
       const model = selectedModelId();
@@ -859,9 +937,10 @@ PAGE_HTML = r"""<!doctype html>
           <td>${esc(item.model)}</td>
           <td><span class="pill ${logStatusClass(item.status)}">${esc(item.status)}</span></td>
           <td class="tiny">${Number(item.duration_ms || 0) ? `${Number(item.duration_ms)} ms` : '-'}</td>
+          <td class="tiny">${Number(item.total_tokens || 0) ? `入 ${Number(item.prompt_tokens || 0)} / 出 ${Number(item.completion_tokens || 0)} / 总 ${Number(item.total_tokens || 0)}` : '-'}</td>
           <td class="tiny resultText" title="${esc(item.detail)}">${esc(item.detail)}</td>
         </tr>
-      `).join('') || '<tr><td colspan="5" class="muted">暂无请求</td></tr>';
+      `).join('') || '<tr><td colspan="6" class="muted">暂无请求</td></tr>';
     }
     async function mutate(url, body, method='POST') {
       const resp = await fetch(url, { method, headers:{'Content-Type':'application/json'}, body: method === 'DELETE' ? undefined : JSON.stringify(body) });
@@ -898,8 +977,9 @@ PAGE_HTML = r"""<!doctype html>
         const payload = JSON.parse($('proxyBody').value);
         const selectedModel = $('testModel').value;
         if (selectedModel && selectedModel !== (state.auto_model_name || AUTO_MODEL_NAME)) payload.model = selectedModel;
+        const routeKey = selectedRouteKey();
         const startedAt = performance.now();
-        const resp = await fetch($('proxyPath').value, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+        const resp = await fetch($('proxyPath').value, { method:'POST', headers:{'Content-Type':'application/json', 'Authorization':`Bearer ${routeKey}`}, body:JSON.stringify(payload) });
         const text = await resp.text();
         const elapsed = Math.round(performance.now() - startedAt);
         log(`HTTP ${resp.status} · ${elapsed} ms\n${formatResponse(text)}`);
@@ -961,9 +1041,22 @@ class RouterHandler(BaseHTTPRequestHandler):
         if not auth.lower().startswith("bearer "):
             return None
         key = auth.split(" ", 1)[1].strip()
-        if not key or key == DEFAULT_PUBLIC_API_KEY:
+        if not key:
             return None
         return self.store.find_group_by_route_key(key)
+
+    def _require_route_group(self) -> Optional[ConnectionGroup]:
+        group = self._route_group()
+        if group:
+            return group
+        self._send_json({
+            "error": {
+                "message": "Missing or invalid Lin Router group API key",
+                "type": "invalid_request_error",
+                "code": "invalid_api_key",
+            }
+        }, status=401)
+        return None
 
     def _visible_models(self, group: Optional[ConnectionGroup]) -> List[ModelConfig]:
         return [
@@ -978,8 +1071,10 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._send_text(PAGE_HTML, content_type="text/html; charset=utf-8")
             return
         if parsed.path in {"/v1/models", "/models"}:
-            group = self._route_group()
-            auto_model_name = self.router.group_auto_model_name(group) if group else DEFAULT_AUTO_MODEL_NAME
+            group = self._require_route_group()
+            if not group:
+                return
+            auto_model_name = DEFAULT_AUTO_MODEL_NAME
             self._send_json({
                 "object": "list",
                 "data": [
@@ -993,8 +1088,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                         "parent": None,
                         "display_name": auto_model_name,
                         "router_virtual": True,
-                        "group_id": group.id if group else "",
-                        "group_name": group.name if group else "全部连接组",
+                        "group_id": group.id,
+                        "group_name": group.name,
                     },
                     *[
                     {
@@ -1124,7 +1219,9 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             return
         if parsed.path == "/api/test":
-            group = self._route_group()
+            group = self._require_route_group()
+            if not group:
+                return
             payload = self._read_json()
             path = str(payload.get("path", "/v1/chat/completions"))
             body = payload.get("body") or {"messages": [{"role": "user", "content": "ping"}]}
@@ -1135,7 +1232,9 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_text(str(err), status=500)
             return
         if parsed.path.startswith("/v1/") or parsed.path.startswith("/chat/"):
-            group = self._route_group()
+            group = self._require_route_group()
+            if not group:
+                return
             payload = self._read_json()
             stream = bool(payload.get("stream"))
             try:
