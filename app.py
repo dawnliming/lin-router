@@ -418,34 +418,42 @@ PAGE_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lin Router</title>
+  <title>Lin Router Hermes</title>
   <style>
-    :root { color-scheme: light; --bg:#f6f7fb; --panel:#ffffff; --line:#d7dce7; --text:#18212f; --muted:#5a6475; --accent:#2358ff; --danger:#c62828; }
+    :root { color-scheme: light; --bg:#f5f7fb; --panel:#fff; --line:#d6dce8; --text:#18212f; --muted:#5b6575; --accent:#2358ff; --danger:#c62828; --ok:#16794c; --warn:#a15c00; }
     * { box-sizing: border-box; }
-    body { margin: 0; font: 14px/1.5 system-ui, -apple-system, Segoe UI, Arial, sans-serif; background: var(--bg); color: var(--text); }
-    header { padding: 18px 22px; background: #fff; border-bottom: 1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    h1 { margin:0; font-size: 18px; }
-    .wrap { padding: 18px; display:grid; gap: 18px; grid-template-columns: 360px 1fr; }
-    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 14px; }
-    .panel h2 { margin: 0 0 12px; font-size: 15px; }
-    label { display:block; margin: 10px 0 6px; color: var(--muted); }
-    input, textarea, select, button { font: inherit; }
-    input, textarea, select { width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; background: #fff; color: var(--text); }
-    textarea { min-height: 108px; resize: vertical; }
-    button { border: 1px solid var(--line); background: #fff; color: var(--text); border-radius: 6px; padding: 8px 10px; cursor: pointer; }
-    button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-    button.danger { color: var(--danger); }
-    .row { display:flex; gap:8px; flex-wrap: wrap; }
-    .row > * { flex: 1 1 auto; }
-    table { width:100%; border-collapse: collapse; }
-    th, td { padding: 9px 8px; border-bottom: 1px solid var(--line); text-align:left; vertical-align: top; }
-    th { color: var(--muted); font-weight: 600; }
-    td.actions { white-space: nowrap; }
-    .muted { color: var(--muted); }
-    .status { padding: 10px 12px; background:#f1f4ff; border:1px solid #cad4ff; border-radius:6px; margin-bottom: 12px; }
-    .log { white-space: pre-wrap; background:#0f172a; color:#d9e2ff; border-radius:6px; padding:12px; min-height:140px; max-height:280px; overflow:auto; }
-    .tiny { font-size: 12px; }
-    @media (max-width: 980px) { .wrap { grid-template-columns: 1fr; } }
+    body { margin:0; font:14px/1.5 system-ui, -apple-system, Segoe UI, Arial, sans-serif; background:var(--bg); color:var(--text); }
+    header { height:58px; padding:0 22px; display:flex; align-items:center; justify-content:space-between; background:#fff; border-bottom:1px solid var(--line); }
+    h1 { margin:0; font-size:18px; }
+    h2 { margin:0 0 12px; font-size:15px; }
+    .shell { padding:18px; display:grid; grid-template-columns:360px 1fr; gap:18px; }
+    .main { display:grid; gap:18px; }
+    .side { display:grid; gap:18px; align-content:start; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:14px; }
+    .hero { grid-column:1 / -1; display:grid; grid-template-columns:1fr auto; gap:16px; align-items:center; }
+    .heroUrl { padding:10px 12px; border:1px solid #c8d2ff; background:#f1f4ff; border-radius:6px; font-family:Consolas, monospace; }
+    label { display:block; margin:10px 0 6px; color:var(--muted); }
+    input, textarea, select, button { font:inherit; }
+    input, textarea, select { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px 10px; background:#fff; color:var(--text); }
+    textarea { min-height:104px; resize:vertical; }
+    button { border:1px solid var(--line); background:#fff; color:var(--text); border-radius:6px; padding:8px 10px; cursor:pointer; }
+    button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+    button.danger { color:var(--danger); }
+    .row { display:flex; gap:8px; flex-wrap:wrap; }
+    .row > * { flex:1 1 auto; }
+    .muted { color:var(--muted); }
+    .tiny { font-size:12px; }
+    .status { padding:10px 12px; background:#f1f4ff; border:1px solid #cad4ff; border-radius:6px; margin-bottom:12px; }
+    .groupList { display:grid; gap:8px; margin-top:10px; }
+    .groupItem { border:1px solid var(--line); border-radius:6px; padding:10px; display:grid; gap:6px; }
+    table { width:100%; border-collapse:collapse; }
+    th, td { padding:9px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { color:var(--muted); font-weight:600; }
+    td.actions { white-space:nowrap; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#edf7f1; color:var(--ok); font-size:12px; }
+    .pill.off { background:#fff3e6; color:var(--warn); }
+    .log { white-space:pre-wrap; background:#0f172a; color:#d9e2ff; border-radius:6px; padding:12px; min-height:120px; max-height:260px; overflow:auto; }
+    @media (max-width: 980px) { .shell { grid-template-columns:1fr; } .hero { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
@@ -453,116 +461,113 @@ PAGE_HTML = r"""<!doctype html>
     <h1>Lin Router Hermes</h1>
     <div class="muted tiny" id="serverInfo"></div>
   </header>
-  <div class="wrap">
-    <section class="panel">
-      <h2>Hermes 接入</h2>
-      <div class="status" id="hermesUrl">加载中...</div>
-      <div class="muted tiny">Hermes 里填这个 OpenAI 兼容地址；API Key 可填任意非空值，比如 lin-router；模型可留空，代理会自动按列表顺序选择可用模型。</div>
+  <div class="shell">
+    <section class="panel hero">
+      <div>
+        <h2>Hermes 接入</h2>
+        <div class="heroUrl" id="hermesUrl">加载中...</div>
+        <div class="muted tiny" style="margin-top:8px">Base URL 填这里；API Key 可填 lin-router；模型可留空，由路由器自动选择可用模型。</div>
+      </div>
+      <button type="button" id="copyHermesBtn">复制地址</button>
     </section>
-    <section class="panel">
-      <h2>连接组</h2>
-      <form id="groupForm">
-        <input type="hidden" id="groupId">
-        <label>组名</label>
-        <input id="groupName" placeholder="默认组">
-        <label>Base URL</label>
-        <input id="groupBase" placeholder="https://ark.cn-beijing.volces.com/api/v3">
-        <label>Ark API Key</label>
-        <input id="groupKey" type="password" placeholder="sk-xxxx">
-        <div class="row" style="margin-top:12px">
-          <button class="primary" type="submit">保存组</button>
-          <button type="button" id="toggleKeyBtn">显示 Key</button>
-        </div>
-      </form>
-      <div class="muted tiny" style="margin-top:10px">第 1 步：同一个 base/key 只建一次组，下面的多个模型复用它。</div>
-    </section>
-    <section class="panel">
-      <h2>模型配置</h2>
-      <form id="modelForm">
-        <input type="hidden" id="modelId">
-        <label>名称</label>
-        <input id="name" placeholder="DeepSeek">
-        <label>EP ID</label>
-        <input id="epId" placeholder="ep-xxxx">
+
+    <aside class="side">
+      <section class="panel">
+        <h2>连接组</h2>
+        <form id="groupForm">
+          <input type="hidden" id="groupId">
+          <label>组名</label>
+          <input id="groupName" placeholder="默认组">
+          <label>Base URL</label>
+          <input id="groupBase" placeholder="https://ark.cn-beijing.volces.com/api/v3">
+          <label>Ark API Key</label>
+          <input id="groupKey" type="password" placeholder="sk-xxxx">
+          <div class="row" style="margin-top:12px">
+            <button class="primary" type="submit">保存组</button>
+            <button type="button" id="toggleKeyBtn">显示 Key</button>
+          </div>
+        </form>
+        <div class="muted tiny" style="margin-top:10px">同一个 base/key 只需要建一次，多个模型可以共用。</div>
+        <div class="groupList" id="groupList"></div>
+      </section>
+
+      <section class="panel">
+        <h2>模型配置</h2>
+        <form id="modelForm">
+          <input type="hidden" id="modelId">
+          <label>名称</label>
+          <input id="name" placeholder="DeepSeek">
+          <label>EP ID</label>
+          <input id="epId" placeholder="ep-xxxx">
+          <label>连接组</label>
+          <select id="groupPick"></select>
+          <div class="row" style="margin-top:12px">
+            <button class="primary" type="submit">保存模型</button>
+            <button type="button" id="resetBtn">全部恢复可用</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2>批量导入</h2>
         <label>连接组</label>
-        <select id="groupPick"></select>
+        <select id="batchGroupPick"></select>
+        <label>模型列表</label>
+        <textarea id="batchModels" placeholder="模型名称,ep-xxxx&#10;另一个模型,ep-yyyy"></textarea>
         <div class="row" style="margin-top:12px">
-          <button class="primary" type="submit">保存模型</button>
-          <button type="button" id="resetBtn">全部恢复可用</button>
+          <button class="primary" type="button" id="batchImportBtn">批量导入模型</button>
         </div>
-      </form>
-      <div class="muted tiny" style="margin-top:10px">第 2 步：新增模型时只填名称、EP ID，并选择上面的连接组。</div>
-    </section>
-    <section class="panel">
-      <h2>批量导入</h2>
-      <label>连接组</label>
-      <select id="batchGroupPick"></select>
-      <label>模型列表</label>
-      <textarea id="batchModels" placeholder="模型名称,ep-xxxx&#10;另一个模型,ep-yyyy"></textarea>
-      <div class="row" style="margin-top:12px">
-        <button class="primary" type="button" id="batchImportBtn">批量导入模型</button>
-      </div>
-    </section>
-    <section class="panel">
-      <h2>模型列表</h2>
-      <div class="status" id="summaryBox">加载中...</div>
-      <table>
-        <thead>
-          <tr>
-            <th>名称</th>
-            <th>EP</th>
-            <th>组</th>
-            <th>状态</th>
-            <th>最近结果</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody id="modelTbody"></tbody>
-      </table>
-    </section>
-    <section class="panel">
-      <h2>代理测试</h2>
-      <label>测试模型</label>
-      <select id="testModel"></select>
-      <label>请求路径</label>
-      <input id="proxyPath" value="/v1/chat/completions">
-      <label>请求体</label>
-      <textarea id="proxyBody">{ "messages": [{"role":"user","content":"hello"}], "temperature": 0.2 }</textarea>
-      <div class="row" style="margin-top:12px">
-        <button class="primary" type="button" id="sendTest">发送测试</button>
-      </div>
-    </section>
-    <section class="panel">
-      <h2>返回结果</h2>
-      <div class="log" id="logBox">等待操作。</div>
-    </section>
-    <section class="panel">
-      <h2>最近请求</h2>
-      <div class="row" style="margin-bottom:10px">
-        <button type="button" id="clearLogsBtn">清空日志</button>
-        <button type="button" id="exportLogsBtn">导出 CSV</button>
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>时间</th>
-            <th>模型</th>
-            <th>状态</th>
-            <th>详情</th>
-          </tr>
-        </thead>
-        <tbody id="logTbody"></tbody>
-      </table>
-    </section>
+      </section>
+    </aside>
+
+    <main class="main">
+      <section class="panel">
+        <h2>模型列表</h2>
+        <div class="status" id="summaryBox">加载中...</div>
+        <table>
+          <thead><tr><th>优先级</th><th>名称</th><th>EP</th><th>组</th><th>状态</th><th>最近结果</th><th>操作</th></tr></thead>
+          <tbody id="modelTbody"></tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <h2>代理测试</h2>
+        <label>测试模型</label>
+        <select id="testModel"></select>
+        <label>请求路径</label>
+        <input id="proxyPath" value="/v1/chat/completions">
+        <label>请求体</label>
+        <textarea id="proxyBody">{ "messages": [{"role":"user","content":"hello"}], "temperature": 0.2 }</textarea>
+        <div class="row" style="margin-top:12px"><button class="primary" type="button" id="sendTest">发送测试</button></div>
+      </section>
+
+      <section class="panel">
+        <h2>返回结果</h2>
+        <div class="log" id="logBox">等待操作。</div>
+      </section>
+
+      <section class="panel">
+        <h2>最近请求</h2>
+        <div class="row" style="margin-bottom:10px">
+          <button type="button" id="clearLogsBtn">清空日志</button>
+          <button type="button" id="exportLogsBtn">导出 CSV</button>
+        </div>
+        <table>
+          <thead><tr><th>时间</th><th>模型</th><th>状态</th><th>详情</th></tr></thead>
+          <tbody id="logTbody"></tbody>
+        </table>
+      </section>
+    </main>
   </div>
   <script>
     const $ = (id) => document.getElementById(id);
-    let state = { groups: [], models: [] };
+    let state = { groups: [], models: [], logs: [] };
     function log(text) { $('logBox').textContent = text; }
     function esc(text) { return String(text ?? '').replace(/[&<>"']/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[s])); }
     function fillGroupPick() {
-      $('groupPick').innerHTML = state.groups.map(g => `<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('');
-      $('batchGroupPick').innerHTML = state.groups.map(g => `<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('');
+      const groupOptions = state.groups.map(g => `<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('');
+      $('groupPick').innerHTML = groupOptions;
+      $('batchGroupPick').innerHTML = groupOptions;
       $('testModel').innerHTML = ['<option value="">自动选择第一个可用模型</option>']
         .concat(state.models.map(m => `<option value="${esc(m.ep_id)}">${esc(m.name)} · ${esc(m.ep_id)}</option>`))
         .join('');
@@ -573,6 +578,27 @@ PAGE_HTML = r"""<!doctype html>
       $('groupBase').value = g?.base_url || '';
       $('groupKey').value = g?.ark_api_key || '';
     }
+    function fillForm(m) {
+      $('modelId').value = m?.id || '';
+      $('name').value = m?.name || '';
+      $('epId').value = m?.ep_id || '';
+      $('groupPick').value = m?.group_id || (state.groups[0]?.id || '');
+    }
+    function renderGroups() {
+      $('groupList').innerHTML = state.groups.map(g => `
+        <div class="groupItem">
+          <strong>${esc(g.name)}</strong>
+          <div class="tiny muted">${esc(g.base_url)}</div>
+          <div class="tiny muted">Key: ${g.ark_api_key ? '已填写' : '未填写'}</div>
+          <div class="row">
+            <button type="button" data-group-edit="${g.id}">编辑</button>
+            <button type="button" class="danger" data-group-del="${g.id}">删除</button>
+          </div>
+        </div>
+      `).join('') || '<div class="muted">暂无连接组</div>';
+      document.querySelectorAll('[data-group-edit]').forEach(btn => btn.onclick = () => fillGroupForm(state.groups.find(x => x.id === btn.dataset.groupEdit)));
+      document.querySelectorAll('[data-group-del]').forEach(btn => btn.onclick = () => mutate(`/api/groups/${btn.dataset.groupDel}`, {}, 'DELETE'));
+    }
     async function refresh() {
       const resp = await fetch('/api/state');
       state = await resp.json();
@@ -580,13 +606,14 @@ PAGE_HTML = r"""<!doctype html>
       $('hermesUrl').textContent = `${location.origin}/v1`;
       $('summaryBox').textContent = `组 ${state.groups.length} · 模型 ${state.models.length} · 可用 ${state.models.filter(m => m.usable).length}`;
       fillGroupPick();
-      const groupRows = state.groups.map(g => `<button type="button" data-group-edit="${g.id}">编辑 ${esc(g.name)}</button> <button type="button" class="danger" data-group-del="${g.id}">删除</button>`).join(' ');
-      $('modelTbody').innerHTML = state.models.map(m => `
+      renderGroups();
+      $('modelTbody').innerHTML = state.models.map((m, index) => `
         <tr>
+          <td>${index + 1}</td>
           <td>${esc(m.name)}</td>
           <td class="tiny">${esc(m.ep_id)}</td>
           <td class="tiny">${esc((state.groups.find(g => g.id === m.group_id) || {}).name || '-')}</td>
-          <td>${m.usable ? '可用' : '停用'}</td>
+          <td><span class="pill ${m.usable ? '' : 'off'}">${m.usable ? '可用' : '停用'}</span></td>
           <td class="tiny">${esc(m.last_error || m.last_success_at || '-')}</td>
           <td class="actions">
             <button type="button" data-edit="${m.id}">编辑</button>
@@ -598,88 +625,42 @@ PAGE_HTML = r"""<!doctype html>
         </tr>
       `).join('');
       document.querySelectorAll('[data-edit]').forEach(btn => btn.onclick = () => fillForm(state.models.find(x => x.id === btn.dataset.edit)));
-      document.querySelectorAll('[data-move-up]').forEach(btn => btn.onclick = () => mutate(`/api/models/${btn.dataset.moveUp}/move`, {direction: 'up'}));
-      document.querySelectorAll('[data-move-down]').forEach(btn => btn.onclick = () => mutate(`/api/models/${btn.dataset.moveDown}/move`, {direction: 'down'}));
+      document.querySelectorAll('[data-move-up]').forEach(btn => btn.onclick = () => mutate(`/api/models/${btn.dataset.moveUp}/move`, {direction:'up'}));
+      document.querySelectorAll('[data-move-down]').forEach(btn => btn.onclick = () => mutate(`/api/models/${btn.dataset.moveDown}/move`, {direction:'down'}));
       document.querySelectorAll('[data-toggle]').forEach(btn => btn.onclick = () => mutate(`/api/models/${btn.dataset.toggle}/toggle`, {}));
       document.querySelectorAll('[data-del]').forEach(btn => btn.onclick = () => mutate(`/api/models/${btn.dataset.del}`, {}, 'DELETE'));
-      document.querySelector('#groupForm + .muted').innerHTML = `第 1 步：同一个 base/key 只建一次组，下面的多个模型复用它。<br>${groupRows}`;
-      document.querySelectorAll('[data-group-edit]').forEach(btn => btn.onclick = () => fillGroupForm(state.groups.find(x => x.id === btn.dataset.groupEdit)));
-      document.querySelectorAll('[data-group-del]').forEach(btn => btn.onclick = () => mutate(`/api/groups/${btn.dataset.groupDel}`, {}, 'DELETE'));
       $('logTbody').innerHTML = (state.logs || []).map(item => `
-        <tr>
-          <td class="tiny">${esc(item.time)}</td>
-          <td>${esc(item.model)}</td>
-          <td>${esc(item.status)}</td>
-          <td class="tiny">${esc(item.detail)}</td>
-        </tr>
+        <tr><td class="tiny">${esc(item.time)}</td><td>${esc(item.model)}</td><td>${esc(item.status)}</td><td class="tiny">${esc(item.detail)}</td></tr>
       `).join('') || '<tr><td colspan="4" class="muted">暂无请求</td></tr>';
     }
-    function fillForm(m) {
-      $('modelId').value = m?.id || '';
-      $('name').value = m?.name || '';
-      $('epId').value = m?.ep_id || '';
-      $('groupPick').value = m?.group_id || (state.groups[0]?.id || '');
-    }
     async function mutate(url, body, method='POST') {
-      const resp = await fetch(url, {
-        method,
-        headers: {'Content-Type':'application/json'},
-        body: method === 'DELETE' ? undefined : JSON.stringify(body),
-      });
+      const resp = await fetch(url, { method, headers:{'Content-Type':'application/json'}, body: method === 'DELETE' ? undefined : JSON.stringify(body) });
       const text = await resp.text();
       if (!resp.ok) throw new Error(text || resp.statusText);
       await refresh();
       log(text || 'ok');
     }
+    $('copyHermesBtn').onclick = async () => { await navigator.clipboard.writeText($('hermesUrl').textContent); log('Hermes 地址已复制'); };
     $('groupForm').onsubmit = async (e) => {
       e.preventDefault();
-      await mutate('/api/groups', {
-        id: $('groupId').value || undefined,
-        name: $('groupName').value.trim(),
-        base_url: $('groupBase').value.trim() || undefined,
-        ark_api_key: $('groupKey').value.trim(),
-      });
-      $('groupId').value = '';
-      $('groupName').value = '';
-      $('groupBase').value = '';
-      $('groupKey').value = '';
+      await mutate('/api/groups', { id:$('groupId').value || undefined, name:$('groupName').value.trim(), base_url:$('groupBase').value.trim() || undefined, ark_api_key:$('groupKey').value.trim() });
+      fillGroupForm(null);
     };
     $('modelForm').onsubmit = async (e) => {
       e.preventDefault();
-      await mutate('/api/models', {
-        id: $('modelId').value || undefined,
-        name: $('name').value.trim(),
-        ep_id: $('epId').value.trim(),
-        group_id: $('groupPick').value,
-      });
-      $('modelId').value = '';
-      $('name').value = '';
-      $('epId').value = '';
+      await mutate('/api/models', { id:$('modelId').value || undefined, name:$('name').value.trim(), ep_id:$('epId').value.trim(), group_id:$('groupPick').value });
+      fillForm(null);
     };
     $('resetBtn').onclick = async () => mutate('/api/reset', {});
     $('clearLogsBtn').onclick = async () => mutate('/api/logs/clear', {});
     $('exportLogsBtn').onclick = () => { location.href = '/api/logs/export'; };
-    $('batchImportBtn').onclick = async () => {
-      await mutate('/api/models/batch', {
-        group_id: $('batchGroupPick').value,
-        text: $('batchModels').value,
-      });
-      $('batchModels').value = '';
-    };
-    $('toggleKeyBtn').onclick = () => {
-      const input = $('groupKey');
-      input.type = input.type === 'password' ? 'text' : 'password';
-      $('toggleKeyBtn').textContent = input.type === 'password' ? '显示 Key' : '隐藏 Key';
-    };
+    $('batchImportBtn').onclick = async () => { await mutate('/api/models/batch', { group_id:$('batchGroupPick').value, text:$('batchModels').value }); $('batchModels').value = ''; };
+    $('toggleKeyBtn').onclick = () => { const input = $('groupKey'); input.type = input.type === 'password' ? 'text' : 'password'; $('toggleKeyBtn').textContent = input.type === 'password' ? '显示 Key' : '隐藏 Key'; };
     $('sendTest').onclick = async () => {
       const payload = JSON.parse($('proxyBody').value);
       const selectedModel = $('testModel').value;
       if (selectedModel) payload.model = selectedModel;
-      const resp = await fetch($('proxyPath').value, {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify(payload),
-      });
+      const resp = await fetch($('proxyPath').value, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
       const text = await resp.text();
       log(`HTTP ${resp.status}\n${text}`);
     };
