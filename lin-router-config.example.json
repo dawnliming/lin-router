@@ -1,0 +1,21 @@
+{
+  "groups": [
+    {
+      "id": "example-group-id",
+      "name": "default",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "ark_api_key": "sk-xxxx",
+      "route_key": "lr-example-route-key"
+    }
+  ],
+  "models": [
+    {
+      "id": "example-model-id",
+      "name": "DeepSeek",
+      "ep_id": "ep-xxxx",
+      "group_id": "example-group-id",
+      "usable": true
+    }
+  ],
+  "logs": []
+}
