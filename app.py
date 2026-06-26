@@ -1322,6 +1322,23 @@ def pick_port(start_port: int, host: str) -> int:
     raise RuntimeError(f"No free port found in range {start_port}-{start_port + MAX_PORT_SCAN - 1}")
 
 
+def create_server(
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_START_PORT,
+    config: str | Path = DEFAULT_CONFIG_FILE,
+) -> Tuple[ThreadingHTTPServer, int, Path]:
+    config_path = Path(config)
+    ensure_sample_config(config_path)
+    store = ConfigStore(config_path)
+    router = ArkProxyRouter(store)
+    selected_port = pick_port(port, host)
+
+    server = ThreadingHTTPServer((host, selected_port), RouterHandler)
+    server.store = store  # type: ignore[attr-defined]
+    server.router = router  # type: ignore[attr-defined]
+    return server, selected_port, config_path.resolve()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Lin Router proxy UI")
     parser.add_argument("--host", default="127.0.0.1")
@@ -1329,18 +1346,10 @@ def main() -> None:
     parser.add_argument("--config", default=DEFAULT_CONFIG_FILE)
     args = parser.parse_args()
 
-    config_path = Path(args.config)
-    ensure_sample_config(config_path)
-    store = ConfigStore(config_path)
-    router = ArkProxyRouter(store)
-    port = pick_port(args.port, args.host)
-
-    server = ThreadingHTTPServer((args.host, port), RouterHandler)
-    server.store = store  # type: ignore[attr-defined]
-    server.router = router  # type: ignore[attr-defined]
+    server, port, config_path = create_server(args.host, args.port, args.config)
 
     print(f"Lin Router running on http://{args.host}:{port}")
-    print(f"Config file: {config_path.resolve()}")
+    print(f"Config file: {config_path}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
