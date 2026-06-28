@@ -1331,7 +1331,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             ark_api_key=source.ark_api_key,
             api_key=source.api_key,
             route_key=new_route_key(),
-            auto_model_cooldown_minutes=source.auto_model_cooldown_minutes,
+            auto_model_cooldown_minutes=source.auto_model_cooldown_minutes if source.provider_type == PROVIDER_RELAY else 0,
             waf_compatible=source.waf_compatible,
             auto_sticky_model_id="",
             upstream_models=[dict(item) for item in source.upstream_models],

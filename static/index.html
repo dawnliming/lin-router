@@ -255,6 +255,13 @@
     }
 
     function statusInfo(m) {
+      const group = state.groups.find(g => g.id === m.group_id);
+      if (group?.provider_type !== "relay") {
+        if (!m.usable) return { text:"停用", cls:"off", detail:m.last_error ? "额度耗尽或手动停用" : "手动停用" };
+        if (m.last_error) return { text:"异常", cls:"bad", detail:m.last_error };
+        if (m.last_success_at) return { text:"可用", cls:"", detail:`最近成功 ${m.last_success_at}` };
+        return { text:"待测", cls:"off", detail:"尚未成功调用" };
+      }
       if (m.cooldown_until) {
         const until = new Date(Number(m.cooldown_until) * 1000);
         return { text:"冷却", cls:"off", detail:`冷却至 ${until.toLocaleString("zh-CN")}` };
@@ -556,7 +563,7 @@
             </span>
           </div></summary>
           <div class="modelGroupBody">
-            <div class="tiny muted" style="margin:10px 0">自动模型：${esc(meta.auto_model_name)} - 本地 Key：${esc(group.route_key)} - 冷却：${esc(group.auto_model_cooldown_minutes ?? 5)} 分钟 - WAF：${group.waf_compatible ? "开启" : "关闭"}</div>
+            <div class="tiny muted" style="margin:10px 0">自动模型：${esc(meta.auto_model_name)} - 本地 Key：${esc(group.route_key)}${group.provider_type === "relay" ? ` - 冷却：${esc(group.auto_model_cooldown_minutes ?? 5)} 分钟 - WAF：${group.waf_compatible ? "开启" : "关闭"}` : ""}</div>
             <table class="modelTable">
               <thead><tr><th>优先级</th><th>名称</th><th>上游模型</th><th>通道</th><th>状态</th><th>最近结果</th><th>操作</th></tr></thead>
               <tbody>${rows || '<tr><td colspan="7" class="muted">该连接组暂无模型</td></tr>'}</tbody>
