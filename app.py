@@ -459,6 +459,8 @@ class ArkProxyRouter:
     def __init__(self, store: ConfigStore) -> None:
         self.store = store
         self.logs: List[RequestLog] = []
+        self.upstream_locks: Dict[str, threading.Lock] = {}
+        self.upstream_locks_guard = threading.Lock()
 
     def add_log(
         self,
@@ -866,6 +868,22 @@ class ArkProxyRouter:
             channel=channel,
         )
 
+    def _candidate_lock(self, candidate: UpstreamCandidate) -> Optional[threading.Lock]:
+        if candidate.group.provider_type != PROVIDER_RELAY or not candidate.group.waf_compatible:
+            return None
+        key = f"{candidate.group.id}:{candidate.target_model}:{candidate.channel}"
+        with self.upstream_locks_guard:
+            lock = self.upstream_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self.upstream_locks[key] = lock
+            return lock
+
+    @staticmethod
+    def _release_lock(lock: Optional[threading.Lock]) -> None:
+        if lock:
+            lock.release()
+
     def _iter_upstream_candidates(self, requested_model: str | None, group_id: str | None = None) -> Iterator[UpstreamCandidate]:
         if group_id:
             group = self.store.find_group(group_id)
@@ -990,6 +1008,9 @@ class ArkProxyRouter:
                 continue
             body, body_mode = self._body_for_upstream(payload, raw_body, str(requested_model) if requested_model else None, candidate.target_model)
             outbound_headers = self._headers_for(group, candidate.auth_key, incoming_headers, stream=False)
+            upstream_lock = self._candidate_lock(candidate)
+            if upstream_lock:
+                upstream_lock.acquire()
             request = Request(
                 target_url,
                 data=body,
@@ -1075,6 +1096,8 @@ class ArkProxyRouter:
                 detail = f"error={self._short_error(str(err))}"
                 self.add_log(path, candidate.label, "network", self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms)
                 continue
+            finally:
+                self._release_lock(upstream_lock)
 
         if last_error is None:
             raise RuntimeError("No usable models available")
@@ -1099,6 +1122,9 @@ class ArkProxyRouter:
                 continue
             body, body_mode = self._body_for_upstream(payload, raw_body, str(requested_model) if requested_model else None, candidate.target_model)
             outbound_headers = self._headers_for(group, candidate.auth_key, incoming_headers, stream=True)
+            upstream_lock = self._candidate_lock(candidate)
+            if upstream_lock:
+                upstream_lock.acquire()
             request = Request(
                 target_url,
                 data=body,
@@ -1127,9 +1153,11 @@ class ArkProxyRouter:
                     finally:
                         resp.close()
                         self.update_latest_stream_usage(path, candidate.label, latest_usage)
+                        self._release_lock(upstream_lock)
 
                 return 200, dict(resp.headers.items()), iterator()
             except HTTPError as err:
+                self._release_lock(upstream_lock)
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 raw = err.read().decode("utf-8", "ignore") if hasattr(err, "read") else str(err)
                 last_error = err
@@ -1154,6 +1182,7 @@ class ArkProxyRouter:
                 self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms)
                 return err.code, headers, [raw.encode("utf-8")]
             except (URLError, TimeoutError, OSError) as err:
+                self._release_lock(upstream_lock)
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 last_error = err
                 if relay_auto_mode:
