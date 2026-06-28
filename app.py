@@ -100,6 +100,7 @@ class ConnectionGroup:
     api_key: str = ""
     route_key: str = ""
     upstream_models: List[Dict[str, Any]] = field(default_factory=list)
+    upstream_models_fetched_at: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ConnectionGroup":
@@ -112,6 +113,7 @@ class ConnectionGroup:
             api_key=str(data.get("api_key") or ""),
             route_key=str(data.get("route_key") or ""),
             upstream_models=[item for item in data.get("upstream_models", []) if isinstance(item, dict)] if isinstance(data.get("upstream_models", []), list) else [],
+            upstream_models_fetched_at=str(data.get("upstream_models_fetched_at") or ""),
         )
 
 
@@ -1009,6 +1011,10 @@ class RouterHandler(BaseHTTPRequestHandler):
             if group.provider_type not in {PROVIDER_RELAY, PROVIDER_PROXY}:
                 model.upstream_model = ""
             self.store.upsert_model(model)
+            if group.provider_type in {PROVIDER_RELAY, PROVIDER_PROXY}:
+                group.upstream_models = []
+                group.upstream_models_fetched_at = ""
+                self.store.upsert_group(group)
             self._send_json({"ok": True, "model": asdict(model)})
             return
         if parsed.path == "/api/models/batch":
@@ -1079,6 +1085,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                     "root": str(item.get("root") or item.get("id") or ep_id).strip(),
                 })
             group.upstream_models = candidates
+            group.upstream_models_fetched_at = self.router._now()
             self.store.upsert_group(group)
             self._send_json({
                 "ok": True,

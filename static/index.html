@@ -54,8 +54,6 @@
     .modelGroupActions { display:flex; gap:6px; flex-wrap:nowrap; font-weight:400; overflow-x:auto; }
     .modelGroupActions button { padding:5px 8px; font-size:12px; line-height:1.2; }
     .modelGroupBody { padding:0 14px 12px; overflow:auto; }
-    .groupModelPickRow { display:flex; gap:10px; align-items:end; margin:10px 0 12px; }
-    .groupModelPickRow .field { flex:1 1 260px; min-width:220px; }
     details.panel { padding:0; }
     details.panel > summary { padding:14px; cursor:pointer; font-weight:700; list-style:none; border-bottom:1px solid var(--line); }
     details.panel > .panelBody { padding:14px; }
@@ -269,6 +267,7 @@
 
     function groupUpstreamModels(groupId) {
       const group = state.groups.find(g => g.id === groupId);
+      if (!group?.upstream_models_fetched_at) return [];
       return Array.isArray(group?.upstream_models) ? group.upstream_models : [];
     }
 
@@ -357,7 +356,18 @@
       $("apiKey").value = model?.api_key || "";
       $("priceGroup").value = model?.price_group || "";
       $("epId").value = model?.ep_id || "";
-      syncModelModeUI(model?.upstream_model || model?.ep_id || "");
+      syncModelModeUI(model?.upstream_model || "");
+    }
+
+    function resetModelForm() {
+      $("modelId").value = "";
+      $("name").value = "";
+      $("apiKey").value = "";
+      $("priceGroup").value = "";
+      $("epId").value = "";
+      $("upstreamModelPick").innerHTML = "";
+      $("upstreamModelPick").value = "";
+      syncModelModeUI("");
     }
 
     function syncGroupModeUI() {
@@ -381,10 +391,9 @@
       $("modelPriceWrap").style.display = relay ? "" : "none";
       $("fetchUpstreamBtn").style.display = (relay || proxy) ? "" : "none";
       if (relay || proxy) {
-        const currentValue = preferredUpstream || $("epId").value || "";
+        const currentValue = preferredUpstream || "";
         $("upstreamModelPick").innerHTML = renderModelOptions(group?.id || "", currentValue);
-        if (currentValue) $("upstreamModelPick").value = currentValue;
-        if ($("upstreamModelPick").value) $("epId").value = $("upstreamModelPick").value;
+        $("upstreamModelPick").value = currentValue;
       }
       if (proxy) $("modelModeHint").textContent = "通用代理可自动拉取上游模型列表，也可以手动维护本地映射。";
       else if (relay) $("modelModeHint").textContent = "中转站模式下可从上游自动获取模型并批量导入当前连接组。";
@@ -438,12 +447,6 @@
       document.querySelectorAll("[data-copy-client]").forEach(btn => btn.onclick = async (event) => {
         event.stopPropagation();
         await copyClientConfig(btn.dataset.copyClient);
-      });
-      document.querySelectorAll("[data-group-model-pick]").forEach(select => select.onchange = (event) => {
-        event.stopPropagation();
-        const group = state.groups.find(x => x.id === select.dataset.groupModelPick);
-        const model = state.models.find(x => x.group_id === group?.id && x.ep_id === select.value);
-        if (model) fillModelForm(model);
       });
       document.querySelectorAll("[data-group-test]").forEach(btn => btn.onclick = (event) => {
         event.stopPropagation();
@@ -516,12 +519,6 @@
           </div></summary>
           <div class="modelGroupBody">
             <div class="tiny muted" style="margin:10px 0">自动模型：${esc(meta.auto_model_name)} - 本地 Key：${esc(group.route_key)} - 调度范围由 Key 决定。</div>
-            <div class="groupModelPickRow">
-              <div class="field">
-                <label style="margin-top:0">上游模型</label>
-                <select data-group-model-pick="${group.id}">${renderModelOptions(group.id, "")}</select>
-              </div>
-            </div>
             <table class="modelTable">
               <thead><tr><th>优先级</th><th>名称</th><th>上游模型</th><th>通道</th><th>状态</th><th>最近结果</th><th>操作</th></tr></thead>
               <tbody>${rows || '<tr><td colspan="7" class="muted">该连接组暂无模型</td></tr>'}</tbody>
@@ -555,7 +552,7 @@
       if (!$("batchGroupPick").value && state.groups[0]) $("batchGroupPick").value = state.groups[0].id;
       if (!$("testGroup").value && state.groups[0]) $("testGroup").value = state.groups[0].id;
       syncGroupModeUI();
-      syncModelModeUI($("epId").value);
+      syncModelModeUI("");
       renderTestModels($("testModel").value);
       renderModels();
       $("logTbody").innerHTML = (state.logs || []).map(item => `<tr>
@@ -566,13 +563,6 @@
         <td class="tiny">${Number(item.total_tokens || 0) ? `入 ${Number(item.prompt_tokens || 0)} / 出 ${Number(item.completion_tokens || 0)} / 总 ${Number(item.total_tokens || 0)}` : "-"}</td>
         <td class="tiny resultText" title="${esc(item.detail)}">${esc(item.detail)}</td>
       </tr>`).join("") || '<tr><td colspan="6" class="muted">暂无请求</td></tr>';
-    }
-
-    async function refreshUpstreamModelPick() {
-      const group = currentModelGroup();
-      if (!group) return;
-      $("upstreamModelPick").innerHTML = renderModelOptions(group.id, $("upstreamModelPick").value || $("epId").value || "");
-      $("upstreamModelPick").value = $("upstreamModelPick").value || $("epId").value || "";
     }
 
     async function mutate(url, body, method="POST") {
@@ -608,16 +598,14 @@
     };
 
     $("groupProvider").onchange = syncGroupModeUI;
-    $("groupPick").onchange = () => syncModelModeUI($("epId").value);
-    $("upstreamModelPick").onchange = () => {
-      $("epId").value = $("upstreamModelPick").value;
-    };
+    $("groupPick").onchange = () => resetModelForm();
+    $("upstreamModelPick").onchange = () => {};
 
     $("modelForm").onsubmit = async (e) => {
       e.preventDefault();
       const group = currentModelGroup();
       const usePicker = group && ["relay", "proxy"].includes(group.provider_type);
-      const upstreamModel = usePicker ? ($("upstreamModelPick").value.trim() || $("epId").value.trim()) : $("epId").value.trim();
+      const upstreamModel = usePicker ? $("upstreamModelPick").value.trim() : $("epId").value.trim();
       await mutate("/api/models", {
         id:$("modelId").value || undefined,
         name:$("name").value.trim(),
@@ -627,7 +615,7 @@
         price_group:$("priceGroup").value.trim(),
         upstream_model: upstreamModel,
       });
-      fillModelForm(null);
+      resetModelForm();
     };
 
     $("resetBtn").onclick = async () => mutate("/api/reset", {});
@@ -638,22 +626,30 @@
         log("只有中转站或通用代理模式才能自动获取模型");
         return;
       }
-      const resp = await fetch("/api/models/fetch-upstream", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        body: JSON.stringify({
-          group_id: group.id,
-          api_key: $("apiKey").value.trim() || $("groupKey").value.trim(),
-        }),
-      });
-      const text = await resp.text();
-      if (!resp.ok) {
-        log(text || resp.statusText);
-        return;
+      const btn = $("fetchUpstreamBtn");
+      const oldText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "获取中...";
+      try {
+        const resp = await fetch("/api/models/fetch-upstream", {
+          method:"POST",
+          headers:{ "Content-Type":"application/json" },
+          body: JSON.stringify({
+            group_id: group.id,
+            api_key: $("apiKey").value.trim() || $("groupKey").value.trim(),
+          }),
+        });
+        const text = await resp.text();
+        if (!resp.ok) {
+          log(text || resp.statusText);
+          return;
+        }
+        await refresh();
+        log(text || "ok");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = oldText;
       }
-      await refresh();
-      await refreshUpstreamModelPick();
-      log(text || "ok");
     };
 
     $("clearLogsBtn").onclick = async () => mutate("/api/logs/clear", {});
