@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -46,14 +46,24 @@
     .muted { color:var(--muted); }
     .tiny { font-size:12px; }
     .status { padding:10px 12px; background:#f1f4ff; border:1px solid #cad4ff; border-radius:6px; margin-bottom:12px; }
-    .modelGroups { display:grid; gap:10px; }
-    .modelGroup { border:1px solid var(--line); border-radius:6px; background:#fff; overflow:hidden; }
-    .modelGroup > summary { padding:12px 14px; cursor:pointer; list-style:none; font-weight:700; background:#f8faff; border-bottom:1px solid var(--line); }
-    .modelGroup > summary::-webkit-details-marker, details.panel > summary::-webkit-details-marker { display:none; }
-    .modelGroupSummary { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-    .modelGroupActions { display:flex; gap:6px; flex-wrap:nowrap; font-weight:400; overflow-x:auto; }
-    .modelGroupActions button { padding:5px 8px; font-size:12px; line-height:1.2; }
-    .modelGroupBody { padding:0 14px 12px; overflow:auto; }
+    .groupList { display:grid; gap:12px; }
+    .groupCard { border:1px solid var(--line); border-radius:6px; background:#fff; overflow:hidden; }
+    .groupCardHead { padding:12px 14px; border-bottom:1px solid var(--line); background:#f8faff; display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+    .groupCardTitle { display:flex; flex-direction:column; gap:4px; min-width:0; }
+    .groupCardTitle strong { font-size:15px; }
+    .groupCardMeta { display:flex; flex-wrap:wrap; gap:8px; }
+    .groupCardActions { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
+    .groupCardActions button { padding:5px 8px; font-size:12px; line-height:1.2; }
+    .groupCardBody { padding:12px 14px 14px; }
+    .groupInfoGrid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:8px 14px; margin-bottom:12px; }
+    .groupInfoItem { min-width:0; }
+    .groupInfoItem .label { color:var(--muted); font-size:12px; margin-bottom:2px; }
+    .groupInfoItem .value { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .groupModels { display:grid; gap:10px; }
+    .groupModels details { border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+    .groupModels summary { list-style:none; cursor:pointer; padding:10px 12px; background:#fff; font-weight:600; }
+    .groupModels summary::-webkit-details-marker { display:none; }
+    .groupModels .modelTableWrap { padding:0 12px 12px; overflow:auto; }
     details.panel { padding:0; }
     details.panel > summary { padding:14px; cursor:pointer; font-weight:700; list-style:none; border-bottom:1px solid var(--line); }
     details.panel > .panelBody { padding:14px; }
@@ -63,9 +73,11 @@
     .modelTable th:nth-child(4), .modelTable td:nth-child(4) { width:12%; }
     .modelTable th:nth-child(5), .modelTable td:nth-child(5) { width:86px; }
     .modelTable th:nth-child(6), .modelTable td:nth-child(6) { width:auto; }
-    .modelTable th:nth-child(7), .modelTable td:nth-child(7) { width:330px; }
+    .modelTable th:nth-child(7), .modelTable td:nth-child(7) { width:300px; }
     .actionGroup { display:flex; align-items:center; gap:5px; flex-wrap:nowrap; overflow-x:auto; padding-bottom:1px; }
     .actionGroup button { padding:5px 8px; font-size:12px; line-height:1.2; min-width:42px; }
+    .sectionHeading { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px; }
+    .sectionHeading h2 { margin:0; }
     .pill { display:inline-block; padding:2px 7px; border-radius:999px; background:#edf7f1; color:var(--ok); font-size:12px; line-height:1.3; }
     .pill.off { background:#fff3e6; color:var(--warn); }
     .pill.bad { background:#fff0f0; color:var(--bad); }
@@ -115,7 +127,7 @@
               <input id="groupCooldownMinutes" type="number" min="0" step="1" value="5">
             </div>
             <div id="groupWafWrap" style="display:none; margin-top:10px">
-              <label><input id="groupWafCompatible" type="checkbox" style="width:auto"> Hermes / WAF 兼容</label>
+              <label><input id="groupWafCompatible" type="checkbox" style="width:auto"> 仅中转站 WAF 兼容</label>
             </div>
             <div class="row" style="margin-top:12px">
               <button class="primary" type="submit">保存组</button>
@@ -387,6 +399,10 @@
       $("priceGroup").value = model?.price_group || "";
       $("epId").value = model?.ep_id || "";
       syncModelModeUI(model?.upstream_model || "");
+      if (currentModelGroup()?.provider_type === "ark") {
+        $("upstreamModelPick").innerHTML = "";
+        $("upstreamModelPick").value = "";
+      }
     }
 
     function resetModelForm() {
@@ -428,7 +444,7 @@
         $("upstreamModelPick").value = currentValue;
       }
       if (proxy) $("modelModeHint").textContent = "通用代理可自动拉取上游模型列表，也可以手动维护本地映射。";
-      else if (relay) $("modelModeHint").textContent = "中转站模式下可从上游自动获取模型并批量导入当前连接组。";
+      else if (relay) $("modelModeHint").textContent = "中转站模式下可从上游自动获取模型并填入当前连接组的下拉框。";
       else $("modelModeHint").textContent = "火山方舟模式下，上游模型填写 EP ID。";
     }
 
@@ -550,27 +566,49 @@
         const meta = groupMeta(group.id);
         const models = groupModels(group.id).map((m, idx) => ({ ...m, __index: idx }));
         const rows = models.map(m => modelRow(m)).join("");
-        return `<details class="modelGroup" open>
-          <summary><div class="modelGroupSummary">
-            <span>${esc(group.name)} - ${providerLabel(group)} - 模型 ${meta.model_count} - 可用 ${meta.usable_count}</span>
-            <span class="modelGroupActions">
-              <button type="button" data-group-test="${group.id}">测试自动</button>
-              <button type="button" data-copy-client="${group.id}">复制 Hermes 配置</button>
-              <button type="button" data-group-clone="${group.id}">复制组</button>
-              <button type="button" data-group-edit="${group.id}">编辑组</button>
-              <button type="button" data-copy-key="${group.id}">复制 Key</button>
-              <button type="button" class="danger" data-group-del="${group.id}">删除组</button>
-            </span>
-          </div></summary>
-          <div class="modelGroupBody">
-            <div class="tiny muted" style="margin:10px 0">自动模型：${esc(meta.auto_model_name)} - 本地 Key：${esc(group.route_key)}${group.provider_type === "relay" ? ` - 冷却：${esc(group.auto_model_cooldown_minutes ?? 5)} 分钟 - WAF：${group.waf_compatible ? "开启" : "关闭"}` : ""}</div>
-            <table class="modelTable">
-              <thead><tr><th>优先级</th><th>名称</th><th>上游模型</th><th>通道</th><th>状态</th><th>最近结果</th><th>操作</th></tr></thead>
-              <tbody>${rows || '<tr><td colspan="7" class="muted">该连接组暂无模型</td></tr>'}</tbody>
-            </table>
+        return `<div class="groupCard">
+          <div class="groupCardHead">
+            <div class="groupCardTitle">
+              <strong>${esc(group.name)}</strong>
+              <div class="groupCardMeta tiny muted">
+                <span>${esc(providerLabel(group))}</span>
+                <span>\u6a21\u578b ${meta.model_count}</span>
+                <span>\u53ef\u7528 ${meta.usable_count}</span>
+                <span>\u81ea\u52a8\u6a21\u578b ${esc(meta.auto_model_name)}</span>
+              </div>
+            </div>
+            <div class="groupCardActions">
+              <button type="button" data-group-test="${group.id}">\u6d4b\u8bd5\u81ea\u52a8</button>
+              <button type="button" data-copy-client="${group.id}">\u590d\u5236 Hermes \u914d\u7f6e</button>
+              <button type="button" data-group-clone="${group.id}">\u590d\u5236\u7ec4</button>
+              <button type="button" data-group-edit="${group.id}">\u7f16\u8f91\u7ec4</button>
+              <button type="button" data-copy-key="${group.id}">\u590d\u5236 Key</button>
+              <button type="button" class="danger" data-group-del="${group.id}">\u5220\u9664\u7ec4</button>
+            </div>
           </div>
-        </details>`;
-      }).join("") || '<div class="muted">暂无连接组</div>';
+          <div class="groupCardBody">
+            <div class="groupInfoGrid tiny">
+              <div class="groupInfoItem"><div class="label">Base URL</div><div class="value" title="${esc(group.base_url)}">${esc(group.base_url)}</div></div>
+              <div class="groupInfoItem"><div class="label">\u672c\u5730 Key</div><div class="value" title="${esc(group.route_key)}">${esc(group.route_key)}</div></div>
+              <div class="groupInfoItem"><div class="label">\u6a21\u5f0f</div><div class="value">${esc(providerLabel(group))}</div></div>
+              <div class="groupInfoItem"><div class="label">\u72b6\u6001</div><div class="value">${group.provider_type === "relay" ? "\u652f\u6301\u81ea\u52a8\u51b7\u5374" : "\u6807\u51c6\u8def\u7531"}</div></div>
+              <div class="groupInfoItem"><div class="label">\u8bf4\u660e</div><div class="value">${esc(meta.auto_model_name)} \u81ea\u52a8\u8c03\u5ea6</div></div>
+              ${group.provider_type === "relay" ? `<div class="groupInfoItem"><div class="label">\u51b7\u5374 / WAF</div><div class="value">${esc(group.auto_model_cooldown_minutes ?? 5)} \u5206\u949f / ${group.waf_compatible ? "\u5f00\u542f" : "\u5173\u95ed"}</div></div>` : ""}
+            </div>
+            <div class="groupModels">
+              <details open>
+                <summary>\u7ec4\u5185\u6a21\u578b</summary>
+                <div class="modelTableWrap">
+                  <table class="modelTable">
+                    <thead><tr><th>\u4f18\u5148\u7ea7</th><th>\u540d\u79f0</th><th>\u4e0a\u6e38\u6a21\u578b</th><th>\u901a\u9053</th><th>\u72b6\u6001</th><th>\u6700\u8fd1\u7ed3\u679c</th><th>\u64cd\u4f5c</th></tr></thead>
+                    <tbody>${rows || '<tr><td colspan="7" class="muted">\u8be5\u8fde\u63a5\u7ec4\u6682\u65e0\u6a21\u578b</td></tr>'}</tbody>
+                  </table>
+                </div>
+              </details>
+            </div>
+          </div>
+        </div>`;
+      }).join("") || '<div class="muted">\u6682\u65e0\u8fde\u63a5\u7ec4</div>';
       bindGroupActions();
       bindModelActions();
     }
@@ -647,7 +685,7 @@
     };
 
     $("groupProvider").onchange = syncGroupModeUI;
-    $("groupPick").onchange = () => resetModelForm();
+    $("groupPick").onchange = () => { resetModelForm(); renderTestModels(state.auto_model_name || AUTO_MODEL_NAME); };
     $("upstreamModelPick").onchange = () => {};
 
     $("modelForm").onsubmit = async (e) => {

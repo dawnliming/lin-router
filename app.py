@@ -469,8 +469,10 @@ class ArkProxyRouter:
     def __init__(self, store: ConfigStore) -> None:
         self.store = store
         self.logs: List[RequestLog] = []
+        self.log_file = self.store.path.parent / ".tmp" / "request-logs.jsonl"
         self.upstream_locks: Dict[str, threading.Lock] = {}
         self.upstream_locks_guard = threading.Lock()
+        self._load_log_file()
 
     def add_log(
         self,
@@ -485,7 +487,7 @@ class ArkProxyRouter:
         cached_tokens: int = 0,
     ) -> None:
         detail = self._sanitize_detail(detail)
-        self.logs.insert(0, RequestLog(
+        item = RequestLog(
             self._now(),
             path,
             model,
@@ -496,7 +498,9 @@ class ArkProxyRouter:
             completion_tokens,
             total_tokens,
             cached_tokens,
-        ))
+        )
+        self.logs.insert(0, item)
+        self._append_log_file(item)
         del self.logs[80:]
 
     def _sanitize_detail(self, detail: str) -> str:
@@ -513,11 +517,77 @@ class ArkProxyRouter:
                 safe = safe.replace(secret, mask_secret(secret))
         return safe
 
+    def _load_log_file(self) -> None:
+        try:
+            if not self.log_file.exists():
+                return
+            with self.log_file.open("r", encoding="utf-8") as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+            items: List[RequestLog] = []
+            for row in rows[-80:]:
+                if isinstance(row, dict):
+                    items.append(RequestLog(
+                        time=str(row.get("time") or self._now()),
+                        path=str(row.get("path") or ""),
+                        model=str(row.get("model") or ""),
+                        status=str(row.get("status") or ""),
+                        detail=str(row.get("detail") or ""),
+                        duration_ms=int(row.get("duration_ms") or 0),
+                        prompt_tokens=int(row.get("prompt_tokens") or 0),
+                        completion_tokens=int(row.get("completion_tokens") or 0),
+                        total_tokens=int(row.get("total_tokens") or 0),
+                        cached_tokens=int(row.get("cached_tokens") or 0),
+                    ))
+            if items:
+                self.logs = items
+        except Exception:
+            return
+
+    def _append_log_file(self, item: RequestLog) -> None:
+        try:
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(asdict(item), ensure_ascii=False) + "\n")
+        except Exception:
+            return
+
     def recent_logs(self) -> List[Dict[str, str]]:
         return [asdict(item) for item in self.logs[:30]]
 
+    def all_logs(self) -> List[RequestLog]:
+        items: List[RequestLog] = []
+        try:
+            if self.log_file.exists():
+                with self.log_file.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        row = json.loads(line)
+                        if not isinstance(row, dict):
+                            continue
+                        items.append(RequestLog(
+                            time=str(row.get("time") or ""),
+                            path=str(row.get("path") or ""),
+                            model=str(row.get("model") or ""),
+                            status=str(row.get("status") or ""),
+                            detail=str(row.get("detail") or ""),
+                            duration_ms=int(row.get("duration_ms") or 0),
+                            prompt_tokens=int(row.get("prompt_tokens") or 0),
+                            completion_tokens=int(row.get("completion_tokens") or 0),
+                            total_tokens=int(row.get("total_tokens") or 0),
+                            cached_tokens=int(row.get("cached_tokens") or 0),
+                        ))
+        except Exception:
+            items = []
+        return items or list(reversed(self.logs))
+
     def clear_logs(self) -> None:
         self.logs.clear()
+        try:
+            if self.log_file.exists():
+                self.log_file.unlink()
+        except Exception:
+            return
 
     def update_latest_stream_usage(self, path: str, model: str, usage: Tuple[int, int, int, int]) -> None:
         prompt_tokens, completion_tokens, total_tokens, cached_tokens = usage
@@ -535,7 +605,7 @@ class ArkProxyRouter:
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["time", "path", "model", "status", "duration_ms", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "detail"])
-        for item in self.logs:
+        for item in self.all_logs():
             writer.writerow([
                 item.time,
                 item.path,
