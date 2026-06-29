@@ -418,15 +418,12 @@ const ConfigTab = {
       Toast.warning('请先保存连接组');
       return;
     }
-    const group = Store.getGroup(groupId);
-    const name = prompt('新模型名称：', '新模型');
-    if (!name) return;
     try {
-      const data = await API.createModel({ name, ep_id: name, group_id: groupId, usable: true });
+      const data = await API.createModel({ name: '新模型', ep_id: 'new-model', group_id: groupId, usable: true });
       await Store.load();
       Store.select('model', data.model.id);
       Tabs.switch('config');
-      Toast.success('模型已创建，请填写详情');
+      Toast.success('已新建模型，请直接编辑');
     } catch (err) {
       Toast.error('创建失败：' + err.message);
     }

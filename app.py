@@ -1350,6 +1350,12 @@ class ArkProxyRouter:
                 if self._is_server_error(err.code):
                     self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "server error, try next"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback")
                     continue
+                # 自动调度/全局 Key 模式下，任何 HTTP 错误都应尝试下一个候选，而不是把单次错误直接返回给客户端
+                if auto_fallback:
+                    self._mark_unusable(candidate, raw)
+                    detail = f"upstream error, try next; error={self._short_error(raw)}"
+                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback")
+                    continue
                 headers = dict(getattr(err, "headers", {}) or {})
                 detail = f"error={self._short_error(raw)}"
                 self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms, group=group, request_id=request_id, attempt=attempt, event="error")
@@ -1449,6 +1455,12 @@ class ArkProxyRouter:
                     continue
                 if self._is_server_error(err.code):
                     self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "server error, try next"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback")
+                    continue
+                # 自动调度/全局 Key 模式下，流式请求同样应继续尝试下一个候选
+                if auto_fallback:
+                    self._mark_unusable(candidate, raw)
+                    detail = f"upstream error, try next; error={self._short_error(raw)}"
+                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback")
                     continue
                 headers = dict(getattr(err, "headers", {}) or {})
                 detail = f"error={self._short_error(raw)}"
