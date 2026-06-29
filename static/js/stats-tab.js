@@ -8,6 +8,12 @@ const StatsTab = {
   render() {
     const panel = document.getElementById('panel-stats');
     const stats = this.compute();
+    const costHtml = stats.hasPrice ? `
+      <div class="stat-card">
+        <div class="stat-value">¥${stats.estimatedCost}</div>
+        <div class="stat-label">估算花费</div>
+      </div>
+    ` : '';
     panel.innerHTML = `
       <h2>统计</h2>
       <div class="stats-grid">
@@ -27,6 +33,11 @@ const StatsTab = {
           <div class="stat-value">${stats.totalTokens}</div>
           <div class="stat-label">总 Token</div>
         </div>
+        <div class="stat-card">
+          <div class="stat-value">${stats.cachedTokens}</div>
+          <div class="stat-label">缓存节省 Token</div>
+        </div>
+        ${costHtml}
       </div>
       <div class="stat-trend">
         <h3>24 小时请求趋势</h3>
@@ -37,6 +48,7 @@ const StatsTab = {
 
   compute() {
     const logs = Store.state.logs || [];
+    const models = Store.state.models || [];
     const now = new Date();
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
     const dayAgo = now.getTime() - 24 * 60 * 60 * 1000;
@@ -50,6 +62,20 @@ const StatsTab = {
     const avgDuration = durations.length ? `${Math.round(durations.reduce((a, b) => a + b, 0) / durations.length)} ms` : '-';
 
     const totalTokens = today.reduce((sum, l) => sum + Number(l.total_tokens || 0), 0);
+    const cachedTokens = today.reduce((sum, l) => sum + Number(l.cached_tokens || 0), 0);
+
+    // 估算花费：按模型单价（元/千 Token）计算
+    let estimatedCost = 0;
+    let hasPrice = false;
+    const priceMap = new Map(models.filter(m => m.price_input || m.price_output).map(m => [m.name, m]));
+    today.forEach(l => {
+      const m = priceMap.get(l.model);
+      if (!m) return;
+      hasPrice = true;
+      const prompt = Number(l.prompt_tokens || 0);
+      const completion = Number(l.completion_tokens || 0);
+      estimatedCost += (prompt * (m.price_input || 0) + completion * (m.price_output || 0)) / 1000;
+    });
 
     const hourly = {};
     for (let i = 0; i < 24; i++) hourly[i] = 0;
@@ -58,7 +84,16 @@ const StatsTab = {
       hourly[h]++;
     });
 
-    return { total, successRate, avgDuration, totalTokens: totalTokens || '-', hourly };
+    return {
+      total,
+      successRate,
+      avgDuration,
+      totalTokens: totalTokens || '-',
+      cachedTokens: cachedTokens || '-',
+      estimatedCost: estimatedCost.toFixed(4),
+      hasPrice,
+      hourly,
+    };
   },
 
   itemTime(item) {

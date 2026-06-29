@@ -13,6 +13,32 @@
   grid-template-columns: var(--sidebar-collapsed-w) 1fr;
 }
 
+.app.sidebar-collapsed .sidebar {
+  position: relative;
+  z-index: 80;
+}
+
+.app.sidebar-collapsed .sidebar:hover {
+  position: absolute;
+  left: 0;
+  top: var(--topbar-h);
+  bottom: 0;
+  width: var(--sidebar-w);
+  box-shadow: var(--shadow-lg);
+}
+
+.app.sidebar-collapsed .sidebar:hover .sidebar-title,
+.app.sidebar-collapsed .sidebar:hover .tree-label,
+.app.sidebar-collapsed .sidebar:hover .tree-badge,
+.app.sidebar-collapsed .sidebar:hover .tree-meta,
+.app.sidebar-collapsed .sidebar:hover .tree-cooldown {
+  display: inline;
+}
+
+.app.sidebar-collapsed .sidebar:hover .tree-toggle {
+  display: inline-flex;
+}
+
 .topbar {
   grid-area: topbar;
   display: flex;

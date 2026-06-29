@@ -45,6 +45,52 @@
   word-break: break-word;
 }
 
+.test-history {
+  margin-top: 20px;
+}
+
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+
+.history-item .history-time {
+  color: var(--text-tertiary);
+  min-width: 130px;
+}
+
+.history-item .history-model {
+  min-width: 120px;
+  font-weight: 500;
+}
+
+.history-item .history-path {
+  flex: 1;
+  color: var(--text-secondary);
+}
+
+.history-item button {
+  flex-shrink: 0;
+}
+
+.empty-tip {
+  color: var(--text-tertiary);
+  font-size: 13px;
+  padding: 12px 0;
+}
+
 @media (max-width: 1100px) {
   .test-layout {
     grid-template-columns: 1fr;

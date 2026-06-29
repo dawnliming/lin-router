@@ -131,6 +131,14 @@ const ConfigTab = {
             <label>价格组 / 通道</label>
             <input id="model-price" value="${Utils.escapeHtml(m?.price_group || '')}" placeholder="cheap / standard / premium">
           </div>
+          <div class="form-row" id="model-price-input-row">
+            <label>输入单价（元 / 千 Token）</label>
+            <input id="model-price-input" type="number" step="0.0001" min="0" value="${m?.price_input ? m.price_input : ''}" placeholder="可选，用于统计花费">
+          </div>
+          <div class="form-row" id="model-price-output-row">
+            <label>输出单价（元 / 千 Token）</label>
+            <input id="model-price-output" type="number" step="0.0001" min="0" value="${m?.price_output ? m.price_output : ''}" placeholder="可选，用于统计花费">
+          </div>
           <div class="form-row">
             <label class="checkbox">
               <input id="model-usable" type="checkbox" ${m?.usable !== false ? 'checked' : ''}>
@@ -302,7 +310,7 @@ const ConfigTab = {
     const groupForm = panel.querySelector('#group-form');
     if (groupForm) {
       groupForm.addEventListener('submit', e => this.onGroupSubmit(e));
-      panel.querySelector('#group-provider')?.addEventListener('change', () => this.syncGroupModeUI());
+      panel.querySelector('#group-provider')?.addEventListener('change', () => { this.syncGroupModeUI(); this.autoSaveGroup(); });
       panel.querySelector('#group-key-toggle')?.addEventListener('click', e => {
         const input = document.getElementById('group-key');
         input.type = input.type === 'password' ? 'text' : 'password';
@@ -310,16 +318,18 @@ const ConfigTab = {
       });
       panel.querySelector('#group-delete')?.addEventListener('click', () => this.onGroupDelete());
       panel.querySelector('#group-clone')?.addEventListener('click', () => this.onGroupClone());
+      this.bindAutoSave(groupForm, () => this.autoSaveGroup());
     }
 
     // 模型表单
     const modelForm = panel.querySelector('#model-form');
     if (modelForm) {
       modelForm.addEventListener('submit', e => this.onModelSubmit(e));
-      panel.querySelector('#model-group')?.addEventListener('change', () => this.syncModelModeUI());
+      panel.querySelector('#model-group')?.addEventListener('change', () => { this.syncModelModeUI(); this.autoSaveModel(); });
       panel.querySelector('#model-delete')?.addEventListener('click', () => this.onModelDelete());
       panel.querySelector('#model-clone')?.addEventListener('click', () => this.onModelClone());
       panel.querySelector('#model-fetch')?.addEventListener('click', () => this.onFetchUpstream());
+      this.bindAutoSave(modelForm, () => this.autoSaveModel());
     }
 
     // 设置
@@ -333,6 +343,34 @@ const ConfigTab = {
     panel.querySelector('#config-export')?.addEventListener('click', () => App.exportConfig());
     panel.querySelector('#config-import')?.addEventListener('click', () => panel.querySelector('#config-import-file')?.click());
     panel.querySelector('#config-import-file')?.addEventListener('change', e => this.onConfigImport(e));
+  },
+
+  bindAutoSave(form, callback) {
+    if (!form) return;
+    form.querySelectorAll('input, select, textarea').forEach(el => {
+      const event = el.tagName === 'SELECT' || el.type === 'checkbox' ? 'change' : 'blur';
+      el.addEventListener(event, () => callback());
+    });
+  },
+
+  autoSaveGroup() {
+    const id = document.getElementById('group-id')?.value;
+    if (!id) return; // 新建不自动保存
+    clearTimeout(this._autoSaveTimer);
+    this._autoSaveTimer = setTimeout(() => {
+      const form = document.getElementById('group-form');
+      if (form) form.dispatchEvent(new Event('submit'));
+    }, 500);
+  },
+
+  autoSaveModel() {
+    const id = document.getElementById('model-id')?.value;
+    if (!id) return; // 新建不自动保存
+    clearTimeout(this._autoSaveTimer);
+    this._autoSaveTimer = setTimeout(() => {
+      const form = document.getElementById('model-form');
+      if (form) form.dispatchEvent(new Event('submit'));
+    }, 500);
   },
 
   async onGroupSubmit(e) {
@@ -396,6 +434,8 @@ const ConfigTab = {
       group_id: groupId,
       api_key: document.getElementById('model-key').value.trim(),
       price_group: document.getElementById('model-price').value.trim(),
+      price_input: Number(document.getElementById('model-price-input').value || 0),
+      price_output: Number(document.getElementById('model-price-output').value || 0),
       upstream_model: upstream,
       usable: document.getElementById('model-usable').checked,
     };

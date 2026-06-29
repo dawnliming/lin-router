@@ -249,6 +249,8 @@ class ModelConfig:
     upstream_model: str = ""
     api_key: str = ""
     price_group: str = ""
+    price_input: float = 0.0
+    price_output: float = 0.0
     usable: bool = True
     last_error: str = ""
     last_success_at: str = ""
@@ -266,6 +268,8 @@ class ModelConfig:
             upstream_model=str(data.get("upstream_model") or ""),
             api_key=str(data.get("api_key") or ""),
             price_group=str(data.get("price_group") or ""),
+            price_input=float(data.get("price_input") or 0),
+            price_output=float(data.get("price_output") or 0),
             usable=bool(data.get("usable", True)),
             last_error=str(data.get("last_error", "")),
             last_success_at=str(data.get("last_success_at", "")),
@@ -478,11 +482,23 @@ class ConfigStore:
             local_idx = next((i for i, pos in enumerate(group_positions) if pos == idx), -1)
             if local_idx < 0:
                 return False
-            new_local_idx = local_idx - 1 if direction == "up" else local_idx + 1
+            group_models = [self.models[pos] for pos in group_positions]
+            if direction == "up":
+                new_local_idx = local_idx - 1
+            elif direction == "down":
+                new_local_idx = local_idx + 1
+            elif direction == "bottom":
+                new_local_idx = len(group_models) - 1
+            elif direction == "top":
+                new_local_idx = 0
+            else:
+                return False
             if new_local_idx < 0 or new_local_idx >= len(group_positions):
                 return False
-            group_models = [self.models[pos] for pos in group_positions]
-            group_models[local_idx], group_models[new_local_idx] = group_models[new_local_idx], group_models[local_idx]
+            if new_local_idx == local_idx:
+                return True
+            model = group_models.pop(local_idx)
+            group_models.insert(new_local_idx, model)
             for pos, model in zip(group_positions, group_models):
                 self.models[pos] = model
             self.save()
@@ -500,6 +516,22 @@ class ConfigStore:
                     changed = True
             if changed:
                 self.save()
+
+    def toggle_group(self, group_id: str) -> bool:
+        """切换指定连接组下所有模型的可用状态（组内全可用则全部禁用，否则全部启用）。"""
+        with self._lock:
+            group_models = [m for m in self.models if m.group_id == group_id]
+            if not group_models:
+                return False
+            all_usable = all(m.usable for m in group_models)
+            changed = False
+            for model in group_models:
+                if model.usable == all_usable:
+                    model.usable = not all_usable
+                    changed = True
+            if changed:
+                self.save()
+            return changed
 
     def find_group(self, group_id: str) -> Optional[ConnectionGroup]:
         return next((g for g in self.groups if g.id == group_id), None)
@@ -2019,6 +2051,14 @@ class RouterHandler(BaseHTTPRequestHandler):
                 model.last_checked_at = self.router._now()
             self.store.save()
             self._send_json({"ok": True, "usable": model.usable})
+            return
+        if parsed.path.endswith("/toggle") and parsed.path.startswith("/api/groups/"):
+            group_id = parsed.path.split("/")[3]
+            changed = self.store.toggle_group(group_id)
+            if not changed:
+                self._send_text("group not found or empty", status=400)
+                return
+            self._send_json({"ok": True})
             return
         if parsed.path.endswith("/move") and parsed.path.startswith("/api/models/"):
             model_id = parsed.path.split("/")[3]

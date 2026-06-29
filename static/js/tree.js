@@ -150,6 +150,14 @@ const Tree = {
         if (action === 'toggle') return;
         const type = node.dataset.type;
         const id = node.dataset.id;
+        if (type === 'group') {
+          // 双击组名展开/折叠
+          if (this.expanded.has(id)) this.expanded.delete(id);
+          else this.expanded.add(id);
+          this.saveExpanded();
+          this.render();
+          return;
+        }
         Store.select(type, id);
         Tabs.switch('test');
       });
@@ -195,9 +203,10 @@ const Tree = {
     if (!targetGroupId) return;
 
     if (dragModel.group_id !== targetGroupId) {
-      // 跨组移动：先改 group_id，再微调顺序
+      // 跨组移动：先改 group_id，再移到目标组最下方
       try {
         await API.saveModel(dragModel.id, { ...dragModel, group_id: targetGroupId });
+        await API.moveModel(dragModel.id, { direction: 'bottom' });
         await Store.load();
         Toast.success('模型已移动');
       } catch (err) {
@@ -235,6 +244,9 @@ const Tree = {
 
   groupMenuHtml(id) {
     const g = Store.getGroup(id);
+    const models = Store.getModelsByGroup(id);
+    const allUsable = models.length > 0 && models.every(m => m.usable);
+    const toggleLabel = allUsable ? '禁用组' : '启用组';
     return `
       <div class="context-item" data-action="test" data-id="${id}">测试自动</div>
       <div class="context-item" data-action="copy-key" data-id="${id}">复制 Key</div>
@@ -242,6 +254,7 @@ const Tree = {
       <div class="context-item" data-action="clone-group" data-id="${id}">复制组</div>
       <div class="context-item" data-action="rename-group" data-id="${id}">重命名</div>
       <div class="context-separator"></div>
+      <div class="context-item" data-action="toggle-group" data-id="${id}">${toggleLabel}</div>
       <div class="context-item" data-action="fetch-models" data-id="${id}">自动获取模型</div>
       <div class="context-item" data-action="expand-all" data-id="${id}">全部展开</div>
       <div class="context-item" data-action="collapse-all" data-id="${id}">全部折叠</div>
@@ -320,6 +333,11 @@ const Tree = {
         }
         break;
       }
+      case 'toggle-group': {
+        try { await API.req(`/api/groups/${id}/toggle`, { method: 'POST' }); await Store.load(); Toast.success('组状态已切换'); }
+        catch (err) { Toast.error(err.message); }
+        break;
+      }
       case 'fetch-models': {
         const g = Store.getGroup(id);
         if (!['relay', 'proxy'].includes(g?.provider_type)) {
@@ -383,7 +401,44 @@ const Tree = {
   },
 
   setSearch(s) {
-    this.search = s;
+    this.search = (s || '').trim().toLowerCase();
     this.render();
+  },
+
+  jumpToFirstMatch() {
+    if (!this.search) return;
+    const models = Store.state.models || [];
+    const groups = Store.state.groups || [];
+    // 优先匹配模型
+    const firstModel = models.find(m => m.name.toLowerCase().includes(this.search));
+    if (firstModel) {
+      const g = Store.getGroup(firstModel.group_id);
+      if (g) {
+        this.expanded.add(g.id);
+        this.saveExpanded();
+      }
+      Store.select('model', firstModel.id);
+      this.render();
+      this.scrollIntoView(`[data-type="model"][data-id="${firstModel.id}"]`);
+      return;
+    }
+    // 再匹配组
+    const firstGroup = groups.find(g => g.name.toLowerCase().includes(this.search));
+    if (firstGroup) {
+      this.expanded.add(firstGroup.id);
+      this.saveExpanded();
+      Store.select('group', firstGroup.id);
+      this.render();
+      this.scrollIntoView(`[data-type="group"][data-id="${firstGroup.id}"]`);
+    }
+  },
+
+  scrollIntoView(selector) {
+    const el = document.querySelector(selector);
+    if (el) {
+      el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      el.classList.add('flash');
+      setTimeout(() => el.classList.remove('flash'), 800);
+    }
   }
 };

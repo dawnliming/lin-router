@@ -1,19 +1,31 @@
 const API = {
   base: '',
+  _loading: 0,
+
+  setLoading(delta) {
+    this._loading = Math.max(0, this._loading + delta);
+    const el = document.getElementById('global-loading');
+    if (el) el.classList.toggle('hidden', this._loading === 0);
+  },
 
   async req(path, opts = {}) {
     const url = `${this.base}${path}`;
-    const res = await fetch(url, {
-      headers: { 'Content-Type': 'application/json' },
-      ...opts
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(text || `HTTP ${res.status}`);
+    this.setLoading(1);
+    try {
+      const res = await fetch(url, {
+        headers: { 'Content-Type': 'application/json' },
+        ...opts
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) return res.json();
+      return res.text();
+    } finally {
+      this.setLoading(-1);
     }
-    const contentType = res.headers.get('content-type') || '';
-    if (contentType.includes('application/json')) return res.json();
-    return res.text();
   },
 
   getState() { return this.req('/api/state'); },

@@ -47,7 +47,19 @@ const App = {
     topbar.querySelector('#global-key').addEventListener('click', () => {
       Utils.copy('lin-router').then(ok => ok ? Toast.success('全局 Key 已复制') : Toast.error('复制失败'));
     });
-    topbar.querySelector('#global-search').addEventListener('input', e => Tree.setSearch(e.target.value));
+    const searchInput = topbar.querySelector('#global-search');
+    searchInput.addEventListener('input', e => Tree.setSearch(e.target.value));
+    searchInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        Tree.jumpToFirstMatch();
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        searchInput.value = '';
+        Tree.setSearch('');
+      }
+    });
     topbar.querySelector('#btn-theme').addEventListener('click', () => this.cycleTheme());
 
     topbar.querySelector('#btn-new-group').addEventListener('click', () => this.createGroup());
@@ -123,6 +135,9 @@ const App = {
 
   bindShortcuts() {
     document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') {
+        Tree.hideMenu();
+      }
       if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
         e.preventDefault();
         document.getElementById('global-search').focus();

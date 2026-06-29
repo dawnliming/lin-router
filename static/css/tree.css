@@ -78,6 +78,17 @@
   padding: 0 2px;
 }
 
+@keyframes flash {
+  0% { background: transparent; }
+  30% { background: var(--accent); opacity: .3; }
+  100% { background: transparent; }
+}
+
+.tree-group.flash,
+.tree-model.flash {
+  animation: flash .8s ease;
+}
+
 .app.sidebar-collapsed .sidebar-title,
 .app.sidebar-collapsed .tree-label,
 .app.sidebar-collapsed .tree-badge,
@@ -117,7 +128,7 @@
   overflow: visible;
 }
 
-.app.sidebar-collapsed .tree-node:hover .tree-label {
+.app.sidebar-collapsed .sidebar:not(:hover) .tree-node:hover .tree-label {
   display: block;
   position: absolute;
   left: 56px;
@@ -128,4 +139,14 @@
   box-shadow: var(--shadow-md);
   z-index: 200;
   white-space: nowrap;
+}
+
+.app.sidebar-collapsed .sidebar:hover .tree-group,
+.app.sidebar-collapsed .sidebar:hover .tree-model {
+  justify-content: flex-start;
+  padding: 7px 8px;
+}
+
+.app.sidebar-collapsed .sidebar:hover .tree-children {
+  padding-left: 18px;
 }
