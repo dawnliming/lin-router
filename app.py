@@ -1477,6 +1477,20 @@ class RouterHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_file(self, file_path: Path, content_type: str = "") -> None:
+        import mimetypes
+        if not file_path.exists():
+            self._send_text("not found", status=404)
+            return
+        data = file_path.read_bytes()
+        ctype = content_type or mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _read_json(self) -> Dict[str, Any]:
         raw = self._read_raw_body()
         return json.loads(raw.decode("utf-8"))
@@ -1665,6 +1679,15 @@ class RouterHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/":
             self._send_text(render_index_page(), content_type="text/html; charset=utf-8")
+            return
+        if parsed.path.startswith("/") and not parsed.path.startswith("/api/") and not parsed.path.startswith("/v1/"):
+            # 服务静态资源（css/js/html 等），统一映射到 static/ 目录
+            rel = parsed.path.lstrip("/")
+            if ".." in rel:
+                self._send_text("forbidden", status=403)
+                return
+            file_path = resource_path("static", *rel.split("/"))
+            self._send_file(file_path)
             return
         if parsed.path in {"/v1/models", "/models"}:
             ctx = self._require_route_context()
