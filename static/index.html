@@ -236,11 +236,22 @@
         <summary>最近请求</summary>
         <div class="panelBody">
           <div class="row" style="margin-bottom:10px">
-            <button type="button" id="clearLogsBtn">清空日志</button>
-            <button type="button" id="exportLogsBtn">导出 CSV</button>
+            <input id="logStart" type="datetime-local" title="&#x5f00;&#x59cb;&#x65f6;&#x95f4;">
+            <input id="logEnd" type="datetime-local" title="&#x7ed3;&#x675f;&#x65f6;&#x95f4;">
+            <select id="logGroupFilter"></select>
+            <select id="logStatusFilter">
+              <option value="">&#x5168;&#x90e8;&#x72b6;&#x6001;</option>
+              <option value="2xx">&#x6210;&#x529f;</option>
+              <option value="error">&#x5f02;&#x5e38;</option>
+              <option value="cooldown">&#x51b7;&#x5374;/&#x5207;&#x6362;</option>
+            </select>
+          </div>
+          <div class="row" style="margin-bottom:10px">
+            <button type="button" id="clearLogsBtn">&#x6e05;&#x7a7a;&#x65e5;&#x5fd7;</button>
+            <button type="button" id="exportLogsBtn">&#x5bfc;&#x51fa; CSV</button>
           </div>
           <table>
-            <thead><tr><th>时间</th><th>模型</th><th>状态</th><th>耗时</th><th>Token</th><th>详情</th><th>操作</th></tr></thead>
+            <thead><tr><th>&#x65f6;&#x95f4;</th><th>&#x8fde;&#x63a5;&#x7ec4;</th><th>&#x6a21;&#x578b;</th><th>&#x72b6;&#x6001;</th><th>&#x4e8b;&#x4ef6;</th><th>&#x8017;&#x65f6;</th><th>Token</th><th>&#x8be6;&#x60c5;</th><th>&#x64cd;&#x4f5c;</th></tr></thead>
             <tbody id="logTbody"></tbody>
           </table>
         </div>
@@ -299,6 +310,56 @@
       if (!total && !prompt && !completion && !cached) return "-";
       const hit = prompt ? Math.round((cached / prompt) * 100) : 0;
       return `入 ${prompt} / 出 ${completion} / 总 ${total} / 缓 ${cached} (${hit}%)`;
+    }
+
+    function eventLabel(event) {
+      const map = { ok:"\u6210\u529f", stream_ok:"\u6d41\u5f0f\u6210\u529f", retry_ok:"\u91cd\u8bd5\u6210\u529f", cooldown:"\u8fdb\u5165\u51b7\u5374", fallback:"\u5207\u6362\u5c1d\u8bd5", skip:"\u8df3\u8fc7", network:"\u7f51\u7edc\u5f02\u5e38", error:"\u5f02\u5e38" };
+      return map[event] || event || "-";
+    }
+
+    function logGroupName(item) {
+      return item.group_name || state.groups.find(g => g.id === item.group_id)?.name || "-";
+    }
+
+    function logDateValue(value) {
+      return value ? new Date(value).getTime() : 0;
+    }
+
+    function logItemTime(item) {
+      return item.time ? new Date(String(item.time).replace(" ", "T")).getTime() : 0;
+    }
+
+    function logMatchesFilters(item) {
+      const start = logDateValue($("logStart").value);
+      const end = logDateValue($("logEnd").value);
+      const t = logItemTime(item);
+      if (start && t && t < start) return false;
+      if (end && t && t > end) return false;
+      const group = $("logGroupFilter").value;
+      if (group && item.group_id !== group) return false;
+      const status = String(item.status || "");
+      const event = String(item.event || "");
+      const statusFilter = $("logStatusFilter").value;
+      if (statusFilter === "2xx" && !status.startsWith("2")) return false;
+      if (statusFilter === "cooldown" && !["cooldown", "fallback", "retry_ok"].includes(event)) return false;
+      if (statusFilter === "error" && (status.startsWith("2") || ["cooldown", "fallback", "retry_ok"].includes(event))) return false;
+      return true;
+    }
+
+    function renderLogRows() {
+      const rows = (state.logs || []).filter(logMatchesFilters).map((item, idx) => `<tr>
+        <td class="tiny">${esc(item.time)}</td>
+        <td class="tiny">${esc(logGroupName(item))}</td>
+        <td>${esc(item.model)}</td>
+        <td><span class="pill ${logStatusClass(item.status)}">${esc(item.status)}</span></td>
+        <td class="tiny">${esc(eventLabel(item.event))}</td>
+        <td class="tiny">${Number(item.duration_ms || 0) ? `${Number(item.duration_ms)} ms` : "-"}</td>
+        <td class="tiny">${esc(tokenSummary(item))}</td>
+        <td class="tiny resultText" title="${esc(item.detail)}">${esc(item.detail)}</td>
+        <td><button type="button" data-log-detail="${idx}">&#x67e5;&#x770b;</button></td>
+      </tr>`).join("");
+      $("logTbody").innerHTML = rows || '<tr><td colspan="9" class="muted">\u6682\u65e0\u8bf7\u6c42</td></tr>';
+      bindLogActions();
     }
 
     function groupModels(groupId) {
@@ -572,43 +633,43 @@
               <strong>${esc(group.name)}</strong>
               <div class="groupCardMeta tiny muted">
                 <span>${esc(providerLabel(group))}</span>
-                <span>\u6a21\u578b ${meta.model_count}</span>
-                <span>\u53ef\u7528 ${meta.usable_count}</span>
-                <span>\u81ea\u52a8\u6a21\u578b ${esc(meta.auto_model_name)}</span>
+                <span>&#x6a21;&#x578b; ${meta.model_count}</span>
+                <span>&#x53ef;&#x7528; ${meta.usable_count}</span>
+                <span>&#x81ea;&#x52a8;&#x6a21;&#x578b; ${esc(meta.auto_model_name)}</span>
               </div>
             </div>
             <div class="groupCardActions">
-              <button type="button" data-group-test="${group.id}">\u6d4b\u8bd5\u81ea\u52a8</button>
-              <button type="button" data-copy-client="${group.id}">\u590d\u5236 Hermes \u914d\u7f6e</button>
-              <button type="button" data-group-clone="${group.id}">\u590d\u5236\u7ec4</button>
-              <button type="button" data-group-edit="${group.id}">\u7f16\u8f91\u7ec4</button>
-              <button type="button" data-copy-key="${group.id}">\u590d\u5236 Key</button>
-              <button type="button" class="danger" data-group-del="${group.id}">\u5220\u9664\u7ec4</button>
+              <button type="button" data-group-test="${group.id}">&#x6d4b;&#x8bd5;&#x81ea;&#x52a8;</button>
+              <button type="button" data-copy-client="${group.id}">&#x590d;&#x5236; Hermes &#x914d;&#x7f6e;</button>
+              <button type="button" data-group-clone="${group.id}">&#x590d;&#x5236;&#x7ec4;</button>
+              <button type="button" data-group-edit="${group.id}">&#x7f16;&#x8f91;&#x7ec4;</button>
+              <button type="button" data-copy-key="${group.id}">&#x590d;&#x5236; Key</button>
+              <button type="button" class="danger" data-group-del="${group.id}">&#x5220;&#x9664;&#x7ec4;</button>
             </div>
           </div>
           <div class="groupCardBody">
             <div class="groupInfoGrid tiny">
               <div class="groupInfoItem"><div class="label">Base URL</div><div class="value" title="${esc(group.base_url)}">${esc(group.base_url)}</div></div>
-              <div class="groupInfoItem"><div class="label">\u672c\u5730 Key</div><div class="value" title="${esc(group.route_key)}">${esc(group.route_key)}</div></div>
-              <div class="groupInfoItem"><div class="label">\u6a21\u5f0f</div><div class="value">${esc(providerLabel(group))}</div></div>
-              <div class="groupInfoItem"><div class="label">\u72b6\u6001</div><div class="value">${group.provider_type === "relay" ? "\u652f\u6301\u81ea\u52a8\u51b7\u5374" : "\u6807\u51c6\u8def\u7531"}</div></div>
-              <div class="groupInfoItem"><div class="label">\u8bf4\u660e</div><div class="value">${esc(meta.auto_model_name)} \u81ea\u52a8\u8c03\u5ea6</div></div>
-              ${group.provider_type === "relay" ? `<div class="groupInfoItem"><div class="label">\u51b7\u5374 / WAF</div><div class="value">${esc(group.auto_model_cooldown_minutes ?? 5)} \u5206\u949f / ${group.waf_compatible ? "\u5f00\u542f" : "\u5173\u95ed"}</div></div>` : ""}
+              <div class="groupInfoItem"><div class="label">&#x672c;&#x5730; Key</div><div class="value" title="${esc(group.route_key)}">${esc(group.route_key)}</div></div>
+              <div class="groupInfoItem"><div class="label">&#x6a21;&#x5f0f;</div><div class="value">${esc(providerLabel(group))}</div></div>
+              <div class="groupInfoItem"><div class="label">&#x72b6;&#x6001;</div><div class="value">${group.provider_type === "relay" ? "\u652f\u6301\u81ea\u52a8\u51b7\u5374" : "\u6807\u51c6\u8def\u7531"}</div></div>
+              <div class="groupInfoItem"><div class="label">&#x8bf4;&#x660e;</div><div class="value">${esc(meta.auto_model_name)} \u81ea\u52a8\u8c03\u5ea6</div></div>
+              ${group.provider_type === "relay" ? `<div class="groupInfoItem"><div class="label">&#x51b7;&#x5374; / WAF</div><div class="value">${esc(group.auto_model_cooldown_minutes ?? 5)} &#x5206;&#x949f; / ${group.waf_compatible ? "&#x5f00;&#x542f;" : "&#x5173;&#x95ed;"}</div></div>` : ""}
             </div>
             <div class="groupModels">
               <details open>
-                <summary>\u7ec4\u5185\u6a21\u578b</summary>
+                <summary>&#x7ec4;&#x5185;&#x6a21;&#x578b;</summary>
                 <div class="modelTableWrap">
                   <table class="modelTable">
-                    <thead><tr><th>\u4f18\u5148\u7ea7</th><th>\u540d\u79f0</th><th>\u4e0a\u6e38\u6a21\u578b</th><th>\u901a\u9053</th><th>\u72b6\u6001</th><th>\u6700\u8fd1\u7ed3\u679c</th><th>\u64cd\u4f5c</th></tr></thead>
-                    <tbody>${rows || '<tr><td colspan="7" class="muted">\u8be5\u8fde\u63a5\u7ec4\u6682\u65e0\u6a21\u578b</td></tr>'}</tbody>
+                    <thead><tr><th>\u4f18\u5148\u7ea7</th><th>\u540d\u79f0</th><th>\u4e0a\u6e38\u6a21\u578b</th><th>\u901a\u9053</th><th>&#x72b6;&#x6001;</th><th>\u6700\u8fd1\u7ed3\u679c</th><th>\u64cd\u4f5c</th></tr></thead>
+                    <tbody>${rows || '<tr><td colspan="7" class="muted">&#x8be5;&#x8fde;&#x63a5;&#x7ec4;&#x6682;&#x65e0;&#x6a21;&#x578b;</td></tr>'}</tbody>
                   </table>
                 </div>
               </details>
             </div>
           </div>
         </div>`;
-      }).join("") || '<div class="muted">\u6682\u65e0\u8fde\u63a5\u7ec4</div>';
+      }).join("") || '<div class="muted">&#x6682;&#x65e0;&#x8fde;&#x63a5;&#x7ec4;</div>';
       bindGroupActions();
       bindModelActions();
     }
@@ -638,16 +699,13 @@
       syncModelModeUI("");
       renderTestModels($("testModel").value);
       renderModels();
-      $("logTbody").innerHTML = (state.logs || []).map((item, idx) => `<tr>
-        <td class="tiny">${esc(item.time)}</td>
-        <td>${esc(item.model)}</td>
-        <td><span class="pill ${logStatusClass(item.status)}">${esc(item.status)}</span></td>
-        <td class="tiny">${Number(item.duration_ms || 0) ? `${Number(item.duration_ms)} ms` : "-"}</td>
-        <td class="tiny">${esc(tokenSummary(item))}</td>
-        <td class="tiny resultText" title="${esc(item.detail)}">${esc(item.detail)}</td>
-        <td><button type="button" data-log-detail="${idx}">查看</button></td>
-      </tr>`).join("") || '<tr><td colspan="7" class="muted">暂无请求</td></tr>';
-      bindLogActions();
+      $("logGroupFilter").innerHTML = renderOptions(
+        state.groups.map(g => ({ value:g.id, label:g.name })),
+        $("logGroupFilter").value,
+        "\u5168\u90e8\u8fde\u63a5\u7ec4",
+        item => item.label
+      );
+      renderLogRows();
     }
 
     async function mutate(url, body, method="POST") {
@@ -732,12 +790,19 @@
           return;
         }
         await refresh();
+        $("groupPick").value = group.id;
+        syncModelModeUI("");
         log(text || "ok");
       } finally {
         btn.disabled = false;
         btn.textContent = oldText;
       }
     };
+
+    ["logStart", "logEnd", "logGroupFilter", "logStatusFilter"].forEach(id => {
+      $(id).onchange = renderLogRows;
+      $(id).oninput = renderLogRows;
+    });
 
     $("clearLogsBtn").onclick = async () => mutate("/api/logs/clear", {});
     $("exportLogsBtn").onclick = () => { location.href = "/api/logs/export"; };

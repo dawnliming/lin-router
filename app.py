@@ -249,6 +249,10 @@ class RequestLog:
     completion_tokens: int = 0
     total_tokens: int = 0
     cached_tokens: int = 0
+    group_id: str = ""
+    group_name: str = ""
+    provider_type: str = ""
+    event: str = ""
 
 
 @dataclass
@@ -485,8 +489,13 @@ class ArkProxyRouter:
         completion_tokens: int = 0,
         total_tokens: int = 0,
         cached_tokens: int = 0,
+        group: Optional[ConnectionGroup] = None,
+        event: str = "",
     ) -> None:
         detail = self._sanitize_detail(detail)
+        group_id = group.id if group else self._detail_value(detail, "group_id")
+        group_name = group.name if group else self._detail_value(detail, "group_name")
+        provider_type = group.provider_type if group else self._detail_value(detail, "provider")
         item = RequestLog(
             self._now(),
             path,
@@ -498,10 +507,38 @@ class ArkProxyRouter:
             completion_tokens,
             total_tokens,
             cached_tokens,
+            group_id,
+            group_name,
+            provider_type,
+            event or self._infer_event(status, detail),
         )
         self.logs.insert(0, item)
         self._append_log_file(item)
         del self.logs[80:]
+
+    @staticmethod
+    def _detail_value(detail: str, key: str) -> str:
+        match = re.search(rf"(?:^|; ){re.escape(key)}=([^;]*)", detail or "")
+        return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def _infer_event(status: str, detail: str) -> str:
+        text = f"{status} {detail}".lower()
+        if "cooldown" in text:
+            return "cooldown"
+        if "retry ok" in text:
+            return "retry_ok"
+        if "try next" in text:
+            return "fallback"
+        if "stream ok" in text:
+            return "stream_ok"
+        if "skip" in text or "missing upstream api key" in text:
+            return "skip"
+        if "network" in text:
+            return "network"
+        if str(status).startswith("2"):
+            return "ok"
+        return "error"
 
     def _sanitize_detail(self, detail: str) -> str:
         if not detail:
@@ -517,6 +554,25 @@ class ArkProxyRouter:
                 safe = safe.replace(secret, mask_secret(secret))
         return safe
 
+    @staticmethod
+    def _log_from_row(row: Dict[str, Any]) -> RequestLog:
+        return RequestLog(
+            time=str(row.get("time") or ""),
+            path=str(row.get("path") or ""),
+            model=str(row.get("model") or ""),
+            status=str(row.get("status") or ""),
+            detail=str(row.get("detail") or ""),
+            duration_ms=int(row.get("duration_ms") or 0),
+            prompt_tokens=int(row.get("prompt_tokens") or 0),
+            completion_tokens=int(row.get("completion_tokens") or 0),
+            total_tokens=int(row.get("total_tokens") or 0),
+            cached_tokens=int(row.get("cached_tokens") or 0),
+            group_id=str(row.get("group_id") or ""),
+            group_name=str(row.get("group_name") or ""),
+            provider_type=str(row.get("provider_type") or ""),
+            event=str(row.get("event") or ""),
+        )
+
     def _load_log_file(self) -> None:
         try:
             if not self.log_file.exists():
@@ -526,18 +582,8 @@ class ArkProxyRouter:
             items: List[RequestLog] = []
             for row in rows[-80:]:
                 if isinstance(row, dict):
-                    items.append(RequestLog(
-                        time=str(row.get("time") or self._now()),
-                        path=str(row.get("path") or ""),
-                        model=str(row.get("model") or ""),
-                        status=str(row.get("status") or ""),
-                        detail=str(row.get("detail") or ""),
-                        duration_ms=int(row.get("duration_ms") or 0),
-                        prompt_tokens=int(row.get("prompt_tokens") or 0),
-                        completion_tokens=int(row.get("completion_tokens") or 0),
-                        total_tokens=int(row.get("total_tokens") or 0),
-                        cached_tokens=int(row.get("cached_tokens") or 0),
-                    ))
+                    row.setdefault("time", row.get("time") or self._now())
+                    items.append(self._log_from_row(row))
             if items:
                 self.logs = items
         except Exception:
@@ -565,18 +611,7 @@ class ArkProxyRouter:
                         row = json.loads(line)
                         if not isinstance(row, dict):
                             continue
-                        items.append(RequestLog(
-                            time=str(row.get("time") or ""),
-                            path=str(row.get("path") or ""),
-                            model=str(row.get("model") or ""),
-                            status=str(row.get("status") or ""),
-                            detail=str(row.get("detail") or ""),
-                            duration_ms=int(row.get("duration_ms") or 0),
-                            prompt_tokens=int(row.get("prompt_tokens") or 0),
-                            completion_tokens=int(row.get("completion_tokens") or 0),
-                            total_tokens=int(row.get("total_tokens") or 0),
-                            cached_tokens=int(row.get("cached_tokens") or 0),
-                        ))
+                        items.append(self._log_from_row(row))
         except Exception:
             items = []
         return items or list(reversed(self.logs))
@@ -604,13 +639,16 @@ class ArkProxyRouter:
     def export_logs_csv(self) -> str:
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["time", "path", "model", "status", "duration_ms", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "detail"])
+        writer.writerow(["time", "path", "group_name", "provider_type", "model", "status", "event", "duration_ms", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "detail"])
         for item in self.all_logs():
             writer.writerow([
                 item.time,
                 item.path,
+                item.group_name,
+                item.provider_type,
                 item.model,
                 item.status,
+                item.event,
                 item.duration_ms,
                 item.prompt_tokens,
                 item.completion_tokens,
@@ -900,8 +938,10 @@ class ArkProxyRouter:
         suffix: str,
     ) -> str:
         base = self._candidate_hit_detail(candidate, requested_label, suffix)
+        group_name = str(candidate.group.name).replace(";", ",")
         return (
-            f"{base}; upstream={target_url}; body={body_mode}; "
+            f"{base}; group_id={candidate.group.id}; group_name={group_name}; provider={candidate.group.provider_type}; "
+            f"upstream={target_url}; body={body_mode}; "
             f"fingerprint=({self._payload_fingerprint(payload, body)}); "
             f"out_headers=({self._safe_header_view(headers)})"
         )
