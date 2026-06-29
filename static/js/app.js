@@ -5,14 +5,16 @@ const App = {
   async init() {
     this.loadTheme();
     this.renderTopbar();
+    this.renderFabs();
     Tree.init();
     Tabs.init();
     this.bindShortcuts();
     this.bindResize();
 
     await Store.load();
-    Store.subscribe(() => {
+    Store.subscribe((state) => {
       document.getElementById('server-addr').textContent = window.location.origin;
+      this.updateStatusDot(state);
       ConfigTab.onShow();
       Tree.render();
     });
@@ -74,11 +76,60 @@ const App = {
     if (btn) btn.textContent = this.sidebarCollapsed ? '▶' : '◀';
   },
 
+  updateStatusDot(state) {
+    const dot = document.getElementById('status-dot');
+    if (!dot) return;
+    const err = state?.log_write_error || '';
+    if (err) {
+      dot.className = 'status-dot error';
+      dot.title = err;
+    } else {
+      dot.className = 'status-dot';
+      dot.title = '运行中';
+    }
+  },
+
+  renderFabs() {
+    const container = document.getElementById('fab-container');
+    if (!container) return;
+    container.innerHTML = `
+      <button class="fab" id="fab-top" title="回到顶部">↑</button>
+      <button class="fab" id="fab-add-model" title="新建模型">+</button>
+    `;
+    container.querySelector('#fab-top').addEventListener('click', () => {
+      document.querySelector('.tab-panel.active')?.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+    container.querySelector('#fab-add-model').addEventListener('click', () => this.createModelForCurrentGroup());
+  },
+
+  createModelForCurrentGroup() {
+    let groupId = null;
+    if (Store.selected.type === 'group') groupId = Store.selected.id;
+    else if (Store.selected.type === 'model') {
+      const m = Store.getModel(Store.selected.id);
+      if (m) groupId = m.group_id;
+    }
+    if (!groupId) {
+      Toast.warning('请先选择一个连接组');
+      return;
+    }
+    const name = prompt('新建模型名称：', '新模型');
+    if (!name) return;
+    API.createModel({ name, ep_id: name, group_id: groupId, usable: true })
+      .then(() => Store.load())
+      .then(() => Toast.success('模型已创建'))
+      .catch(err => Toast.error('创建失败：' + err.message));
+  },
+
   bindShortcuts() {
     document.addEventListener('keydown', e => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
         e.preventDefault();
         document.getElementById('global-search').focus();
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        this.saveCurrentConfig();
       }
       if ((e.ctrlKey || e.metaKey) && /^[1-4]$/.test(e.key)) {
         e.preventDefault();
@@ -86,6 +137,17 @@ const App = {
         Tabs.switch(map[e.key]);
       }
     });
+  },
+
+  saveCurrentConfig() {
+    const sel = Store.selected;
+    if (sel.type === 'group') {
+      const form = document.getElementById('group-form');
+      if (form) form.dispatchEvent(new Event('submit'));
+    } else if (sel.type === 'model') {
+      const form = document.getElementById('model-form');
+      if (form) form.dispatchEvent(new Event('submit'));
+    }
   },
 
   bindResize() {

@@ -424,8 +424,11 @@ const ConfigTab = {
 
   async onModelClone() {
     const id = document.getElementById('model-id').value;
+    const m = Store.getModel(id);
+    if (!m) return;
     try {
-      await API.cloneModel(id);
+      // 后端没有 /api/models/{id}/clone，用 createModel 复制字段实现
+      await API.createModel({ ...m, id: undefined, name: `${m.name} 副本` });
       await Store.load();
       Toast.success('模型已复制');
     } catch (err) {

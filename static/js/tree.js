@@ -16,7 +16,24 @@ const Tree = {
     document.getElementById('sidebar-collapse').addEventListener('click', () => App.toggleSidebar());
     this.hideMenu = this.hideMenu.bind(this);
     document.addEventListener('click', this.hideMenu);
+    this.loadExpanded();
     Store.subscribe(() => this.render());
+  },
+
+  loadExpanded() {
+    try {
+      const raw = localStorage.getItem('lin-router-expanded');
+      if (raw) {
+        const ids = JSON.parse(raw);
+        if (Array.isArray(ids)) this.expanded = new Set(ids);
+      }
+    } catch (_) {}
+  },
+
+  saveExpanded() {
+    try {
+      localStorage.setItem('lin-router-expanded', JSON.stringify([...this.expanded]));
+    } catch (_) {}
   },
 
   render() {
@@ -47,7 +64,7 @@ const Tree = {
         <div class="tree-group ${active}" data-type="group" data-id="${g.id}" data-context="group">
           <span class="tree-toggle" data-action="toggle">${expanded ? '▼' : '▶'}</span>
           <span class="tree-status ${status}"></span>
-          <span class="tree-label">${Utils.escapeHtml(g.name)}</span>
+          <span class="tree-label">${this.highlight(Utils.escapeHtml(g.name))}</span>
           <span class="tree-badge">${modeLabel}</span>
           <span class="tree-meta">${groupModels.length}模型</span>
         </div>
@@ -66,11 +83,18 @@ const Tree = {
     return `
       <div class="tree-model ${active}" data-type="model" data-id="${m.id}" data-context="model" draggable="true" title="${Utils.escapeHtml(m.last_error || '')}">
         <span class="tree-status ${status}"></span>
-        <span class="tree-label">${Utils.escapeHtml(m.name)}</span>
+        <span class="tree-label">${this.highlight(Utils.escapeHtml(m.name))}</span>
         ${coolingText ? `<span class="tree-cooldown">${coolingText}</span>` : ''}
         <span class="tree-meta">${Utils.escapeHtml(meta)}</span>
       </div>
     `;
+  },
+
+  highlight(text) {
+    if (!this.search) return text;
+    const s = this.search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(${s})`, 'gi');
+    return text.replace(re, '<mark>$1</mark>');
   },
 
   groupStatus(g, models) {
@@ -115,10 +139,19 @@ const Tree = {
           e.stopPropagation();
           if (this.expanded.has(id)) this.expanded.delete(id);
           else this.expanded.add(id);
+          this.saveExpanded();
           this.render();
           return;
         }
         Store.select(type, id);
+      });
+      node.addEventListener('dblclick', e => {
+        const action = e.target.dataset.action;
+        if (action === 'toggle') return;
+        const type = node.dataset.type;
+        const id = node.dataset.id;
+        Store.select(type, id);
+        Tabs.switch('test');
       });
     });
 
@@ -299,10 +332,12 @@ const Tree = {
       }
       case 'expand-all':
         (Store.state.groups || []).forEach(g => this.expanded.add(g.id));
+        this.saveExpanded();
         this.render();
         break;
       case 'collapse-all':
         this.expanded.clear();
+        this.saveExpanded();
         this.render();
         break;
       case 'delete-group': {

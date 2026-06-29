@@ -1496,6 +1496,10 @@ class RouterHandler(BaseHTTPRequestHandler):
         return json.loads(raw.decode("utf-8"))
 
     def _read_raw_body(self) -> bytes:
+        # do_PUT 转发到 do_POST 时会把 body 缓存在这里，避免重复读取 rfile
+        cached = getattr(self, "_put_body", None)
+        if cached is not None:
+            return cached
         length = int(self.headers.get("Content-Length", "0"))
         return self.rfile.read(length) if length else b"{}"
 
@@ -1776,7 +1780,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/settings":
             # 返回当前用户设置（开机自启、启动最小化等）
-            self._send_json(self.store.settings)
+            self._send_json(self.server.settings_store.to_dict())
             return
         if parsed.path == "/api/logs/export":
             csv_text = self.router.export_logs_csv()
@@ -2115,6 +2119,25 @@ class RouterHandler(BaseHTTPRequestHandler):
             except Exception as err:
                 self._send_text(str(err), status=500)
             return
+        self._send_text("not found", status=404)
+
+    def do_PUT(self) -> None:
+        """把 PUT /api/groups/{id} 和 PUT /api/models/{id} 转发到对应的 POST 处理逻辑。"""
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/groups/"):
+            group_id = parsed.path.split("/")[3]
+            payload = self._read_json()
+            payload["id"] = group_id
+            self.path = "/api/groups"
+            self._put_body = json.dumps(payload).encode("utf-8")
+            return self.do_POST()
+        if parsed.path.startswith("/api/models/"):
+            model_id = parsed.path.split("/")[3]
+            payload = self._read_json()
+            payload["id"] = model_id
+            self.path = "/api/models"
+            self._put_body = json.dumps(payload).encode("utf-8")
+            return self.do_POST()
         self._send_text("not found", status=404)
 
     def do_DELETE(self) -> None:

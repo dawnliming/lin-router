@@ -71,6 +71,13 @@
 
 .drag-over { outline: 2px dashed var(--accent); outline-offset: -2px; }
 
+.tree-label mark {
+  background: var(--warning);
+  color: #fff;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+
 .app.sidebar-collapsed .sidebar-title,
 .app.sidebar-collapsed .tree-label,
 .app.sidebar-collapsed .tree-badge,

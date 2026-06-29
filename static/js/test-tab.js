@@ -68,6 +68,7 @@ const TestTab = {
   },
 
   syncSelection() {
+    const templateSel = document.getElementById('test-template');
     if (Store.selected.type === 'group') {
       const sel = document.getElementById('test-group');
       if (sel) sel.value = Store.selected.id;
@@ -75,9 +76,13 @@ const TestTab = {
       const model = Store.getModel(Store.selected.id);
       const sel = document.getElementById('test-group');
       if (sel && model) sel.value = model.group_id;
+      // 选中具体模型时切换到指定模型模板，方便直接测试
+      if (templateSel && model) templateSel.value = 'model';
     }
     this.renderModelOptions();
     this.applyTemplate();
+    // 双击跳转等场景下自动聚焦请求体输入框
+    document.getElementById('test-body')?.focus();
   },
 
   renderModelOptions() {
