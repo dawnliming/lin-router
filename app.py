@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -20,13 +21,52 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from settings_store import SettingsStore
+
 
 DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+
+
+def _set_windows_auto_start(enabled: bool) -> bool:
+    """Windows 下设置当前用户开机自启（HKCU Run）。打包为 exe 时生效，开发模式跳过。"""
+    if not getattr(sys, "frozen", False):
+        # 开发模式下不写注册表，避免把 python.exe 写进去
+        return True
+    try:
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        exe = Path(sys.executable).resolve()
+        command = f'"{exe}" --tray'
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_WRITE) as key:
+            if enabled:
+                winreg.SetValueEx(key, "LinRouter", 0, winreg.REG_SZ, command)
+            else:
+                try:
+                    winreg.DeleteValue(key, "LinRouter")
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception:
+        return False
+
+
+def _get_windows_auto_start() -> bool:
+    """读取 Windows 当前用户开机自启是否启用。"""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ) as key:
+            winreg.QueryValueEx(key, "LinRouter")
+            return True
+    except (FileNotFoundError, OSError):
+        return False
+
+
 DEFAULT_CONFIG_FILE = "lin-router-config.json"
 DEFAULT_START_PORT = 18400
 DEFAULT_AUTO_MODEL_NAME = "lin-router-auto"
 DEFAULT_AUTO_MODEL_COOLDOWN_MINUTES = 5
 DEFAULT_PUBLIC_API_KEY = "lin-router"
+GLOBAL_ROUTE_GROUP_ID = "__global__"
 PROVIDER_ARK = "ark"
 PROVIDER_RELAY = "relay"
 PROVIDER_PROXY = "proxy"
@@ -180,7 +220,6 @@ class ConnectionGroup:
     route_key: str = ""
     auto_model_cooldown_minutes: int = DEFAULT_AUTO_MODEL_COOLDOWN_MINUTES
     waf_compatible: bool = False
-    auto_sticky_model_id: str = ""
     upstream_models: List[Dict[str, Any]] = field(default_factory=list)
     upstream_models_fetched_at: str = ""
 
@@ -196,7 +235,6 @@ class ConnectionGroup:
             route_key=str(data.get("route_key") or ""),
             auto_model_cooldown_minutes=int(data.get("auto_model_cooldown_minutes") or DEFAULT_AUTO_MODEL_COOLDOWN_MINUTES),
             waf_compatible=bool(data.get("waf_compatible", False)),
-            auto_sticky_model_id=str(data.get("auto_sticky_model_id") or ""),
             upstream_models=[item for item in data.get("upstream_models", []) if isinstance(item, dict)] if isinstance(data.get("upstream_models", []), list) else [],
             upstream_models_fetched_at=str(data.get("upstream_models_fetched_at") or ""),
         )
@@ -253,6 +291,8 @@ class RequestLog:
     group_name: str = ""
     provider_type: str = ""
     event: str = ""
+    request_id: str = ""
+    attempt: int = 0
 
 
 @dataclass
@@ -274,6 +314,11 @@ class RouteContext:
     provider_type: str
     base_url: str
     display_name: str
+    # passthrough 标识：proxy/ark 模式为 True，请求体与头部尽量原样转发；
+    # relay 模式为 False，允许 WAF 兼容、冷却、自动调度等专属逻辑介入。
+    passthrough: bool = True
+    # 全局 Key 标识：使用 DEFAULT_PUBLIC_API_KEY 时跨所有组调度
+    is_global: bool = False
 
 
 class ConfigStore:
@@ -469,14 +514,38 @@ class ConfigStore:
         return next((m for m in self.models if m.group_id == group_id and m.ep_id == ep_id), None)
 
 
+class AllModelsFailedError(RuntimeError):
+    """所有候选模型均不可用或均失败时抛出，便于外层返回 503。"""
+    def __init__(self, message: str, attempted: int = 0) -> None:
+        super().__init__(message)
+        self.attempted = attempted
+
+
 class ArkProxyRouter:
     def __init__(self, store: ConfigStore) -> None:
         self.store = store
         self.logs: List[RequestLog] = []
-        self.log_file = self.store.path.parent / ".tmp" / "request-logs.jsonl"
+        self.log_file = self._resolve_log_file()
+        self.log_write_error = ""
         self.upstream_locks: Dict[str, threading.Lock] = {}
         self.upstream_locks_guard = threading.Lock()
         self._load_log_file()
+
+    def _resolve_log_file(self) -> Path:
+        candidates = [
+            self.store.path.parent / "lin-router-logs.jsonl",
+            Path.home() / ".lin-router" / "logs" / "lin-router-logs.jsonl",
+            Path(tempfile.gettempdir()) / "lin-router-logs.jsonl",
+        ]
+        for candidate in candidates:
+            try:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                with candidate.open("a", encoding="utf-8"):
+                    pass
+                return candidate
+            except Exception:
+                continue
+        return candidates[-1]
 
     def add_log(
         self,
@@ -491,6 +560,8 @@ class ArkProxyRouter:
         cached_tokens: int = 0,
         group: Optional[ConnectionGroup] = None,
         event: str = "",
+        request_id: str = "",
+        attempt: int = 0,
     ) -> None:
         detail = self._sanitize_detail(detail)
         group_id = group.id if group else self._detail_value(detail, "group_id")
@@ -511,10 +582,27 @@ class ArkProxyRouter:
             group_name,
             provider_type,
             event or self._infer_event(status, detail),
+            request_id,
+            attempt,
         )
         self.logs.insert(0, item)
         self._append_log_file(item)
         del self.logs[80:]
+        self._trim_log_file()
+
+    def _trim_log_file(self, max_lines: int = 1000) -> None:
+        # 日志文件滚动策略：保留最近 1000 条，避免磁盘无限增长
+        try:
+            if not self.log_file.exists():
+                return
+            with self.log_file.open("r", encoding="utf-8") as f:
+                lines = [line for line in f if line.strip()]
+            if len(lines) <= max_lines:
+                return
+            with self.log_file.open("w", encoding="utf-8") as f:
+                f.writelines(lines[-max_lines:])
+        except Exception as exc:
+            self.log_write_error = f"日志滚动失败: {exc}"
 
     @staticmethod
     def _detail_value(detail: str, key: str) -> str:
@@ -571,6 +659,8 @@ class ArkProxyRouter:
             group_name=str(row.get("group_name") or ""),
             provider_type=str(row.get("provider_type") or ""),
             event=str(row.get("event") or ""),
+            request_id=str(row.get("request_id") or ""),
+            attempt=int(row.get("attempt") or 0),
         )
 
     def _load_log_file(self) -> None:
@@ -586,7 +676,8 @@ class ArkProxyRouter:
                     items.append(self._log_from_row(row))
             if items:
                 self.logs = items
-        except Exception:
+        except Exception as exc:
+            self.log_write_error = f"日志加载失败: {exc}"
             return
 
     def _append_log_file(self, item: RequestLog) -> None:
@@ -594,8 +685,28 @@ class ArkProxyRouter:
             self.log_file.parent.mkdir(parents=True, exist_ok=True)
             with self.log_file.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(asdict(item), ensure_ascii=False) + "\n")
-        except Exception:
-            return
+        except Exception as exc:
+            self.log_write_error = f"日志写入失败: {exc}"
+            # 在内存日志中插入一条系统级告警，方便用户从日志列表也能发现
+            self.logs.insert(0, RequestLog(
+                time=self._now(),
+                path="/system/log",
+                model="-",
+                status="warn",
+                detail=f"日志写入失败: {exc}; file={self.log_file}",
+                duration_ms=0,
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+                cached_tokens=0,
+                group_id="",
+                group_name="系统",
+                provider_type="system",
+                event="system",
+                request_id="",
+                attempt=0,
+            ))
+            del self.logs[80:]
 
     def recent_logs(self) -> List[Dict[str, str]]:
         return [asdict(item) for item in self.logs[:30]]
@@ -639,11 +750,13 @@ class ArkProxyRouter:
     def export_logs_csv(self) -> str:
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(["time", "path", "group_name", "provider_type", "model", "status", "event", "duration_ms", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "detail"])
+        writer.writerow(["time", "path", "request_id", "attempt", "group_name", "provider_type", "model", "status", "event", "duration_ms", "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "detail"])
         for item in self.all_logs():
             writer.writerow([
                 item.time,
                 item.path,
+                item.request_id,
+                item.attempt,
                 item.group_name,
                 item.provider_type,
                 item.model,
@@ -939,8 +1052,10 @@ class ArkProxyRouter:
     ) -> str:
         base = self._candidate_hit_detail(candidate, requested_label, suffix)
         group_name = str(candidate.group.name).replace(";", ",")
+        # mode=passthrough 表示该请求走透传路径（ark/proxy），relay 专属逻辑不介入
+        mode_tag = "passthrough" if candidate.group.provider_type != PROVIDER_RELAY else "relay"
         return (
-            f"{base}; group_id={candidate.group.id}; group_name={group_name}; provider={candidate.group.provider_type}; "
+            f"{base}; group_id={candidate.group.id}; group_name={group_name}; provider={candidate.group.provider_type}; mode={mode_tag}; "
             f"upstream={target_url}; body={body_mode}; "
             f"fingerprint=({self._payload_fingerprint(payload, body)}); "
             f"out_headers=({self._safe_header_view(headers)})"
@@ -1005,14 +1120,19 @@ class ArkProxyRouter:
             lock.release()
 
     def _iter_upstream_candidates(self, requested_model: str | None, group_id: str | None = None) -> Iterator[UpstreamCandidate]:
+        # 全局 Key：跨所有组按 models 数组顺序调度
+        if group_id == GLOBAL_ROUTE_GROUP_ID:
+            for idx, model in self._iter_candidates(requested_model, None):
+                group = self._group_for(model)
+                if group:
+                    yield self._candidate_from_model(idx, model, group)
+            return
         if group_id:
             group = self.store.find_group(group_id)
             if not group:
                 return
             matched = False
             candidates = list(self._iter_candidates(requested_model, group.id))
-            if self._is_auto_model(requested_model) and group.auto_sticky_model_id:
-                candidates.sort(key=lambda item: 0 if item[1].id == group.auto_sticky_model_id else 1)
             for idx, model in candidates:
                 matched = True
                 yield self._candidate_from_model(idx, model, group)
@@ -1067,14 +1187,6 @@ class ArkProxyRouter:
         if candidate.idx is not None:
             self._set_success(candidate.idx)
 
-    def _mark_sticky_success(self, candidate: UpstreamCandidate, auto_mode: bool) -> None:
-        if not auto_mode or candidate.idx is None or not candidate.model:
-            return
-        group = candidate.group
-        if group.auto_sticky_model_id != candidate.model.id:
-            group.auto_sticky_model_id = candidate.model.id
-            self.store.upsert_group(group)
-
     @staticmethod
     def _route_group_id(route: RouteContext | str | None) -> str | None:
         if isinstance(route, RouteContext):
@@ -1117,14 +1229,18 @@ class ArkProxyRouter:
         group_id = self._route_group_id(route)
         route_group = route.group if isinstance(route, RouteContext) else self.store.find_group(group_id) if group_id else None
         auto_mode = self._is_auto_model(str(requested_model) if requested_model else None)
-        relay_auto_mode = auto_mode and self._mode_for(route_group) == PROVIDER_RELAY
+        # auto_fallback：组级 auto 或全局 Key 模式下，失败时尝试下一个候选
+        auto_fallback = auto_mode or (isinstance(route, RouteContext) and route.is_global)
+        request_id = uuid.uuid4().hex[:12]
+        attempt = 0
         last_error: Optional[Exception] = None
 
         for candidate in self._iter_upstream_candidates(str(requested_model) if requested_model else None, group_id):
+            attempt += 1
             group = candidate.group
             target_url = self._resolve_url(group.base_url, path)
             if not candidate.auth_key:
-                self.add_log(path, candidate.label, "skip", f"requested={requested_label}; missing upstream api key")
+                self.add_log(path, candidate.label, "skip", f"requested={requested_label}; missing upstream api key", group=group, request_id=request_id, attempt=attempt, event="skip")
                 continue
             body, body_mode = self._body_for_upstream(payload, raw_body, str(requested_model) if requested_model else None, candidate.target_model)
             outbound_headers = self._headers_for(group, candidate.auth_key, incoming_headers, stream=False)
@@ -1144,7 +1260,6 @@ class ArkProxyRouter:
                     duration_ms = int((time.perf_counter() - started_at) * 1000)
                     prompt_tokens, completion_tokens, total_tokens, cached_tokens = self._usage_from_response(data)
                     self._mark_success(candidate)
-                    self._mark_sticky_success(candidate, auto_mode)
                     self.add_log(
                         path,
                         candidate.label,
@@ -1155,21 +1270,23 @@ class ArkProxyRouter:
                         completion_tokens,
                         total_tokens,
                         cached_tokens,
+                        group=group,
+                        event="ok",
                     )
                     return resp.status, dict(resp.headers.items()), data
             except HTTPError as err:
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 raw = err.read().decode("utf-8", "ignore") if hasattr(err, "read") else str(err)
                 last_error = err
-                if relay_auto_mode:
+                if auto_fallback and candidate.group.provider_type == PROVIDER_RELAY:
                     cooldown_seconds = self._auto_cooldown_seconds(group)
                     self._set_cooldown(candidate.idx, raw or str(err), cooldown_seconds, f"http_{err.code}")
                     detail = f"cooldown {cooldown_seconds // 60 or 0}m, try next; error={self._short_error(raw)}"
-                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms)
+                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms, group=group, request_id=request_id, attempt=attempt, event="cooldown")
                     continue
                 if self._is_quota_exhausted(err.code, raw):
                     self._mark_unusable(candidate, raw)
-                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "quota exhausted, try next"), duration_ms)
+                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "quota exhausted, try next"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback")
                     continue
                 if self._is_rate_limited(err.code, raw):
                     try:
@@ -1179,7 +1296,6 @@ class ArkProxyRouter:
                             retry_duration_ms = int((time.perf_counter() - retry_started_at) * 1000)
                             prompt_tokens, completion_tokens, total_tokens, cached_tokens = self._usage_from_response(data)
                             self._mark_success(candidate)
-                            self._mark_sticky_success(candidate, auto_mode)
                             self.add_log(
                                 path,
                                 candidate.label,
@@ -1190,38 +1306,40 @@ class ArkProxyRouter:
                                 completion_tokens,
                                 total_tokens,
                                 cached_tokens,
+                                group=group,
+                                event="retry_ok",
                             )
                             return resp.status, dict(resp.headers.items()), data
                     except Exception as retry_err:
                         last_error = retry_err
                         retry_duration_ms = int((time.perf_counter() - started_at) * 1000)
-                        self.add_log(path, candidate.label, "retry failed", self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, str(retry_err)), retry_duration_ms)
+                        self.add_log(path, candidate.label, "retry failed", self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, str(retry_err)), retry_duration_ms, group=group, request_id=request_id, attempt=attempt, event="error")
                         continue
                 if self._is_server_error(err.code):
-                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "server error, try next"), duration_ms)
+                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "server error, try next"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback")
                     continue
                 headers = dict(getattr(err, "headers", {}) or {})
                 detail = f"error={self._short_error(raw)}"
-                self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms)
+                self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms, group=group, request_id=request_id, attempt=attempt, event="error")
                 return err.code, headers, raw.encode("utf-8")
             except (URLError, TimeoutError, OSError) as err:
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 last_error = err
-                if relay_auto_mode:
+                if auto_fallback and candidate.group.provider_type == PROVIDER_RELAY:
                     cooldown_seconds = self._auto_cooldown_seconds(group)
                     self._set_cooldown(candidate.idx, str(err), cooldown_seconds, "network")
                     detail = f"cooldown {cooldown_seconds // 60 or 0}m, try next; error={self._short_error(str(err))}"
-                    self.add_log(path, candidate.label, "network", self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms)
+                    self.add_log(path, candidate.label, "network", self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network")
                     continue
                 detail = f"error={self._short_error(str(err))}"
-                self.add_log(path, candidate.label, "network", self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms)
+                self.add_log(path, candidate.label, "network", self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network")
                 continue
             finally:
                 self._release_lock(upstream_lock)
 
         if last_error is None:
-            raise RuntimeError("No usable models available")
-        raise RuntimeError("All available models failed") from last_error
+            raise AllModelsFailedError("No usable models available", attempted=attempt - 1)
+        raise AllModelsFailedError(f"All available models failed, attempted {attempt - 1}", attempted=attempt - 1) from last_error
 
     def stream(self, path: str, payload: Dict[str, Any], route: RouteContext | str | None = None, incoming_headers: Optional[Dict[str, str]] = None, raw_body: bytes | None = None) -> Tuple[int, Dict[str, str], Iterable[bytes]]:
         self.store.refresh_expired_cooldowns()
@@ -1231,14 +1349,18 @@ class ArkProxyRouter:
         group_id = self._route_group_id(route)
         route_group = route.group if isinstance(route, RouteContext) else self.store.find_group(group_id) if group_id else None
         auto_mode = self._is_auto_model(str(requested_model) if requested_model else None)
-        relay_auto_mode = auto_mode and self._mode_for(route_group) == PROVIDER_RELAY
+        # auto_fallback：组级 auto 或全局 Key 模式下，失败时尝试下一个候选
+        auto_fallback = auto_mode or (isinstance(route, RouteContext) and route.is_global)
+        request_id = uuid.uuid4().hex[:12]
+        attempt = 0
         last_error: Optional[Exception] = None
 
         for candidate in self._iter_upstream_candidates(str(requested_model) if requested_model else None, group_id):
+            attempt += 1
             group = candidate.group
             target_url = self._resolve_url(group.base_url, path)
             if not candidate.auth_key:
-                self.add_log(path, candidate.label, "skip", f"requested={requested_label}; missing upstream api key")
+                self.add_log(path, candidate.label, "skip", f"requested={requested_label}; missing upstream api key", group=group, request_id=request_id, attempt=attempt, event="skip")
                 continue
             body, body_mode = self._body_for_upstream(payload, raw_body, str(requested_model) if requested_model else None, candidate.target_model)
             outbound_headers = self._headers_for(group, candidate.auth_key, incoming_headers, stream=True)
@@ -1256,8 +1378,7 @@ class ArkProxyRouter:
                 resp = urlopen(request, timeout=120)
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 self._mark_success(candidate)
-                self._mark_sticky_success(candidate, auto_mode)
-                self.add_log(path, candidate.label, "200", self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "stream ok"), duration_ms)
+                self.add_log(path, candidate.label, "200", self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "stream ok"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="stream_ok")
 
                 def iterator() -> Iterator[bytes]:
                     latest_usage = (0, 0, 0, 0)
@@ -1281,43 +1402,44 @@ class ArkProxyRouter:
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 raw = err.read().decode("utf-8", "ignore") if hasattr(err, "read") else str(err)
                 last_error = err
-                if relay_auto_mode:
+                if auto_fallback and candidate.group.provider_type == PROVIDER_RELAY:
                     cooldown_seconds = self._auto_cooldown_seconds(group)
                     self._set_cooldown(candidate.idx, raw or str(err), cooldown_seconds, f"http_{err.code}")
                     detail = f"cooldown {cooldown_seconds // 60 or 0}m, try next; error={self._short_error(raw)}"
-                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms)
+                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms, group=group, request_id=request_id, attempt=attempt, event="cooldown")
                     continue
                 if self._is_quota_exhausted(err.code, raw):
                     self._mark_unusable(candidate, raw)
-                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "quota exhausted, try next"), duration_ms)
+                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "quota exhausted, try next"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback")
                     continue
                 if self._is_rate_limited(err.code, raw):
-                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "rate limited, try next"), duration_ms)
+                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "rate limited, try next"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback")
                     continue
                 if self._is_server_error(err.code):
-                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "server error, try next"), duration_ms)
+                    self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, "server error, try next"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback")
                     continue
                 headers = dict(getattr(err, "headers", {}) or {})
                 detail = f"error={self._short_error(raw)}"
-                self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms)
+                self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms, group=group, request_id=request_id, attempt=attempt, event="error")
                 return err.code, headers, [raw.encode("utf-8")]
             except (URLError, TimeoutError, OSError) as err:
                 self._release_lock(upstream_lock)
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 last_error = err
-                if relay_auto_mode:
+                if auto_fallback and candidate.group.provider_type == PROVIDER_RELAY:
                     cooldown_seconds = self._auto_cooldown_seconds(group)
                     self._set_cooldown(candidate.idx, str(err), cooldown_seconds, "network")
                     detail = f"cooldown {cooldown_seconds // 60 or 0}m, try next; error={self._short_error(str(err))}"
-                    self.add_log(path, candidate.label, "network", self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms)
+                    self.add_log(path, candidate.label, "network", self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network")
                     continue
                 detail = f"error={self._short_error(str(err))}"
-                self.add_log(path, candidate.label, "network", self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms)
+                self.add_log(path, candidate.label, "network", self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload, outbound_headers, detail), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network")
                 continue
 
         if last_error is None:
-            raise RuntimeError("No usable models available")
-        raise RuntimeError("All available models failed") from last_error
+            raise AllModelsFailedError("No usable models available", attempted=attempt - 1)
+        raise AllModelsFailedError(f"All available models failed, attempted {attempt - 1}", attempted=attempt - 1) from last_error
+
 
 
 
@@ -1401,6 +1523,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                     str(resp.status),
                     f"fetch upstream models ok; upstream={target_url}; out_headers=({self.router._safe_header_view(headers)})",
                     duration_ms,
+                    group=group,
+                    event="fetch_models",
                 )
         except HTTPError as err:
             duration_ms = int((time.perf_counter() - started_at) * 1000)
@@ -1411,6 +1535,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 str(err.code),
                 f"fetch upstream models failed; upstream={target_url}; error={self.router._short_error(body)}; out_headers=({self.router._safe_header_view(headers)})",
                 duration_ms,
+                group=group,
+                event="fetch_models_failed",
             )
             raise RuntimeError(body or f"upstream error {err.code}") from err
         except Exception as err:
@@ -1421,6 +1547,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 "network",
                 f"fetch upstream models failed; upstream={target_url}; error={self.router._short_error(str(err))}; out_headers=({self.router._safe_header_view(headers)})",
                 duration_ms,
+                group=group,
+                event="fetch_models_failed",
             )
             raise
         payload = json.loads(raw.decode("utf-8"))
@@ -1443,7 +1571,6 @@ class RouterHandler(BaseHTTPRequestHandler):
             route_key=new_route_key(),
             auto_model_cooldown_minutes=source.auto_model_cooldown_minutes if source.provider_type == PROVIDER_RELAY else 0,
             waf_compatible=source.waf_compatible,
-            auto_sticky_model_id="",
             upstream_models=[dict(item) for item in source.upstream_models],
             upstream_models_fetched_at=source.upstream_models_fetched_at,
         )
@@ -1479,6 +1606,19 @@ class RouterHandler(BaseHTTPRequestHandler):
         key = parse_bearer_key(self.headers.get("Authorization", ""))
         if not key:
             return None
+        # 全局 Key：跨所有连接组顺序调度
+        if key == DEFAULT_PUBLIC_API_KEY:
+            first_group = self.store.groups[0] if self.store.groups else None
+            return RouteContext(
+                client_key=key,
+                group=first_group,
+                group_id=GLOBAL_ROUTE_GROUP_ID,
+                provider_type="global",
+                base_url=first_group.base_url if first_group else DEFAULT_BASE_URL,
+                display_name="全局调度",
+                passthrough=False,
+                is_global=True,
+            )
         group = self.store.find_group_by_route_key(key)
         if not group:
             return None
@@ -1489,6 +1629,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             provider_type=group.provider_type,
             base_url=group.base_url,
             display_name=group.name,
+            # 仅 relay 模式不走 passthrough；ark/proxy 均视为透传，避免中转站专属逻辑污染
+            passthrough=group.provider_type != PROVIDER_RELAY,
         )
 
     def _route_group(self) -> Optional[ConnectionGroup]:
@@ -1529,6 +1671,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             if not ctx:
                 return
             group = ctx.group
+            # 全局 Key：返回所有组的所有可用模型
+            visible_group = None if ctx.is_global else group
             auto_model_name = DEFAULT_AUTO_MODEL_NAME
             self._send_json({
                 "object": "list",
@@ -1543,9 +1687,9 @@ class RouterHandler(BaseHTTPRequestHandler):
                         "parent": None,
                         "display_name": auto_model_name,
                         "router_virtual": True,
-                        "group_id": group.id,
-                        "group_name": group.name,
-                        "provider_type": group.provider_type,
+                        "group_id": GLOBAL_ROUTE_GROUP_ID if ctx.is_global else group.id,
+                        "group_name": "全局调度" if ctx.is_global else group.name,
+                        "provider_type": "global" if ctx.is_global else group.provider_type,
                     },
                     *[
                     {
@@ -1559,20 +1703,25 @@ class RouterHandler(BaseHTTPRequestHandler):
                         "display_name": model.name,
                         "ep_id": model.ep_id,
                         "group_id": model.group_id,
-                        "provider_type": group.provider_type,
+                        "provider_type": self._group_for(model).provider_type if self._group_for(model) else "",
                         "price_group": model.price_group,
                     }
-                    for model in self._visible_models(group)
+                    for model in self._visible_models(visible_group)
                     ],
                 ],
             })
             return
         if parsed.path == "/api/state":
             self.store.refresh_expired_cooldowns()
+            settings = self.server.settings_store.to_dict()  # type: ignore[attr-defined]
             self._send_json({
                 "config_file": str(self.store.path),
                 "auto_model_name": DEFAULT_AUTO_MODEL_NAME,
-                "public_api_key": DEFAULT_PUBLIC_API_KEY,
+                "settings": {
+                    **settings,
+                    # 开机自启以注册表真实状态为准
+                    "auto_start": _get_windows_auto_start(),
+                },
                 "group_meta": {
                     group.id: {
                         "auto_model_name": self.router.group_auto_model_name(group),
@@ -1584,6 +1733,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 "groups": [asdict(g) for g in self.store.groups],
                 "models": [asdict(m) for m in self.store.models],
                 "logs": self.router.recent_logs(),
+                "log_file": str(self.router.log_file),
+                "log_write_error": self.router.log_write_error,
             })
             return
         if parsed.path.startswith("/api/client-config/"):
@@ -1600,9 +1751,28 @@ class RouterHandler(BaseHTTPRequestHandler):
                 "group_name": group.name,
             })
             return
+        if parsed.path == "/api/settings":
+            # 返回当前用户设置（开机自启、启动最小化等）
+            self._send_json(self.store.settings)
+            return
         if parsed.path == "/api/logs/export":
             csv_text = self.router.export_logs_csv()
             self._send_text(csv_text, content_type="text/csv; charset=utf-8")
+            return
+        if parsed.path == "/api/config/export":
+            # 导出当前配置（groups + models），用于备份和迁移
+            payload = {
+                "groups": [asdict(g) for g in self.store.groups],
+                "models": [asdict(m) for m in self.store.models],
+            }
+            body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="lin-router-config-export.json"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if parsed.path == "/health":
             self._send_json({"ok": True, "groups": len(self.store.groups), "models": len(self.store.models)})
@@ -1611,6 +1781,55 @@ class RouterHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/config/import":
+            # 导入配置：合并模式，按 id 覆盖同名连接组/模型，其余保留
+            payload = self._read_json()
+            groups_raw = payload.get("groups") or []
+            models_raw = payload.get("models") or []
+            if not isinstance(groups_raw, list) or not isinstance(models_raw, list):
+                self._send_text("invalid payload: groups and models must be arrays", status=400)
+                return
+            with self.store._lock:
+                existing_group_ids = {g.id for g in self.store.groups}
+                for item in groups_raw:
+                    if not isinstance(item, dict) or not item.get("name"):
+                        continue
+                    group = ConnectionGroup.from_dict(item)
+                    if not group.route_key:
+                        group.route_key = new_route_key()
+                    if not group.provider_type:
+                        group.provider_type = PROVIDER_ARK
+                    # 按 id 覆盖，否则追加
+                    for idx, existing in enumerate(self.store.groups):
+                        if existing.id == group.id:
+                            self.store.groups[idx] = group
+                            break
+                    else:
+                        self.store.groups.append(group)
+                existing_model_ids = {m.id for m in self.store.models}
+                for item in models_raw:
+                    if not isinstance(item, dict) or not item.get("name") or not item.get("ep_id"):
+                        continue
+                    model = ModelConfig.from_dict(item)
+                    # 缺失 group_id 时挂到第一个组，避免悬空
+                    if not model.group_id or not self.store.find_group(model.group_id):
+                        if self.store.groups:
+                            model.group_id = self.store.groups[0].id
+                        else:
+                            continue
+                    for idx, existing in enumerate(self.store.models):
+                        if existing.id == model.id:
+                            self.store.models[idx] = model
+                            break
+                    else:
+                        self.store.models.append(model)
+                self.store.save()
+            self._send_json({
+                "ok": True,
+                "groups": len(self.store.groups),
+                "models": len(self.store.models),
+            })
+            return
         if parsed.path == "/api/groups":
             payload = self._read_json()
             if not payload.get("name"):
@@ -1757,7 +1976,13 @@ class RouterHandler(BaseHTTPRequestHandler):
             if not model:
                 self._send_text("model not found", status=404)
                 return
-            if model.usable:
+            if model.cooldown_until:
+                model.usable = True
+                model.cooldown_until = 0
+                model.cooldown_reason = ""
+                model.last_error = ""
+                model.last_checked_at = self.router._now()
+            elif model.usable:
                 model.usable = False
             else:
                 model.usable = True
@@ -1785,6 +2010,25 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.router.clear_logs()
             self._send_json({"ok": True})
             return
+        if parsed.path == "/api/settings":
+            # 更新用户设置，未知字段会被忽略
+            raw = self._read_raw_body()
+            payload = self._json_from_raw(raw)
+            if not isinstance(payload, dict):
+                self._send_text("invalid payload", status=400)
+                return
+            allowed = {"auto_start", "start_minimized"}
+            new_settings = {k: v for k, v in payload.items() if k in allowed}
+            # 开机自启需要同步到 Windows 注册表
+            if "auto_start" in new_settings:
+                _set_windows_auto_start(bool(new_settings["auto_start"]))
+            settings_store = self.server.settings_store  # type: ignore[attr-defined]
+            updated = settings_store.update(new_settings)
+            self._send_json({
+                **updated,
+                "auto_start": _get_windows_auto_start(),
+            })
+            return
         if parsed.path == "/api/test":
             ctx = self._require_route_context()
             if not ctx:
@@ -1796,6 +2040,14 @@ class RouterHandler(BaseHTTPRequestHandler):
             try:
                 status, headers, result = self.router.call(path, body, ctx, dict(self.headers.items()))
                 self._send_json({"status": status, "headers": headers, "body": result.decode("utf-8", "ignore")})
+            except AllModelsFailedError as err:
+                self._send_json({
+                    "error": {
+                        "message": f"{err}，共尝试 {err.attempted} 个上游",
+                        "type": "all_models_failed",
+                        "code": "service_unavailable",
+                    }
+                }, status=503)
             except Exception as err:
                 self._send_text(str(err), status=500)
             return
@@ -1829,6 +2081,14 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+            except AllModelsFailedError as err:
+                self._send_json({
+                    "error": {
+                        "message": f"{err}，共尝试 {err.attempted} 个上游",
+                        "type": "all_models_failed",
+                        "code": "service_unavailable",
+                    }
+                }, status=503)
             except Exception as err:
                 self._send_text(str(err), status=500)
             return
@@ -1902,19 +2162,23 @@ def create_server(
     store = ConfigStore(config_path)
     store.reset_usable()
     router = ArkProxyRouter(store)
+    settings_store = SettingsStore(config_path)
     selected_port = pick_port(port, host)
 
     server = ThreadingHTTPServer((host, selected_port), RouterHandler)
     server.store = store  # type: ignore[attr-defined]
     server.router = router  # type: ignore[attr-defined]
+    server.settings_store = settings_store  # type: ignore[attr-defined]
     return server, selected_port, config_path.resolve()
 
 
 def main() -> None:
+    # 默认配置文件固定在项目根目录，不跟随命令行工作目录变化
+    default_config = str(Path(__file__).resolve().parent / DEFAULT_CONFIG_FILE)
     parser = argparse.ArgumentParser(description="Lin Router proxy UI")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=DEFAULT_START_PORT, type=int)
-    parser.add_argument("--config", default=DEFAULT_CONFIG_FILE)
+    parser.add_argument("--config", default=default_config)
     args = parser.parse_args()
 
     server, port, config_path = create_server(args.host, args.port, args.config)

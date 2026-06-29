@@ -79,10 +79,23 @@
     .sectionHeading { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px; }
     .sectionHeading h2 { margin:0; }
     .pill { display:inline-block; padding:2px 7px; border-radius:999px; background:#edf7f1; color:var(--ok); font-size:12px; line-height:1.3; }
-    .pill.off { background:#fff3e6; color:var(--warn); }
+    .pill.off { background:#f1f5f9; color:var(--muted); }
     .pill.bad { background:#fff0f0; color:var(--bad); }
-    .resultText { max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .pill.cooldown { background:#fff3e6; color:var(--warn); }
+    .pill.warn { background:#fff3e6; color:var(--warn); }
+.resultText { max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .log { white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; background:#0f172a; color:#d9e2ff; border-radius:6px; padding:12px; min-height:120px; max-height:260px; overflow:auto; }
+    .logDetailRow { background:#f8fafc; }
+    .logDetailRow td { border-bottom:1px solid var(--line); padding:12px; }
+    .logDetailGrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:10px; font-size:12px; }
+    .logDetailBlock { background:#fff; border:1px solid var(--line); border-radius:6px; padding:10px; }
+    .logDetailBlock h4 { margin:0 0 8px; font-size:13px; color:var(--text); }
+    .logDetailBlock dl { margin:0; }
+    .logDetailBlock dt { color:var(--muted); font-size:11px; margin-top:6px; }
+    .logDetailBlock dd { margin:2px 0 0; color:var(--text); overflow-wrap:anywhere; }
+    .logRoutePath { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12px; }
+    .logRoutePath span { background:#fff; border:1px solid var(--line); border-radius:6px; padding:4px 8px; }
+    .logRoutePath .arrow { color:var(--muted); border:none; padding:0; background:none; }
     @media (max-width: 980px) { .shell { grid-template-columns:1fr; } .hero { grid-template-columns:1fr; } }
   </style>
 </head>
@@ -98,11 +111,31 @@
         <h2>客户端接入</h2>
         <div class="heroUrl" id="clientUrl">加载中...</div>
         <div class="muted tiny" style="margin-top:8px">Hermes / Codex++ 填这个 Base URL；API Key 使用目标连接组的本地 lr-... Key。</div>
+        <div class="muted tiny" style="margin-top:4px;"><strong>全局 Key（跨所有组自动调度）：<span id="globalKey">lin-router</span></strong> — 会在所有连接组中按顺序挑选第一个可用模型。</div>
+        <div id="logWriteError" class="tiny" style="margin-top:6px; color:var(--bad); display:none;"></div>
       </div>
-      <button type="button" id="copyClientBtn">复制地址</button>
+      <div class="row" style="flex-direction:column; gap:8px; align-items:flex-end;">
+        <button type="button" id="copyClientBtn">复制地址</button>
+        <button type="button" id="copyGlobalKeyBtn">复制全局 Key</button>
+      </div>
     </section>
 
     <aside class="side">
+      <details class="panel">
+        <summary>⚙ 设置</summary>
+        <div class="panelBody">
+          <label class="row" style="justify-content:space-between; align-items:center; margin-bottom:10px;">
+            <span>开机自启（Windows 当前用户）</span>
+            <input type="checkbox" id="settingAutoStart">
+          </label>
+          <label class="row" style="justify-content:space-between; align-items:center;">
+            <span>启动后最小化到托盘</span>
+            <input type="checkbox" id="settingStartMinimized">
+          </label>
+          <div class="muted tiny" style="margin-top:10px;">开机自启会写入注册表启动项；被杀软拦截属于正常情况。</div>
+        </div>
+      </details>
+
       <details class="panel" open>
         <summary>连接组</summary>
         <div class="panelBody">
@@ -194,6 +227,18 @@
           </div>
         </div>
       </details>
+
+      <details class="panel">
+        <summary>配置导入 / 导出</summary>
+        <div class="panelBody">
+          <div class="row" style="margin-bottom:10px">
+            <button type="button" id="exportConfigBtn">导出配置</button>
+            <button type="button" id="importConfigBtn">导入配置</button>
+            <input id="importConfigFile" type="file" accept="application/json,.json" style="display:none;">
+          </div>
+          <div class="muted tiny">导出当前连接组与模型为 JSON；导入时按 ID 合并，同名覆盖、其余保留。</div>
+        </div>
+      </details>
     </aside>
 
     <main class="main">
@@ -233,25 +278,40 @@
       </details>
 
       <details class="panel" open>
-        <summary>最近请求</summary>
+        <summary>最近请求 <span id="logStatusIcon" class="tiny" style="float:right;"></span></summary>
         <div class="panelBody">
           <div class="row" style="margin-bottom:10px">
-            <input id="logStart" type="datetime-local" title="&#x5f00;&#x59cb;&#x65f6;&#x95f4;">
-            <input id="logEnd" type="datetime-local" title="&#x7ed3;&#x675f;&#x65f6;&#x95f4;">
-            <select id="logGroupFilter"></select>
-            <select id="logStatusFilter">
-              <option value="">&#x5168;&#x90e8;&#x72b6;&#x6001;</option>
-              <option value="2xx">&#x6210;&#x529f;</option>
-              <option value="error">&#x5f02;&#x5e38;</option>
-              <option value="cooldown">&#x51b7;&#x5374;/&#x5207;&#x6362;</option>
-            </select>
+            <button type="button" id="clearLogsBtn">清空日志</button>
+            <button type="button" id="exportLogsBtn">导出 CSV</button>
           </div>
-          <div class="row" style="margin-bottom:10px">
-            <button type="button" id="clearLogsBtn">&#x6e05;&#x7a7a;&#x65e5;&#x5fd7;</button>
-            <button type="button" id="exportLogsBtn">&#x5bfc;&#x51fa; CSV</button>
+          <!-- 日志筛选：时间范围 / 连接组 / 状态 -->
+          <div class="row" style="margin-bottom:10px; gap:8px;">
+            <div style="flex:1 1 160px; min-width:140px;">
+              <label style="margin:0 0 2px;">开始时间</label>
+              <input id="logStart" type="datetime-local">
+            </div>
+            <div style="flex:1 1 160px; min-width:140px;">
+              <label style="margin:0 0 2px;">结束时间</label>
+              <input id="logEnd" type="datetime-local">
+            </div>
+            <div style="flex:1 1 160px; min-width:140px;">
+              <label style="margin:0 0 2px;">连接组</label>
+              <select id="logGroupFilter">
+                <option value="">全部</option>
+              </select>
+            </div>
+            <div style="flex:1 1 160px; min-width:140px;">
+              <label style="margin:0 0 2px;">状态</label>
+              <select id="logStatusFilter">
+                <option value="">全部</option>
+                <option value="2xx">2xx 成功</option>
+                <option value="cooldown">冷却/切换/重试</option>
+                <option value="error">错误</option>
+              </select>
+            </div>
           </div>
           <table>
-            <thead><tr><th>&#x65f6;&#x95f4;</th><th>&#x8fde;&#x63a5;&#x7ec4;</th><th>&#x6a21;&#x578b;</th><th>&#x72b6;&#x6001;</th><th>&#x4e8b;&#x4ef6;</th><th>&#x8017;&#x65f6;</th><th>Token</th><th>&#x8be6;&#x60c5;</th><th>&#x64cd;&#x4f5c;</th></tr></thead>
+            <thead><tr><th>时间</th><th>组</th><th>模型</th><th>状态</th><th>事件</th><th>请求#次</th><th>耗时</th><th>Token</th><th>详情</th><th>操作</th></tr></thead>
             <tbody id="logTbody"></tbody>
           </table>
         </div>
@@ -279,15 +339,14 @@
 
     function statusInfo(m) {
       const group = state.groups.find(g => g.id === m.group_id);
-      if (group?.provider_type !== "relay") {
-        if (!m.usable) return { text:"停用", cls:"off", detail:m.last_error ? "额度耗尽或手动停用" : "手动停用" };
-        if (m.last_error) return { text:"异常", cls:"bad", detail:m.last_error };
-        if (m.last_success_at) return { text:"可用", cls:"", detail:`最近成功 ${m.last_success_at}` };
-        return { text:"待测", cls:"off", detail:"尚未成功调用" };
-      }
-      if (m.cooldown_until) {
-        const until = new Date(Number(m.cooldown_until) * 1000);
-        return { text:"冷却", cls:"off", detail:`冷却至 ${until.toLocaleString("zh-CN")}` };
+      const nowSec = Math.floor(Date.now() / 1000);
+      const isRelay = group?.provider_type === "relay";
+      // 冷却状态优先级最高（仅中转站生效）
+      if (isRelay && m.cooldown_until && Number(m.cooldown_until) > nowSec) {
+        const remain = Number(m.cooldown_until) - nowSec;
+        const mm = Math.floor(remain / 60).toString().padStart(2, "0");
+        const ss = (remain % 60).toString().padStart(2, "0");
+        return { text:"冷却中", cls:"cooldown", detail:`${m.cooldown_reason || ""} 剩余 ${mm}:${ss}` };
       }
       if (!m.usable) return { text:"停用", cls:"off", detail:m.last_error ? "额度耗尽或手动停用" : "手动停用" };
       if (m.last_error) return { text:"异常", cls:"bad", detail:m.last_error };
@@ -313,7 +372,8 @@
     }
 
     function eventLabel(event) {
-      const map = { ok:"\u6210\u529f", stream_ok:"\u6d41\u5f0f\u6210\u529f", retry_ok:"\u91cd\u8bd5\u6210\u529f", cooldown:"\u8fdb\u5165\u51b7\u5374", fallback:"\u5207\u6362\u5c1d\u8bd5", skip:"\u8df3\u8fc7", network:"\u7f51\u7edc\u5f02\u5e38", error:"\u5f02\u5e38" };
+      // 事件类型中文映射，便于在日志列表中识别
+      const map = { ok:"成功", stream_ok:"流式成功", retry_ok:"重试成功", cooldown:"冷却切换", fallback:"自动切换", skip:"跳过", network:"网络错误", error:"错误", system:"系统" };
       return map[event] || event || "-";
     }
 
@@ -346,20 +406,108 @@
       return true;
     }
 
+    function parseDetail(detail) {
+      // 把后端 detail 字符串解析成结构化对象，便于详情展示
+      const result = {};
+      if (!detail) return result;
+      const regex = /(?:^|;\s*)([^=;]+)=([^;]*)/g;
+      let match;
+      while ((match = regex.exec(detail)) !== null) {
+        const key = match[1].trim();
+        const value = match[2].trim();
+        if (key) result[key] = value;
+      }
+      return result;
+    }
+
+    function renderLogDetail(item) {
+      const parsed = parseDetail(item.detail);
+      const routeSteps = [
+        parsed.requested ? esc(parsed.requested) : (item.model || "lin-router-auto"),
+        parsed.group_name ? esc(parsed.group_name) : esc(logGroupName(item)),
+        parsed.model ? esc(parsed.model) : esc(item.model),
+        parsed.upstream ? esc(parsed.upstream) : "-",
+        parsed.channel ? esc(parsed.channel) : "-",
+      ];
+      const routePathHtml = routeSteps.map((s, i) => {
+        if (i === 0) return `<span>${s}</span>`;
+        return `<span class="arrow">→</span><span>${s}</span>`;
+      }).join("");
+      return `<div class="logDetailGrid">
+        <div class="logDetailBlock">
+          <h4>基础信息</h4>
+          <dl>
+            <dt>时间</dt><dd>${esc(item.time)}</dd>
+            <dt>耗时</dt><dd>${Number(item.duration_ms || 0) ? `${Number(item.duration_ms)} ms` : "-"}</dd>
+            <dt>状态</dt><dd><span class="pill ${logStatusClass(item.status)}">${esc(item.status)}</span> ${esc(eventLabel(item.event))}</dd>
+            <dt>请求 ID / 次</dt><dd>${esc(item.request_id || "-")} #${Number(item.attempt || 0)}</dd>
+          </dl>
+        </div>
+        <div class="logDetailBlock">
+          <h4>路由路径</h4>
+          <div class="logRoutePath">${routePathHtml}</div>
+          <dl style="margin-top:10px;">
+            <dt>模式</dt><dd>${esc(parsed.provider || item.provider_type || "-")}</dd>
+            <dt>Mode</dt><dd>${esc(parsed.mode || "-")}</dd>
+          </dl>
+        </div>
+      </div>
+      <details style="margin-top:10px;">
+        <summary style="font-size:12px; color:var(--muted); cursor:pointer;">技术细节</summary>
+        <div class="logDetailGrid" style="margin-top:8px;">
+          <div class="logDetailBlock">
+            <dl>
+              <dt>上游地址</dt><dd>${esc(parsed.upstream || "-")}</dd>
+              <dt>Body 模式</dt><dd>${esc(parsed.body || "-")}</dd>
+              <dt>Fingerprint</dt><dd>${esc(parsed.fingerprint || "-")}</dd>
+            </dl>
+          </div>
+          <div class="logDetailBlock">
+            <dl>
+              <dt>Tokens</dt><dd>${esc(tokenSummary(item))}</dd>
+              <dt>详情原文</dt><dd style="white-space:pre-wrap; overflow-wrap:anywhere;">${esc(item.detail)}</dd>
+            </dl>
+          </div>
+        </div>
+      </details>`;
+    }
+
+    function resetLogFilters() {
+      // 重置日志筛选条件为默认（全部）
+      $("logStart").value = "";
+      $("logEnd").value = "";
+      $("logGroupFilter").value = "";
+      $("logStatusFilter").value = "";
+      renderLogRows();
+    }
+
     function renderLogRows() {
-      const rows = (state.logs || []).filter(logMatchesFilters).map((item, idx) => `<tr>
+      // 渲染日志行：先按筛选条件过滤，再生成表格内容；每行可展开详情
+      const filtered = (state.logs || []).filter(logMatchesFilters);
+      if (!filtered.length) {
+        $("logTbody").innerHTML = `<tr><td colspan="10" class="muted" style="text-align:center; padding:20px;">
+          <div>暂无符合条件的日志</div>
+          <button type="button" id="resetLogFiltersBtn" style="margin-top:10px;">重置筛选</button>
+        </td></tr>`;
+        $("resetLogFiltersBtn").onclick = resetLogFilters;
+        return;
+      }
+      const rows = filtered.map((item, idx) => `<tr data-log-row="${idx}">
         <td class="tiny">${esc(item.time)}</td>
         <td class="tiny">${esc(logGroupName(item))}</td>
         <td>${esc(item.model)}</td>
         <td><span class="pill ${logStatusClass(item.status)}">${esc(item.status)}</span></td>
         <td class="tiny">${esc(eventLabel(item.event))}</td>
+        <td class="tiny">${Number(item.request_id ? 1 : 0) ? `${esc(item.request_id)}#${Number(item.attempt || 0)}` : "-"}</td>
         <td class="tiny">${Number(item.duration_ms || 0) ? `${Number(item.duration_ms)} ms` : "-"}</td>
         <td class="tiny">${esc(tokenSummary(item))}</td>
         <td class="tiny resultText" title="${esc(item.detail)}">${esc(item.detail)}</td>
-        <td><button type="button" data-log-detail="${idx}">&#x67e5;&#x770b;</button></td>
+        <td><button type="button" data-log-detail="${idx}">查看</button></td>
+      </tr>
+      <tr class="logDetailRow" data-log-detail-row="${idx}" style="display:none;">
+        <td colspan="10">${renderLogDetail(item)}</td>
       </tr>`).join("");
-      $("logTbody").innerHTML = rows || '<tr><td colspan="9" class="muted">\u6682\u65e0\u8bf7\u6c42</td></tr>';
-      bindLogActions();
+      $("logTbody").innerHTML = rows;
     }
 
     function groupModels(groupId) {
@@ -584,18 +732,20 @@
         : group?.provider_type === "proxy" ? "通用代理"
         : "火山";
       const upstream = group?.provider_type === "ark" ? model.ep_id : (model.upstream_model || model.ep_id);
+      const isCooldown = info.cls === "cooldown";
+      const toggleLabel = isCooldown ? "恢复" : (model.usable ? "停用" : "启用");
       return `<tr>
         <td>${model.__index + 1}</td>
         <td>${esc(model.name)}</td>
         <td class="tiny">${esc(upstream)}</td>
         <td class="tiny">${esc(channel)}</td>
         <td><span class="pill ${info.cls}">${info.text}</span></td>
-        <td class="tiny resultText" title="${esc(info.detail)}">${esc(info.detail)}</td>
+        <td class="tiny resultText" title="${esc(info.detail)}" data-cooldown-detail="${isCooldown ? model.id : ""}">${esc(info.detail)}</td>
         <td class="actions"><div class="actionGroup">
           <button type="button" data-edit="${model.id}">编辑</button>
           <button type="button" data-move-up="${model.id}">上移</button>
           <button type="button" data-move-down="${model.id}">下移</button>
-          <button type="button" data-toggle="${model.id}">${model.usable ? "停用" : "启用"}</button>
+          <button type="button" data-toggle="${model.id}">${toggleLabel}</button>
           <button type="button" data-del="${model.id}" class="danger">删除</button>
         </div></td>
       </tr>`;
@@ -616,9 +766,13 @@
 
     function bindLogActions() {
       document.querySelectorAll("[data-log-detail]").forEach(btn => btn.onclick = () => {
-        const item = (state.logs || [])[Number(btn.dataset.logDetail)];
-        if (!item) return;
-        log(`${item.time} ${item.model} ${item.status}\n${item.detail || "无详情"}`);
+        const idx = Number(btn.dataset.logDetail);
+        const detailRow = document.querySelector(`[data-log-detail-row="${idx}"]`);
+        if (!detailRow) return;
+        const isHidden = detailRow.style.display === "none";
+        // 收起其它已展开的详情行
+        document.querySelectorAll("[data-log-detail-row]").forEach(row => row.style.display = "none");
+        detailRow.style.display = isHidden ? "" : "none";
       });
     }
 
@@ -633,43 +787,43 @@
               <strong>${esc(group.name)}</strong>
               <div class="groupCardMeta tiny muted">
                 <span>${esc(providerLabel(group))}</span>
-                <span>&#x6a21;&#x578b; ${meta.model_count}</span>
-                <span>&#x53ef;&#x7528; ${meta.usable_count}</span>
-                <span>&#x81ea;&#x52a8;&#x6a21;&#x578b; ${esc(meta.auto_model_name)}</span>
+                <span>\u6a21\u578b ${meta.model_count}</span>
+                <span>\u53ef\u7528 ${meta.usable_count}</span>
+                <span>\u81ea\u52a8\u6a21\u578b ${esc(meta.auto_model_name)}</span>
               </div>
             </div>
             <div class="groupCardActions">
-              <button type="button" data-group-test="${group.id}">&#x6d4b;&#x8bd5;&#x81ea;&#x52a8;</button>
-              <button type="button" data-copy-client="${group.id}">&#x590d;&#x5236; Hermes &#x914d;&#x7f6e;</button>
-              <button type="button" data-group-clone="${group.id}">&#x590d;&#x5236;&#x7ec4;</button>
-              <button type="button" data-group-edit="${group.id}">&#x7f16;&#x8f91;&#x7ec4;</button>
-              <button type="button" data-copy-key="${group.id}">&#x590d;&#x5236; Key</button>
-              <button type="button" class="danger" data-group-del="${group.id}">&#x5220;&#x9664;&#x7ec4;</button>
+              <button type="button" data-group-test="${group.id}">\u6d4b\u8bd5\u81ea\u52a8</button>
+              <button type="button" data-copy-client="${group.id}">\u590d\u5236 Hermes \u914d\u7f6e</button>
+              <button type="button" data-group-clone="${group.id}">\u590d\u5236\u7ec4</button>
+              <button type="button" data-group-edit="${group.id}">\u7f16\u8f91\u7ec4</button>
+              <button type="button" data-copy-key="${group.id}">\u590d\u5236 Key</button>
+              <button type="button" class="danger" data-group-del="${group.id}">\u5220\u9664\u7ec4</button>
             </div>
           </div>
           <div class="groupCardBody">
             <div class="groupInfoGrid tiny">
               <div class="groupInfoItem"><div class="label">Base URL</div><div class="value" title="${esc(group.base_url)}">${esc(group.base_url)}</div></div>
-              <div class="groupInfoItem"><div class="label">&#x672c;&#x5730; Key</div><div class="value" title="${esc(group.route_key)}">${esc(group.route_key)}</div></div>
-              <div class="groupInfoItem"><div class="label">&#x6a21;&#x5f0f;</div><div class="value">${esc(providerLabel(group))}</div></div>
-              <div class="groupInfoItem"><div class="label">&#x72b6;&#x6001;</div><div class="value">${group.provider_type === "relay" ? "\u652f\u6301\u81ea\u52a8\u51b7\u5374" : "\u6807\u51c6\u8def\u7531"}</div></div>
-              <div class="groupInfoItem"><div class="label">&#x8bf4;&#x660e;</div><div class="value">${esc(meta.auto_model_name)} \u81ea\u52a8\u8c03\u5ea6</div></div>
-              ${group.provider_type === "relay" ? `<div class="groupInfoItem"><div class="label">&#x51b7;&#x5374; / WAF</div><div class="value">${esc(group.auto_model_cooldown_minutes ?? 5)} &#x5206;&#x949f; / ${group.waf_compatible ? "&#x5f00;&#x542f;" : "&#x5173;&#x95ed;"}</div></div>` : ""}
+              <div class="groupInfoItem"><div class="label">\u672c\u5730 Key</div><div class="value" title="${esc(group.route_key)}">${esc(group.route_key)}</div></div>
+              <div class="groupInfoItem"><div class="label">\u6a21\u5f0f</div><div class="value">${esc(providerLabel(group))}</div></div>
+              <div class="groupInfoItem"><div class="label">\u72b6\u6001</div><div class="value">${group.provider_type === "relay" ? "\u652f\u6301\u81ea\u52a8\u51b7\u5374" : "\u6807\u51c6\u8def\u7531"}</div></div>
+              <div class="groupInfoItem"><div class="label">\u8bf4\u660e</div><div class="value">${esc(meta.auto_model_name)} \u81ea\u52a8\u8c03\u5ea6</div></div>
+              ${group.provider_type === "relay" ? `<div class="groupInfoItem"><div class="label">\u51b7\u5374 / WAF</div><div class="value">${esc(group.auto_model_cooldown_minutes ?? 5)} \u5206\u949f / ${group.waf_compatible ? "\u5f00\u542f" : "\u5173\u95ed"}</div></div>` : ""}
             </div>
             <div class="groupModels">
               <details open>
-                <summary>&#x7ec4;&#x5185;&#x6a21;&#x578b;</summary>
+                <summary>\u7ec4\u5185\u6a21\u578b</summary>
                 <div class="modelTableWrap">
                   <table class="modelTable">
-                    <thead><tr><th>\u4f18\u5148\u7ea7</th><th>\u540d\u79f0</th><th>\u4e0a\u6e38\u6a21\u578b</th><th>\u901a\u9053</th><th>&#x72b6;&#x6001;</th><th>\u6700\u8fd1\u7ed3\u679c</th><th>\u64cd\u4f5c</th></tr></thead>
-                    <tbody>${rows || '<tr><td colspan="7" class="muted">&#x8be5;&#x8fde;&#x63a5;&#x7ec4;&#x6682;&#x65e0;&#x6a21;&#x578b;</td></tr>'}</tbody>
+                    <thead><tr><th>\u4f18\u5148\u7ea7</th><th>\u540d\u79f0</th><th>\u4e0a\u6e38\u6a21\u578b</th><th>\u901a\u9053</th><th>\u72b6\u6001</th><th>\u6700\u8fd1\u7ed3\u679c</th><th>\u64cd\u4f5c</th></tr></thead>
+                    <tbody>${rows || '<tr><td colspan="7" class="muted">\u8be5\u8fde\u63a5\u7ec4\u6682\u65e0\u6a21\u578b</td></tr>'}</tbody>
                   </table>
                 </div>
               </details>
             </div>
           </div>
         </div>`;
-      }).join("") || '<div class="muted">&#x6682;&#x65e0;&#x8fde;&#x63a5;&#x7ec4;</div>';
+      }).join("") || '<div class="muted">\u6682\u65e0\u8fde\u63a5\u7ec4</div>';
       bindGroupActions();
       bindModelActions();
     }
@@ -689,9 +843,31 @@
       $("serverInfo").textContent = `${location.origin} - config: ${state.config_file}`;
       $("clientUrl").textContent = `${location.origin}/v1`;
       $("summaryBox").textContent = `组 ${state.groups.length} - 模型 ${state.models.length} - 可用 ${state.models.filter(m => m.usable).length}`;
+      // 日志写入失败提示
+      const logErr = state.log_write_error || "";
+      const logErrEl = $("logWriteError");
+      const logStatusIcon = $("logStatusIcon");
+      if (logErr) {
+        logErrEl.textContent = `日志写入告警：${logErr}`;
+        logErrEl.style.display = "block";
+        if (logStatusIcon) logStatusIcon.textContent = "🔴";
+      } else {
+        logErrEl.textContent = "";
+        logErrEl.style.display = "none";
+        if (logStatusIcon) logStatusIcon.textContent = "🟢";
+      }
+      // 设置面板状态（不覆盖用户正在操作的开关）
+      const settings = state.settings || {};
+      if (!$("settingAutoStart").matches(":focus")) $("settingAutoStart").checked = !!settings.auto_start;
+      if (!$("settingStartMinimized").matches(":focus")) $("settingStartMinimized").checked = !!settings.start_minimized;
       $("groupPick").innerHTML = renderGroupOptions($("groupPick").value);
       $("batchGroupPick").innerHTML = renderGroupOptions($("batchGroupPick").value || $("groupPick").value);
       $("testGroup").innerHTML = renderGroupOptions($("testGroup").value);
+      // 日志筛选下拉：保留当前选中，刷新组列表
+      const logGroupFilter = $("logGroupFilter");
+      const curGroupFilter = logGroupFilter.value;
+      logGroupFilter.innerHTML = '<option value="">全部</option>' + state.groups.map(g => `<option value="${esc(g.id)}">${esc(g.name)}</option>`).join("");
+      if (curGroupFilter && state.groups.some(g => g.id === curGroupFilter)) logGroupFilter.value = curGroupFilter;
       if (!$("groupPick").value && state.groups[0]) $("groupPick").value = state.groups[0].id;
       if (!$("batchGroupPick").value && state.groups[0]) $("batchGroupPick").value = state.groups[0].id;
       if (!$("testGroup").value && state.groups[0]) $("testGroup").value = state.groups[0].id;
@@ -699,13 +875,8 @@
       syncModelModeUI("");
       renderTestModels($("testModel").value);
       renderModels();
-      $("logGroupFilter").innerHTML = renderOptions(
-        state.groups.map(g => ({ value:g.id, label:g.name })),
-        $("logGroupFilter").value,
-        "\u5168\u90e8\u8fde\u63a5\u7ec4",
-        item => item.label
-      );
       renderLogRows();
+      bindLogActions();
     }
 
     async function mutate(url, body, method="POST") {
@@ -724,6 +895,17 @@
       await navigator.clipboard.writeText($("clientUrl").textContent);
       log("客户端地址已复制");
     };
+    $("copyGlobalKeyBtn").onclick = async () => {
+      await navigator.clipboard.writeText($("globalKey").textContent);
+      log("全局 Key 已复制");
+    };
+
+    async function updateSetting(key, value) {
+      await mutate("/api/settings", { [key]: value });
+      log("设置已保存");
+    }
+    $("settingAutoStart").onchange = () => updateSetting("auto_start", $("settingAutoStart").checked);
+    $("settingStartMinimized").onchange = () => updateSetting("start_minimized", $("settingStartMinimized").checked);
 
     $("groupForm").onsubmit = async (e) => {
       e.preventDefault();
@@ -790,8 +972,6 @@
           return;
         }
         await refresh();
-        $("groupPick").value = group.id;
-        syncModelModeUI("");
         log(text || "ok");
       } finally {
         btn.disabled = false;
@@ -799,13 +979,41 @@
       }
     };
 
-    ["logStart", "logEnd", "logGroupFilter", "logStatusFilter"].forEach(id => {
-      $(id).onchange = renderLogRows;
-      $(id).oninput = renderLogRows;
-    });
-
-    $("clearLogsBtn").onclick = async () => mutate("/api/logs/clear", {});
+    $("clearLogsBtn").onclick = async () => {
+      if (!confirm("确定清空所有请求日志吗？本地日志文件也会被一起删除。此操作不可恢复。")) return;
+      await mutate("/api/logs/clear", {});
+      log("日志已清空");
+    };
     $("exportLogsBtn").onclick = () => { location.href = "/api/logs/export"; };
+    // 配置导入/导出
+    $("exportConfigBtn").onclick = () => { location.href = "/api/config/export"; };
+    $("importConfigBtn").onclick = () => $("importConfigFile").click();
+    $("importConfigFile").onchange = async (event) => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const payload = JSON.parse(text);
+        const resp = await fetch("/api/config/import", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const result = await resp.text();
+        if (!resp.ok) throw new Error(result || resp.statusText);
+        log(`配置已导入：${result}`);
+        await refresh();
+      } catch (err) {
+        log(`导入失败：${err.message || err}`);
+      } finally {
+        // 允许重复选择同一文件
+        event.target.value = "";
+      }
+    };
+    // 日志筛选条件变化时，仅重新渲染日志行，不重新拉取数据
+    ["logStart", "logEnd", "logGroupFilter", "logStatusFilter"].forEach(id => {
+      $(id).addEventListener("change", renderLogRows);
+    });
     $("batchImportBtn").onclick = async () => {
       await mutate("/api/models/batch", {
         group_id:$("batchGroupPick").value,
@@ -860,6 +1068,27 @@
         btn.textContent = "发送测试";
       }
     };
+
+    // 冷却倒计时：每秒更新页面上处于冷却状态的模型详情和恢复按钮文案
+    function updateCooldownCountdowns() {
+      const nowSec = Math.floor(Date.now() / 1000);
+      document.querySelectorAll("[data-cooldown-detail]").forEach(el => {
+        const modelId = el.dataset.cooldownDetail;
+        if (!modelId) return;
+        const model = state.models.find(m => m.id === modelId);
+        if (!model || !model.cooldown_until || Number(model.cooldown_until) <= nowSec) {
+          // 冷却已过期，重新渲染以刷新状态
+          renderModels();
+          return;
+        }
+        const remain = Number(model.cooldown_until) - nowSec;
+        const mm = Math.floor(remain / 60).toString().padStart(2, "0");
+        const ss = (remain % 60).toString().padStart(2, "0");
+        el.textContent = `${model.cooldown_reason || ""} 剩余 ${mm}:${ss}`;
+        el.title = el.textContent;
+      });
+    }
+    setInterval(updateCooldownCountdowns, 1000);
 
     refresh().catch(err => log(String(err)));
   </script>

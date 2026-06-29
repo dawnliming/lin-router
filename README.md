@@ -1,4 +1,4 @@
-﻿# lin-router
+# lin-router
 
 本地 OpenAI 兼容路由器，为 Hermes、Codex++ 和通用 OpenAI 客户端提供统一入口。
 
@@ -23,18 +23,30 @@ http://127.0.0.1:18400
 http://127.0.0.1:18400/v1
 ```
 
-客户端填写页面里生成的 `lr-...` Key，服务端会按 Key 绑定到对应连接组。
+客户端填写页面里生成的 `lr-...` Key，服务端会按 Key 绑定到对应连接组；也可以使用全局 Key `lin-router`，Lin Router 会在所有连接组中按顺序挑选第一个可用模型。
+
+## 桌面端
+
+双击 `dist\LinRouter.exe` 启动后，程序会驻留在系统托盘：
+
+- 左键单击托盘图标：打开管理面板
+- 右键托盘图标：打开面板 / 复制地址 / 复制全局 Key / 开机自启 / 启动最小化 / 退出
+- 开机自启：写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+- 启动最小化：启动后不自动打开浏览器，仅显示托盘图标
+- 单实例保护：重复启动会自动打开已有实例的管理面板
 
 ## 主要能力
 
 - 连接组管理：火山方舟 / 中转站 / 通用 OpenAI 代理
 - 自动调度模型 `lin-router-auto`
+- 全局 Key `lin-router`：跨所有连接组自动挑选第一个可用模型
 - 连接组级自动冷却：仅中转站启用
 - 自动获取上游模型
-- 最近请求日志和请求详情
+- 最近请求日志、详情展开、筛选与 CSV 导出
 - 代理测试
 - 复制 Hermes 配置
 - 复制连接组
+- Windows 系统托盘、开机自启、启动最小化
 
 ## 模式说明
 
@@ -95,4 +107,3 @@ dist\LinRouter.exe
 - 模板配置：`lin-router-config.example.json`
 
 真实配置已加入 `.gitignore`，不要提交真实 API Key。
-

@@ -1,7 +1,10 @@
 lin-router-config.json
+lin-router-settings.json
+lin-router-logs.jsonl
 __pycache__/
 *.py[cod]
 .tmp/
 build/
 dist/
 *.spec
+PRD/
