@@ -1538,18 +1538,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         ]
         # 全局 Key 使用统一的 all-router-auto 模型名，连接组 Key 使用 lin-router-auto
         auto_model_name = "all-router-auto" if ctx.is_global else DEFAULT_AUTO_MODEL_NAME
-        # 容错：旧进程可能没挂载 router，避免因此 500
-        router = getattr(self, 'router', None)
-        if router:
-            router.add_log(
-                "/v1/models",
-                "lin-router",
-                "200",
-                f"key_type={'global' if ctx.is_global else 'route'}; group_id={ctx.group_id}; "
-                f"total_models={len(self.store.models)}; matched_models={len(matched_models)}",
-                0,
-                event="models_list",
-            )
+        # 成功的 /v1/models 请求不再记录到最近请求，避免客户端频繁拉取模型列表时刷屏
         data = [{
             "id": auto_model_name,
             "object": "model",
