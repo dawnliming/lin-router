@@ -28,19 +28,15 @@ const Store = {
   },
 
   ensureSelection() {
+    // v0.4.1：默认不自动选中任何节点，首次打开显示空白引导页
+    if (!this.selected.id) return;
     const groups = this.state.groups || [];
     const models = this.state.models || [];
-    if (!this.selected.id) {
-      if (groups.length) this.selected = { type: 'group', id: groups[0].id };
-      else if (models.length) this.selected = { type: 'model', id: models[0].id };
-      return;
-    }
     const exists = this.selected.type === 'group'
       ? groups.find(g => g.id === this.selected.id)
       : models.find(m => m.id === this.selected.id);
     if (!exists) {
-      if (groups.length) this.selected = { type: 'group', id: groups[0].id };
-      else if (models.length) this.selected = { type: 'model', id: models[0].id };
+      this.selected = { type: 'group', id: null };
     }
   },
 

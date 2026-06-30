@@ -25,6 +25,22 @@
 
 .context-item.danger { color: var(--danger); }
 
+.context-item.disabled {
+  color: var(--text-tertiary);
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.context-item.disabled:hover { background: transparent; }
+
+.mode-tag {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  background: var(--bg-secondary);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+}
+
 .context-separator {
   height: 1px;
   background: var(--border);

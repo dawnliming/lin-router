@@ -1547,6 +1547,32 @@ class RouterHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         return self.rfile.read(length) if length else b"{}"
 
+    def _read_multipart_json(self) -> Optional[Dict[str, Any]]:
+        """解析 multipart/form-data 上传的 JSON 配置文件，返回解析后的 dict。"""
+        import email
+        content_type = self.headers.get("Content-Type", "")
+        if not content_type.startswith("multipart/form-data"):
+            return None
+        length = int(self.headers.get("Content-Length", "0"))
+        if not length:
+            return None
+        body = self.rfile.read(length)
+        try:
+            msg = email.message_from_bytes(
+                b"Content-Type: " + content_type.encode("utf-8") + b"\r\n\r\n" + body
+            )
+            for part in msg.get_payload() or []:
+                if not isinstance(part, email.message.Message):
+                    continue
+                name = part.get_param("name", header="Content-Disposition")
+                if name == "file" or part.get_filename():
+                    data = part.get_payload(decode=True)
+                    if data:
+                        return json.loads(data.decode("utf-8"))
+        except Exception:
+            return None
+        return None
+
     @staticmethod
     def _json_from_raw(raw: bytes) -> Dict[str, Any]:
         return json.loads(raw.decode("utf-8"))
@@ -1845,6 +1871,23 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if parsed.path == "/api/backup/export":
+            # 导出全部数据：配置 + 设置
+            settings_store = self.server.settings_store  # type: ignore[attr-defined]
+            payload = {
+                "groups": [asdict(g) for g in self.store.groups],
+                "models": [asdict(m) for m in self.store.models],
+                "settings": settings_store.to_dict(),
+            }
+            body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="lin-router-backup.json"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path == "/health":
             self._send_json({"ok": True, "groups": len(self.store.groups), "models": len(self.store.models)})
             return
@@ -1854,7 +1897,17 @@ class RouterHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/config/import":
             # 导入配置：合并模式，按 id 覆盖同名连接组/模型，其余保留
-            payload = self._read_json()
+            # 优先尝试 multipart/form-data 文件上传，失败回退到 JSON body
+            payload = self._read_multipart_json()
+            if payload is None:
+                try:
+                    payload = self._read_json()
+                except Exception as e:
+                    self._send_text(f"invalid config file: {e}", status=400)
+                    return
+            if not isinstance(payload, dict):
+                self._send_text("invalid config file: must be a JSON object", status=400)
+                return
             groups_raw = payload.get("groups") or []
             models_raw = payload.get("models") or []
             if not isinstance(groups_raw, list) or not isinstance(models_raw, list):
@@ -1899,6 +1952,64 @@ class RouterHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "groups": len(self.store.groups),
                 "models": len(self.store.models),
+            })
+            return
+        if parsed.path == "/api/backup/import":
+            # 恢复全部数据：配置 + 设置，完全覆盖当前数据
+            payload = self._read_multipart_json()
+            if payload is None:
+                try:
+                    payload = self._read_json()
+                except Exception as e:
+                    self._send_text(f"invalid backup file: {e}", status=400)
+                    return
+            if not isinstance(payload, dict):
+                self._send_text("invalid backup file: must be a JSON object", status=400)
+                return
+            groups_raw = payload.get("groups") or []
+            models_raw = payload.get("models") or []
+            settings_raw = payload.get("settings") or {}
+            if not isinstance(groups_raw, list) or not isinstance(models_raw, list):
+                self._send_text("invalid payload: groups and models must be arrays", status=400)
+                return
+            new_groups: List[ConnectionGroup] = []
+            for item in groups_raw:
+                if not isinstance(item, dict) or not item.get("name"):
+                    continue
+                group = ConnectionGroup.from_dict(item)
+                if not group.route_key:
+                    group.route_key = new_route_key()
+                if not group.provider_type:
+                    group.provider_type = PROVIDER_ARK
+                new_groups.append(group)
+            new_models: List[ModelConfig] = []
+            for item in models_raw:
+                if not isinstance(item, dict) or not item.get("name") or not item.get("ep_id"):
+                    continue
+                model = ModelConfig.from_dict(item)
+                # 缺失或无效 group_id 时挂到第一个组
+                if not model.group_id or not any(g.id == model.group_id for g in new_groups):
+                    if new_groups:
+                        model.group_id = new_groups[0].id
+                    else:
+                        continue
+                new_models.append(model)
+            with self.store._lock:
+                self.store.groups = new_groups
+                self.store.models = new_models
+                self.store.save()
+            # 恢复设置
+            settings_store = self.server.settings_store  # type: ignore[attr-defined]
+            allowed = {"auto_start", "start_minimized", "theme", "auto_refresh_logs"}
+            new_settings = {k: v for k, v in settings_raw.items() if k in allowed}
+            if "auto_start" in new_settings:
+                _set_windows_auto_start(bool(new_settings["auto_start"]))
+            updated = settings_store.update(new_settings)
+            self._send_json({
+                "ok": True,
+                "groups": len(self.store.groups),
+                "models": len(self.store.models),
+                "settings": {**updated, "auto_start": _get_windows_auto_start()},
             })
             return
         if parsed.path == "/api/groups":
@@ -2064,6 +2175,39 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.store.save()
             self._send_json({"ok": True, "usable": model.usable})
             return
+        if parsed.path.endswith("/usable") and parsed.path.startswith("/api/models/"):
+            model_id = parsed.path.split("/")[3]
+            model = self.store.find_model(model_id)
+            if not model:
+                self._send_text("model not found", status=404)
+                return
+            payload = self._read_json()
+            model.usable = bool(payload.get("usable", True))
+            if model.usable:
+                model.cooldown_until = 0
+                model.cooldown_reason = ""
+                model.last_error = ""
+            model.last_checked_at = self.router._now()
+            self.store.save()
+            self._send_json({"ok": True, "usable": model.usable})
+            return
+        if parsed.path == "/api/models/usable/all":
+            payload = self._read_json()
+            usable = bool(payload.get("usable", True))
+            changed = False
+            with self.store._lock:
+                for model in self.store.models:
+                    if model.usable != usable:
+                        model.usable = usable
+                        changed = True
+                    if usable:
+                        model.cooldown_until = 0
+                        model.cooldown_reason = ""
+                        model.last_error = ""
+                if changed:
+                    self.store.save()
+            self._send_json({"ok": True, "changed": changed})
+            return
         if parsed.path.endswith("/toggle") and parsed.path.startswith("/api/groups/"):
             group_id = parsed.path.split("/")[3]
             changed = self.store.toggle_group(group_id)
@@ -2071,6 +2215,30 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self._send_text("group not found or empty", status=400)
                 return
             self._send_json({"ok": True})
+            return
+        if parsed.path.endswith("/usable") and parsed.path.startswith("/api/groups/"):
+            group_id = parsed.path.split("/")[3]
+            group = self.store.find_group(group_id)
+            if not group:
+                self._send_text("group not found", status=404)
+                return
+            payload = self._read_json()
+            usable = bool(payload.get("usable", True))
+            changed = False
+            with self.store._lock:
+                for model in self.store.models:
+                    if model.group_id != group_id:
+                        continue
+                    if model.usable != usable:
+                        model.usable = usable
+                        changed = True
+                    if usable:
+                        model.cooldown_until = 0
+                        model.cooldown_reason = ""
+                        model.last_error = ""
+                if changed:
+                    self.store.save()
+            self._send_json({"ok": True, "changed": changed})
             return
         if parsed.path.endswith("/move") and parsed.path.startswith("/api/models/"):
             model_id = parsed.path.split("/")[3]
@@ -2096,7 +2264,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 self._send_text("invalid payload", status=400)
                 return
-            allowed = {"auto_start", "start_minimized"}
+            allowed = {"auto_start", "start_minimized", "theme", "auto_refresh_logs"}
             new_settings = {k: v for k, v in payload.items() if k in allowed}
             # 开机自启需要同步到 Windows 注册表
             if "auto_start" in new_settings:

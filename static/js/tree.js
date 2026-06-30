@@ -18,6 +18,14 @@ const Tree = {
     document.addEventListener('click', this.hideMenu);
     this.loadExpanded();
     Store.subscribe(() => this.render());
+
+    // 树空白处右键：全局批量操作
+    const treeRoot = document.getElementById('tree-root');
+    treeRoot?.addEventListener('contextmenu', e => {
+      if (e.target.closest('[data-context]')) return;
+      e.preventDefault();
+      this.showGlobalMenu(e);
+    });
   },
 
   loadExpanded() {
@@ -172,6 +180,7 @@ const Tree = {
     root.querySelectorAll('[data-context]').forEach(node => {
       node.addEventListener('contextmenu', e => {
         e.preventDefault();
+        e.stopPropagation();
         this.showMenu(e, node.dataset.context, node.dataset.id);
       });
     });
@@ -207,6 +216,13 @@ const Tree = {
     const targetType = targetNode.dataset.type;
     let targetGroupId = targetType === 'group' ? targetNode.dataset.id : Store.getModel(targetNode.dataset.id)?.group_id;
     if (!targetGroupId) return;
+
+    const sourceGroup = Store.getGroup(dragModel.group_id);
+    const targetGroup = Store.getGroup(targetGroupId);
+    if (sourceGroup && targetGroup && sourceGroup.provider_type !== targetGroup.provider_type) {
+      Toast.warning('只能移动到相同模式的连接组');
+      return;
+    }
 
     if (dragModel.group_id !== targetGroupId) {
       // 跨组移动：先改 group_id，再移到目标组最下方
@@ -244,6 +260,20 @@ const Tree = {
     this.attachMenuEvents(menu);
   },
 
+  showGlobalMenu(e) {
+    const menu = document.getElementById('context-menu');
+    menu.innerHTML = `
+      <div class="context-item" data-action="expand-all">全部展开</div>
+      <div class="context-item" data-action="collapse-all">全部折叠</div>
+      <div class="context-separator"></div>
+      <div class="context-item" data-action="enable-all">全部启用所有模型</div>
+    `;
+    menu.classList.remove('hidden');
+    menu.style.left = `${Math.min(e.clientX, window.innerWidth - 180)}px`;
+    menu.style.top = `${Math.min(e.clientY, window.innerHeight - 200)}px`;
+    this.attachMenuEvents(menu);
+  },
+
   hideMenu() {
     document.getElementById('context-menu')?.classList.add('hidden');
   },
@@ -252,7 +282,6 @@ const Tree = {
     const g = Store.getGroup(id);
     const models = Store.getModelsByGroup(id);
     const allUsable = models.length > 0 && models.every(m => m.usable);
-    const toggleLabel = allUsable ? '禁用组' : '启用组';
     return `
       <div class="context-item" data-action="test" data-id="${id}">测试自动</div>
       <div class="context-item" data-action="copy-key" data-id="${id}">复制 Key</div>
@@ -260,8 +289,7 @@ const Tree = {
       <div class="context-item" data-action="clone-group" data-id="${id}">复制组</div>
       <div class="context-item" data-action="rename-group" data-id="${id}">重命名</div>
       <div class="context-separator"></div>
-      <div class="context-item" data-action="toggle-group" data-id="${id}">${toggleLabel}</div>
-      <div class="context-item" data-action="fetch-models" data-id="${id}">自动获取模型</div>
+      <div class="context-item" data-action="toggle-group" data-id="${id}">${allUsable ? '全部禁用本组模型' : '全部启用本组模型'}</div>
       <div class="context-item" data-action="expand-all" data-id="${id}">全部展开</div>
       <div class="context-item" data-action="collapse-all" data-id="${id}">全部折叠</div>
       <div class="context-separator"></div>
@@ -273,13 +301,17 @@ const Tree = {
     const m = Store.getModel(id);
     const toggleLabel = m?.usable ? '停用' : '启用';
     const cooling = this.isCooling(m);
+    const sourceGroup = Store.getGroup(m?.group_id);
     return `
       <div class="context-item" data-action="edit-model" data-id="${id}">编辑</div>
       <div class="context-item" data-action="clone-model" data-id="${id}">复制模型</div>
       <div class="context-item has-submenu">
         移动到其他组
         <div class="context-submenu">
-          ${(Store.state.groups || []).map(g => `<div class="context-item" data-action="move-to-group" data-id="${id}" data-target="${g.id}">${Utils.escapeHtml(g.name)}</div>`).join('')}
+          ${(Store.state.groups || []).map(g => {
+            const sameMode = sourceGroup && g.provider_type === sourceGroup.provider_type;
+            return `<div class="context-item ${sameMode ? '' : 'disabled'}" data-action="move-to-group" data-id="${id}" data-target="${g.id}" data-disabled="${!sameMode}">${Utils.escapeHtml(g.name)} <span class="mode-tag">${{ark:'方舟', relay:'中转', proxy:'代理'}[g.provider_type] || g.provider_type}</span></div>`;
+          }).join('')}
         </div>
       </div>
       <div class="context-separator"></div>
@@ -294,6 +326,7 @@ const Tree = {
     menu.querySelectorAll('.context-item').forEach(item => {
       item.addEventListener('click', e => {
         e.stopPropagation();
+        if (item.dataset.disabled === 'true') return;
         const action = item.dataset.action;
         const id = item.dataset.id;
         const target = item.dataset.target;
@@ -340,20 +373,20 @@ const Tree = {
         break;
       }
       case 'toggle-group': {
-        try { await API.req(`/api/groups/${id}/toggle`, { method: 'POST' }); await Store.load(); Toast.success('组状态已切换'); }
-        catch (err) { Toast.error(err.message); }
-        break;
-      }
-      case 'fetch-models': {
         const g = Store.getGroup(id);
-        if (!['relay', 'proxy'].includes(g?.provider_type)) {
-          Toast.warning('只有中转站或通用代理支持');
-          return;
-        }
-        try { await API.fetchUpstreamModels(id); await Store.load(); Toast.success('已获取上游模型'); }
-        catch (err) { Toast.error(err.message); }
+        const models = Store.getModelsByGroup(id);
+        const allUsable = models.length > 0 && models.every(m => m.usable);
+        try {
+          await API.setGroupUsable(id, !allUsable);
+          await Store.load();
+          Toast.success(allUsable ? '本组模型已禁用' : '本组模型已启用');
+        } catch (err) { Toast.error(err.message); }
         break;
       }
+      case 'enable-all':
+        try { await API.setAllUsable(true); await Store.load(); Toast.success('所有模型已启用'); }
+        catch (err) { Toast.error(err.message); }
+        break;
       case 'expand-all':
         (Store.state.groups || []).forEach(g => this.expanded.add(g.id));
         this.saveExpanded();
@@ -366,10 +399,15 @@ const Tree = {
         break;
       case 'delete-group': {
         const g = Store.getGroup(id);
-        if (confirm(`删除连接组「${g?.name || id}」？`)) {
-          try { await API.deleteGroup(id); await Store.load(); Toast.success('组已删除'); }
-          catch (err) { Toast.error(err.message); }
-        }
+        const ok = await Modal.confirm({
+          title: '删除连接组',
+          message: `确定删除连接组「${Utils.escapeHtml(g?.name || id)}」吗？组下所有模型也会被删除，此操作不可恢复。`,
+          confirmText: '确定删除',
+          confirmClass: 'btn-danger'
+        });
+        if (!ok) return;
+        try { await API.deleteGroup(id); await Store.load(); Toast.success('组已删除'); }
+        catch (err) { Toast.error(err.message); }
         break;
       }
       case 'edit-model':
@@ -386,6 +424,12 @@ const Tree = {
       }
       case 'move-to-group': {
         const m = Store.getModel(id);
+        const sourceGroup = Store.getGroup(m?.group_id);
+        const targetGroup = Store.getGroup(target);
+        if (sourceGroup && targetGroup && sourceGroup.provider_type !== targetGroup.provider_type) {
+          Toast.warning('只能移动到相同模式的连接组');
+          return;
+        }
         try { await API.saveModel(id, { ...m, group_id: target }); await Store.load(); Toast.success('模型已移动'); }
         catch (err) { Toast.error(err.message); }
         break;
@@ -397,10 +441,15 @@ const Tree = {
         break;
       case 'delete-model': {
         const m = Store.getModel(id);
-        if (confirm(`删除模型「${m?.name || id}」？`)) {
-          try { await API.deleteModel(id); await Store.load(); Toast.success('模型已删除'); }
-          catch (err) { Toast.error(err.message); }
-        }
+        const ok = await Modal.confirm({
+          title: '删除模型',
+          message: `确定删除模型「${Utils.escapeHtml(m?.name || id)}」吗？此操作不可恢复。`,
+          confirmText: '确定删除',
+          confirmClass: 'btn-danger'
+        });
+        if (!ok) return;
+        try { await API.deleteModel(id); await Store.load(); Toast.success('模型已删除'); }
+        catch (err) { Toast.error(err.message); }
         break;
       }
     }

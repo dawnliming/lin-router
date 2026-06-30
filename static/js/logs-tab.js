@@ -1,6 +1,9 @@
 const LogsTab = {
   filters: { start: '', end: '', group: '', status: '' },
   currentOnly: false,
+  autoRefresh: true,
+  refreshTimer: null,
+  REFRESH_INTERVAL: 5000,
 
   refresh() {
     const panel = document.getElementById('panel-logs');
@@ -17,6 +20,11 @@ const LogsTab = {
           <label class="checkbox">
             <input type="checkbox" id="logs-current-only" ${this.currentOnly ? 'checked' : ''}>
             <span>仅显示当前选中组/模型</span>
+          </label>
+          <button type="button" id="logs-refresh" class="btn-secondary" title="立即刷新">🔄 刷新</button>
+          <label class="checkbox">
+            <input type="checkbox" id="logs-auto-refresh" ${this.autoRefresh ? 'checked' : ''}>
+            <span>自动刷新</span>
           </label>
           <button type="button" id="logs-clear" class="btn-secondary">清空日志</button>
           <button type="button" id="logs-export" class="btn-secondary">导出 CSV</button>
@@ -54,7 +62,9 @@ const LogsTab = {
               <th>模型</th>
               <th>状态</th>
               <th>事件</th>
-              <th>请求#次</th>
+              <th>
+                <span class="help-tip" title="同请求重试次数，首次请求为 1">请求#次 ?</span>
+              </th>
               <th>耗时</th>
               <th>Token</th>
               <th>详情</th>
@@ -71,6 +81,7 @@ const LogsTab = {
     `;
     this.attachEvents(panel);
     this.renderRows();
+    this.startAutoRefresh();
   },
 
   renderGroupOptions() {
@@ -85,9 +96,48 @@ const LogsTab = {
       panel.querySelector(`#${id}`)?.addEventListener('change', () => this.readFilters());
     });
     panel.querySelector('#logs-current-only')?.addEventListener('change', e => { this.currentOnly = e.target.checked; this.renderRows(); });
+    panel.querySelector('#logs-auto-refresh')?.addEventListener('change', e => { this.setAutoRefresh(e.target.checked); });
+    panel.querySelector('#logs-refresh')?.addEventListener('click', () => this.manualRefresh());
     panel.querySelector('#logs-clear')?.addEventListener('click', () => this.clear());
     panel.querySelector('#logs-export')?.addEventListener('click', () => { location.href = '/api/logs/export'; });
     panel.querySelector('#logs-reset')?.addEventListener('click', () => this.resetFilters());
+  },
+
+  setAutoRefresh(enabled) {
+    this.autoRefresh = enabled;
+    if (enabled) this.startAutoRefresh();
+    else this.stopAutoRefresh();
+  },
+
+  startAutoRefresh() {
+    this.stopAutoRefresh();
+    if (!this.autoRefresh) return;
+    this.refreshTimer = setInterval(() => this.autoRefreshTick(), this.REFRESH_INTERVAL);
+  },
+
+  stopAutoRefresh() {
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = null;
+    }
+  },
+
+  async autoRefreshTick() {
+    if (!this.autoRefresh) return;
+    // 只在当前是 logs tab 时刷新
+    if (Tabs.current !== 'logs') return;
+    await this.manualRefresh();
+  },
+
+  async manualRefresh() {
+    try {
+      const data = await API.getState();
+      Store.update({ logs: data.logs });
+      this.renderRows(true);
+    } catch (err) {
+      // 自动刷新失败不弹 Toast，避免打扰
+      console.error('日志刷新失败', err);
+    }
   },
 
   readFilters() {
@@ -163,9 +213,12 @@ const LogsTab = {
     return result;
   },
 
-  renderRows() {
+  renderRows(keepScroll = false) {
     const tbody = document.getElementById('log-tbody');
     const empty = document.getElementById('logs-empty');
+    const wrap = document.querySelector('.logs-table-wrap');
+    const wasAtBottom = keepScroll && wrap ? (wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 20) : false;
+
     const filtered = (Store.state.logs || []).filter(item => this.matches(item));
     if (!filtered.length) {
       tbody.innerHTML = '';
@@ -177,6 +230,10 @@ const LogsTab = {
     tbody.querySelectorAll('[data-log-detail]').forEach(btn => {
       btn.addEventListener('click', () => this.toggleDetail(Number(btn.dataset.logDetail)));
     });
+
+    if (wasAtBottom && wrap) {
+      wrap.scrollTop = wrap.scrollHeight;
+    }
   },
 
   rowHtml(item, idx) {
@@ -187,16 +244,34 @@ const LogsTab = {
         <td>${Utils.escapeHtml(item.model || '-')}</td>
         <td><span class="pill ${this.statusClass(item.status)}">${Utils.escapeHtml(item.status)}</span></td>
         <td class="tiny">${Utils.escapeHtml(this.eventLabel(item.event))}</td>
-        <td class="tiny">${item.request_id ? `${Utils.escapeHtml(item.request_id)}#${Number(item.attempt || 0)}` : '-'}</td>
+        <td class="tiny">${Number(item.attempt || 0) || '-'}</td>
         <td class="tiny">${Number(item.duration_ms || 0) ? `${Number(item.duration_ms)} ms` : '-'}</td>
         <td class="tiny">${Utils.escapeHtml(this.tokenSummary(item))}</td>
-        <td class="tiny result-text" title="${Utils.escapeHtml(item.detail)}">${Utils.escapeHtml(item.detail)}</td>
+        <td class="tiny result-text" title="${Utils.escapeHtml(item.detail)}">${this.formatDetailPreview(item.detail)}</td>
         <td><button type="button" data-log-detail="${idx}">查看</button></td>
       </tr>
       <tr class="log-detail-row hidden" data-log-detail-row="${idx}">
         <td colspan="10">${this.detailHtml(item)}</td>
       </tr>
     `;
+  },
+
+  formatDetailPreview(detail) {
+    if (!detail) return '-';
+    // 把分号分隔的 detail 做简单可读化处理
+    const text = String(detail).replace(/;/g, '; ');
+    const escaped = Utils.escapeHtml(text);
+    return escaped.length > 120 ? escaped.slice(0, 120) + '…' : escaped;
+  },
+
+  formatJsonBlock(value) {
+    if (!value) return '-';
+    const str = String(value);
+    // 尝试把分号键值对或 JSON 字符串格式化显示
+    let formatted = Utils.escapeHtml(str);
+    // 如果有 model=... 这类键值对，高亮关键 key
+    formatted = formatted.replace(/(requested|group_name|model|upstream|channel|mode|error)=/g, '<strong>$1=</strong>');
+    return formatted;
   },
 
   detailHtml(item) {
@@ -216,7 +291,7 @@ const LogsTab = {
             <dt>时间</dt><dd>${Utils.escapeHtml(item.time)}</dd>
             <dt>耗时</dt><dd>${Number(item.duration_ms || 0) ? `${Number(item.duration_ms)} ms` : '-'}</dd>
             <dt>状态</dt><dd><span class="pill ${this.statusClass(item.status)}">${Utils.escapeHtml(item.status)}</span> ${Utils.escapeHtml(this.eventLabel(item.event))}</dd>
-            <dt>请求 ID / 次</dt><dd>${Utils.escapeHtml(item.request_id || '-')} #${Number(item.attempt || 0)}</dd>
+            <dt>请求 ID / 次</dt><dd>${Utils.escapeHtml(item.request_id || '-')} / ${Number(item.attempt || 0) || 1}</dd>
           </dl>
         </div>
         <div class="log-detail-block">
@@ -241,7 +316,7 @@ const LogsTab = {
           <div class="log-detail-block">
             <dl>
               <dt>Tokens</dt><dd>${Utils.escapeHtml(this.tokenSummary(item))}</dd>
-              <dt>详情原文</dt><dd style="white-space:pre-wrap; overflow-wrap:anywhere;">${Utils.escapeHtml(item.detail)}</dd>
+              <dt>详情原文</dt><dd class="log-detail-raw">${this.formatJsonBlock(item.detail)}</dd>
             </dl>
           </div>
         </div>
@@ -258,7 +333,13 @@ const LogsTab = {
   },
 
   async clear() {
-    if (!confirm('确定清空所有请求日志吗？本地日志文件也会被一起删除。此操作不可恢复。')) return;
+    const ok = await Modal.confirm({
+      title: '清空日志',
+      message: '确定清空所有请求日志吗？本地日志文件也会被一起删除，此操作不可恢复。',
+      confirmText: '确定清空',
+      confirmClass: 'btn-danger'
+    });
+    if (!ok) return;
     try {
       await API.clearLogs();
       await Store.load();

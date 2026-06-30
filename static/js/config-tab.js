@@ -8,19 +8,25 @@ const ConfigTab = {
   render() {
     const panel = document.getElementById('panel-config');
     const sel = Store.selected;
+    if (!sel.id) {
+      panel.innerHTML = this.renderEmptyState();
+      this.attachEmptyEvents(panel);
+      return;
+    }
     const item = sel.type === 'group' ? Store.getGroup(sel.id) : Store.getModel(sel.id);
     const title = item ? Utils.escapeHtml(item.name) : (sel.type === 'group' ? '新建连接组' : '新建模型');
 
     panel.innerHTML = `
-      <h2>${title}</h2>
+      <div class="config-header">
+        <h2>${title}</h2>
+        <div class="save-status" id="save-status"></div>
+      </div>
       <div class="config-layout">
         <div class="config-main">
           ${sel.type === 'group' || sel.type === null ? this.renderGroupSection() : this.renderModelSection()}
         </div>
         <div class="config-side">
-          ${this.renderSettings()}
-          ${this.renderBatchImport()}
-          ${this.renderConfigTools()}
+          ${sel.type === 'group' || sel.type === null ? this.renderGroupSide() : ''}
         </div>
       </div>
     `;
@@ -28,10 +34,37 @@ const ConfigTab = {
     this.syncUIFromState();
   },
 
+  renderEmptyState() {
+    return `
+      <div class="empty-state">
+        <div class="empty-icon">🚀</div>
+        <h2>欢迎使用 Lin Router</h2>
+        <p class="empty-subtitle">点击左上角 + 新建你的第一个连接组，或导入已有配置</p>
+        <div class="empty-actions">
+          <button type="button" class="btn-primary" id="empty-new-group">新建连接组</button>
+          <button type="button" class="btn-secondary" id="empty-import">导入配置</button>
+        </div>
+        <p class="empty-hint">全局Key: <code>lin-router</code>，本地地址点击顶部复制即可使用</p>
+      </div>
+    `;
+  },
+
+  attachEmptyEvents(panel) {
+    panel.querySelector('#empty-new-group')?.addEventListener('click', () => App.createGroup());
+    panel.querySelector('#empty-import')?.addEventListener('click', () => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'application/json,.json';
+      input.addEventListener('change', e => this.onConfigImport(e));
+      input.click();
+    });
+  },
+
   renderGroupSection() {
     const sel = Store.selected;
     const g = sel.type === 'group' ? Store.getGroup(sel.id) : null;
     const provider = g?.provider_type || 'ark';
+    const showAdvanced = provider === 'relay';
     return `
       <form class="config-form" id="group-form" data-type="group">
         <input type="hidden" id="group-id" value="${g?.id || ''}">
@@ -61,7 +94,7 @@ const ConfigTab = {
             </div>
           </div>
         </section>
-        <section class="form-card">
+        <section class="form-card ${showAdvanced ? '' : 'hidden'}" id="group-advanced-card">
           <h3>高级配置</h3>
           <div class="form-row" id="group-cooldown-row">
             <label>自动冷却分钟</label>
@@ -78,17 +111,23 @@ const ConfigTab = {
           <h3>其他</h3>
           <div class="form-row">
             <label>本地路由 Key</label>
-            <input id="group-route-key" value="${Utils.escapeHtml(g?.route_key || '')}" readonly>
+            <div class="input-with-btn">
+              <input id="group-route-key" value="${Utils.escapeHtml(g?.route_key || '')}" readonly>
+              <button type="button" id="group-copy-route-key" title="复制路由 Key">📋</button>
+            </div>
           </div>
           <div class="form-row">
             <label>模式说明</label>
             <div class="form-hint" id="group-mode-hint"></div>
           </div>
-          <div class="form-actions">
-            <button type="submit" class="btn-primary">保存连接组</button>
-            ${g ? `<button type="button" class="btn-danger" id="group-delete">删除组</button>` : ''}
-            ${g ? `<button type="button" id="group-clone">复制组</button>` : ''}
-            ${g ? `<button type="button" class="btn-primary" id="group-add-model">+ 添加模型</button>` : ''}
+          <div class="form-actions form-actions-split">
+            <div class="form-actions-left">
+              <button type="submit" class="btn-primary">保存更改</button>
+              ${g ? `<button type="button" id="group-clone">复制组</button>` : ''}
+            </div>
+            <div class="form-actions-right">
+              ${g ? `<button type="button" class="btn-danger" id="group-delete">删除组</button>` : ''}
+            </div>
           </div>
         </section>
       </form>
@@ -100,6 +139,10 @@ const ConfigTab = {
     const m = sel.type === 'model' ? Store.getModel(sel.id) : null;
     const groupId = m?.group_id || Store.state.groups?.[0]?.id || '';
     const group = Store.getGroup(groupId);
+    const isArk = group?.provider_type === 'ark';
+    const isRelay = group?.provider_type === 'relay';
+    const isProxy = group?.provider_type === 'proxy';
+    const needUpstream = isRelay || isProxy;
     return `
       <form class="config-form" id="model-form" data-type="model">
         <input type="hidden" id="model-id" value="${m?.id || ''}">
@@ -113,25 +156,32 @@ const ConfigTab = {
             <label>连接组</label>
             <select id="model-group">${this.renderGroupOptions(groupId)}</select>
           </div>
-          <div class="form-row" id="model-ep-row">
+          ${!isArk ? `
+          <div class="form-row" id="model-key-row">
+            <label>${isRelay ? '中转站 API Key' : '上游 API Key'}</label>
+            <input id="model-key" type="password" value="${Utils.escapeHtml(m?.api_key || '')}" placeholder="sk-xxxx">
+          </div>
+          ` : ''}
+          <div class="form-row ${needUpstream ? 'hidden' : ''}" id="model-ep-row">
             <label>上游模型 / EP</label>
             <input id="model-ep" value="${Utils.escapeHtml(m?.ep_id || '')}" placeholder="ep-xxxx / deepseek-chat">
           </div>
-          <div class="form-row hidden" id="model-upstream-row">
+          <div class="form-row ${needUpstream ? '' : 'hidden'}" id="model-upstream-row">
             <label>上游模型</label>
-            <select id="model-upstream"></select>
-          </div>
-          <div class="form-row" id="model-key-row">
-            <label>中转站 API Key</label>
-            <input id="model-key" type="password" value="${Utils.escapeHtml(m?.api_key || '')}" placeholder="sk-xxxx">
+            <div class="input-with-btn">
+              <select id="model-upstream"></select>
+              <button type="button" id="model-fetch">获取</button>
+            </div>
           </div>
         </section>
         <section class="form-card">
           <h3>调度配置</h3>
+          ${isRelay ? `
           <div class="form-row" id="model-price-row">
             <label>价格组 / 通道</label>
             <input id="model-price" value="${Utils.escapeHtml(m?.price_group || '')}" placeholder="cheap / standard / premium">
           </div>
+          ` : ''}
           <div class="form-row" id="model-price-input-row">
             <label>输入单价（元 / 千 Token）</label>
             <input id="model-price-input" type="number" step="0.0001" min="0" value="${m?.price_input ? m.price_input : ''}" placeholder="可选，用于统计花费">
@@ -165,47 +215,46 @@ const ConfigTab = {
             <label>最近错误</label>
             <span class="error-text">${Utils.escapeHtml(m?.last_error || '-')}</span>
           </div>
-          <div class="form-actions">
-            <button type="submit" class="btn-primary">保存模型</button>
-            ${m ? `<button type="button" id="model-delete" class="btn-danger">删除</button>` : ''}
-            ${m ? `<button type="button" id="model-clone">复制</button>` : ''}
-            ${m ? `<button type="button" id="model-fetch">自动获取模型</button>` : ''}
+          <div class="form-actions form-actions-split">
+            <div class="form-actions-left">
+              <button type="submit" class="btn-primary">保存模型</button>
+              ${m ? `<button type="button" id="model-clone">复制</button>` : ''}
+            </div>
+            <div class="form-actions-right">
+              ${m ? `<button type="button" id="model-delete" class="btn-danger">删除</button>` : ''}
+            </div>
           </div>
         </section>
       </form>
     `;
   },
 
-  renderSettings() {
-    const s = Store.state.settings || {};
+  renderGroupSide() {
     return `
-      <section class="form-card">
-        <h3>设置</h3>
-        <label class="checkbox-row">
-          <span>开机自启（Windows 当前用户）</span>
-          <input id="setting-auto-start" type="checkbox" ${s.auto_start ? 'checked' : ''}>
-        </label>
-        <label class="checkbox-row">
-          <span>启动后最小化到托盘</span>
-          <input id="setting-start-minimized" type="checkbox" ${s.start_minimized ? 'checked' : ''}>
-        </label>
-        <div class="form-hint">开机自启会写入注册表启动项；被杀软拦截属于正常情况。</div>
-      </section>
+      ${this.renderBatchImport()}
+      ${this.renderConfigTools()}
     `;
   },
 
   renderBatchImport() {
     return `
       <section class="form-card">
-        <h3>批量导入</h3>
+        <h3>批量添加模型</h3>
+        <div class="form-row">
+          <button type="button" id="group-add-model" class="btn-primary" style="width:100%">+ 添加模型</button>
+        </div>
         <div class="form-row">
           <label>连接组</label>
           <select id="batch-group">${this.renderGroupOptions()}</select>
         </div>
         <div class="form-row">
           <label>模型列表</label>
-          <textarea id="batch-models" rows="4" placeholder="显示名称,上游模型&#10;另一个模型,upstream-model-2"></textarea>
+          <textarea id="batch-models" rows="4" placeholder='粘贴模型JSON数组，格式示例：[{&quot;name&quot;:&quot;模型名&quot;,&quot;ep_id&quot;:&quot;端点ID&quot;}]'></textarea>
         </div>
+        <details class="batch-example">
+          <summary>查看格式示例</summary>
+          <pre>[\n  {&quot;name&quot;: &quot;DeepSeek-V3&quot;, &quot;ep_id&quot;: &quot;deepseek-chat&quot;},\n  {&quot;name&quot;: &quot;GPT-4o&quot;, &quot;ep_id&quot;: &quot;gpt-4o&quot;}\n]</pre>
+        </details>
         <div class="form-row">
           <label>中转站 API Key</label>
           <input id="batch-key" type="password" placeholder="批量导入时可填">
@@ -214,7 +263,9 @@ const ConfigTab = {
           <label>价格组 / 通道</label>
           <input id="batch-price" placeholder="cheap / standard / premium">
         </div>
-        <button type="button" id="batch-import" class="btn-primary" style="width:100%">批量导入模型</button>
+        <div class="form-actions" style="justify-content:flex-end">
+          <button type="button" id="batch-import" class="btn-primary">批量导入</button>
+        </div>
       </section>
     `;
   },
@@ -224,11 +275,11 @@ const ConfigTab = {
       <section class="form-card">
         <h3>配置导入 / 导出</h3>
         <div class="form-actions" style="flex-direction:column">
-          <button type="button" id="config-export" class="btn-secondary" style="width:100%">导出配置</button>
-          <button type="button" id="config-import" class="btn-secondary" style="width:100%">导入配置</button>
+          <button type="button" id="config-export" class="btn-secondary" style="width:100%">导出连接组配置</button>
+          <button type="button" id="config-import" class="btn-secondary" style="width:100%">导入连接组配置</button>
           <input id="config-import-file" type="file" accept="application/json,.json" style="display:none">
         </div>
-        <div class="form-hint">导出当前连接组与模型为 JSON；导入时按 ID 合并，同名覆盖、其余保留。</div>
+        <div class="form-hint">导出包含当前所有连接组和模型配置，不会导出本地代理设置、日志等数据。</div>
       </section>
     `;
   },
@@ -255,12 +306,14 @@ const ConfigTab = {
     const mode = document.getElementById('group-provider')?.value || 'ark';
     const needsKey = mode === 'ark' || mode === 'proxy';
     const keyRow = document.getElementById('group-key-row');
+    const advancedCard = document.getElementById('group-advanced-card');
     const cooldownRow = document.getElementById('group-cooldown-row');
     const wafRow = document.getElementById('group-waf-row');
     const hint = document.getElementById('group-mode-hint');
     const label = document.getElementById('group-key-label');
 
     if (keyRow) keyRow.classList.toggle('hidden', !needsKey);
+    if (advancedCard) advancedCard.classList.toggle('hidden', mode !== 'relay');
     if (cooldownRow) cooldownRow.classList.toggle('hidden', mode !== 'relay');
     if (wafRow) wafRow.classList.toggle('hidden', mode !== 'relay');
     if (label) label.textContent = mode === 'ark' ? 'Ark API Key' : '上游 API Key';
@@ -277,18 +330,26 @@ const ConfigTab = {
     const group = Store.getGroup(groupId);
     const relay = group?.provider_type === 'relay';
     const proxy = group?.provider_type === 'proxy';
+    const ark = group?.provider_type === 'ark';
 
     const epRow = document.getElementById('model-ep-row');
     const upstreamRow = document.getElementById('model-upstream-row');
-    const keyRow = document.getElementById('model-key-row');
-    const priceRow = document.getElementById('model-price-row');
 
     if (epRow) epRow.classList.toggle('hidden', relay || proxy);
     if (upstreamRow) upstreamRow.classList.toggle('hidden', !(relay || proxy));
-    if (keyRow) keyRow.classList.toggle('hidden', !relay);
-    if (priceRow) priceRow.classList.toggle('hidden', !relay);
 
     if (relay || proxy) this.renderUpstreamOptions(groupId);
+
+    // 更新冷却显示
+    const m = Store.getModel(document.getElementById('model-id')?.value);
+    const display = document.getElementById('model-cooldown-display');
+    if (display && m) {
+      if (m.cooldown_until && m.cooldown_until * 1000 > Date.now()) {
+        display.textContent = Utils.formatDate(m.cooldown_until);
+      } else {
+        display.textContent = '-';
+      }
+    }
   },
 
   renderUpstreamOptions(groupId) {
@@ -317,6 +378,10 @@ const ConfigTab = {
         input.type = input.type === 'password' ? 'text' : 'password';
         e.target.textContent = input.type === 'password' ? '显示' : '隐藏';
       });
+      panel.querySelector('#group-copy-route-key')?.addEventListener('click', () => {
+        const key = document.getElementById('group-route-key')?.value || '';
+        Utils.copy(key).then(ok => ok ? Toast.success('路由 Key 已复制') : Toast.error('复制失败'));
+      });
       panel.querySelector('#group-delete')?.addEventListener('click', () => this.onGroupDelete());
       panel.querySelector('#group-clone')?.addEventListener('click', () => this.onGroupClone());
       panel.querySelector('#group-add-model')?.addEventListener('click', () => this.onAddModelToGroup());
@@ -328,15 +393,12 @@ const ConfigTab = {
     if (modelForm) {
       modelForm.addEventListener('submit', e => this.onModelSubmit(e));
       panel.querySelector('#model-group')?.addEventListener('change', () => { this.syncModelModeUI(); this.autoSaveModel(); });
+      panel.querySelector('#model-upstream')?.addEventListener('change', () => this.autoSaveModel());
       panel.querySelector('#model-delete')?.addEventListener('click', () => this.onModelDelete());
       panel.querySelector('#model-clone')?.addEventListener('click', () => this.onModelClone());
       panel.querySelector('#model-fetch')?.addEventListener('click', () => this.onFetchUpstream());
       this.bindAutoSave(modelForm, () => this.autoSaveModel());
     }
-
-    // 设置
-    panel.querySelector('#setting-auto-start')?.addEventListener('change', e => this.updateSetting('auto_start', e.target.checked));
-    panel.querySelector('#setting-start-minimized')?.addEventListener('change', e => this.updateSetting('start_minimized', e.target.checked));
 
     // 批量导入
     panel.querySelector('#batch-import')?.addEventListener('click', () => this.onBatchImport());
@@ -355,10 +417,32 @@ const ConfigTab = {
     });
   },
 
+  setSaveStatus(status, message) {
+    const el = document.getElementById('save-status');
+    if (!el) return;
+    el.className = 'save-status';
+    if (status === 'saving') {
+      el.textContent = '保存中…';
+      el.classList.add('saving');
+    } else if (status === 'saved') {
+      el.textContent = '已保存';
+      el.classList.add('saved');
+      setTimeout(() => {
+        if (el.textContent === '已保存') el.textContent = '';
+      }, 2000);
+    } else if (status === 'error') {
+      el.textContent = message || '保存失败';
+      el.classList.add('error');
+    } else {
+      el.textContent = '';
+    }
+  },
+
   autoSaveGroup() {
     const id = document.getElementById('group-id')?.value;
     if (!id) return; // 新建不自动保存
     clearTimeout(this._autoSaveTimer);
+    this.setSaveStatus('saving');
     this._autoSaveTimer = setTimeout(() => {
       const form = document.getElementById('group-form');
       if (form) form.dispatchEvent(new Event('submit'));
@@ -369,6 +453,7 @@ const ConfigTab = {
     const id = document.getElementById('model-id')?.value;
     if (!id) return; // 新建不自动保存
     clearTimeout(this._autoSaveTimer);
+    this.setSaveStatus('saving');
     this._autoSaveTimer = setTimeout(() => {
       const form = document.getElementById('model-form');
       if (form) form.dispatchEvent(new Event('submit'));
@@ -390,11 +475,13 @@ const ConfigTab = {
       waf_compatible: mode === 'relay' ? document.getElementById('group-waf').checked : false,
     };
     try {
+      this.setSaveStatus('saving');
       if (id) await API.saveGroup(id, payload);
       else await API.createGroup(payload);
       await Store.load();
-      Toast.success('连接组已保存');
+      this.setSaveStatus('saved');
     } catch (err) {
+      this.setSaveStatus('error', '保存失败：' + err.message);
       Toast.error('保存失败：' + err.message);
     }
   },
@@ -402,7 +489,13 @@ const ConfigTab = {
   async onGroupDelete() {
     const id = document.getElementById('group-id').value;
     const group = Store.getGroup(id);
-    if (!confirm(`删除连接组「${group?.name || id}」？`)) return;
+    const ok = await Modal.confirm({
+      title: '删除连接组',
+      message: `确定删除连接组「${Utils.escapeHtml(group?.name || id)}」吗？组下所有模型也会被删除，此操作不可恢复。`,
+      confirmText: '确定删除',
+      confirmClass: 'btn-danger'
+    });
+    if (!ok) return;
     try {
       await API.deleteGroup(id);
       await Store.load();
@@ -449,21 +542,23 @@ const ConfigTab = {
     const id = document.getElementById('model-id').value;
     const payload = {
       name: document.getElementById('model-name').value.trim(),
-      ep_id: upstream,
+      ep_id: upstream || document.getElementById('model-ep')?.value?.trim(),
       group_id: groupId,
-      api_key: document.getElementById('model-key').value.trim(),
-      price_group: document.getElementById('model-price').value.trim(),
+      api_key: document.getElementById('model-key')?.value?.trim() || '',
+      price_group: document.getElementById('model-price')?.value?.trim() || '',
       price_input: Number(document.getElementById('model-price-input').value || 0),
       price_output: Number(document.getElementById('model-price-output').value || 0),
       upstream_model: upstream,
       usable: document.getElementById('model-usable').checked,
     };
     try {
+      this.setSaveStatus('saving');
       if (id) await API.saveModel(id, payload);
       else await API.createModel(payload);
       await Store.load();
-      Toast.success('模型已保存');
+      this.setSaveStatus('saved');
     } catch (err) {
+      this.setSaveStatus('error', '保存失败：' + err.message);
       Toast.error('保存失败：' + err.message);
     }
   },
@@ -471,7 +566,13 @@ const ConfigTab = {
   async onModelDelete() {
     const id = document.getElementById('model-id').value;
     const model = Store.getModel(id);
-    if (!confirm(`删除模型「${model?.name || id}」？`)) return;
+    const ok = await Modal.confirm({
+      title: '删除模型',
+      message: `确定删除模型「${Utils.escapeHtml(model?.name || id)}」吗？此操作不可恢复。`,
+      confirmText: '确定删除',
+      confirmClass: 'btn-danger'
+    });
+    if (!ok) return;
     try {
       await API.deleteModel(id);
       await Store.load();
@@ -486,7 +587,6 @@ const ConfigTab = {
     const m = Store.getModel(id);
     if (!m) return;
     try {
-      // 后端没有 /api/models/{id}/clone，用 createModel 复制字段实现
       await API.createModel({ ...m, id: undefined, name: `${m.name} 副本` });
       await Store.load();
       Toast.success('模型已复制');
@@ -499,7 +599,7 @@ const ConfigTab = {
     const groupId = document.getElementById('model-group').value;
     const group = Store.getGroup(groupId);
     if (!['relay', 'proxy'].includes(group?.provider_type)) {
-      Toast.warning('只有中转站或通用代理模式才能自动获取模型');
+      Toast.warning('只有中转站或通用代理模式才能获取模型');
       return;
     }
     const btn = document.getElementById('model-fetch');
@@ -519,24 +619,31 @@ const ConfigTab = {
     }
   },
 
-  async updateSetting(key, value) {
-    try {
-      await API.saveSettings({ [key]: value });
-      await Store.load();
-      Toast.success('设置已保存');
-    } catch (err) {
-      Toast.error('保存设置失败：' + err.message);
-      await Store.load();
-    }
-  },
-
   async onBatchImport() {
+    const raw = document.getElementById('batch-models').value.trim();
+    if (!raw) {
+      Toast.warning('请输入模型列表');
+      return;
+    }
+    // 优先尝试 JSON 数组格式
+    let text = raw;
+    try {
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) throw new Error('must be array');
+      text = arr.map(item => `${item.name || item.ep_id || ''},${item.ep_id || item.name || ''}`).join('\n');
+    } catch (jsonErr) {
+      // 不是 JSON 数组则按原有 CSV 格式处理，后续后端也做基础校验
+      if (raw.startsWith('[') || raw.startsWith('{')) {
+        Toast.error('格式错误，请检查 JSON 格式是否正确，参考示例');
+        return;
+      }
+    }
     try {
       await API.req('/api/models/batch', {
         method: 'POST',
         body: JSON.stringify({
           group_id: document.getElementById('batch-group').value,
-          text: document.getElementById('batch-models').value,
+          text,
           api_key: document.getElementById('batch-key').value.trim(),
           price_group: document.getElementById('batch-price').value.trim(),
         })

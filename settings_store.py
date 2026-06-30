@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 
-DEFAULT_SETTINGS = {"auto_start": False, "start_minimized": False}
+DEFAULT_SETTINGS = {"auto_start": False, "start_minimized": False, "theme": "system", "auto_refresh_logs": True}
 
 
 class SettingsStore:

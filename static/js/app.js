@@ -3,7 +3,6 @@ const App = {
   sidebarCollapsed: false,
 
   async init() {
-    this.loadTheme();
     this.renderTopbar();
     this.renderFabs();
     Tree.init();
@@ -12,8 +11,11 @@ const App = {
     this.bindResize();
 
     await Store.load();
+    // 应用服务器端保存的设置
+    this.applySettings(Store.state.settings);
+
     Store.subscribe((state) => {
-      document.getElementById('server-addr').textContent = window.location.origin;
+      document.getElementById('server-addr').textContent = `${window.location.origin}/v1`;
       this.updateStatusDot(state);
       ConfigTab.onShow();
       Tree.render();
@@ -22,12 +24,18 @@ const App = {
     setInterval(() => Tree.render(), 1000);
   },
 
+  applySettings(settings) {
+    const s = settings || {};
+    this.setTheme(s.theme || localStorage.getItem('lin-router-theme') || 'system', false);
+    LogsTab.setAutoRefresh(s.auto_refresh_logs !== false);
+  },
+
   renderTopbar() {
     const topbar = document.getElementById('topbar');
     topbar.innerHTML = `
       <div class="topbar-left">
         <span class="status-dot" id="status-dot" title="运行中"></span>
-        <span class="copy-chip" id="server-addr" title="点击复制本地地址">http://127.0.0.1:8234</span>
+        <span class="copy-chip" id="server-addr" title="点击复制兼容 OpenAI 的接口地址（自动带 /v1）">http://127.0.0.1:8234/v1</span>
         <span class="copy-chip" id="global-key" title="点击复制全局 Key">lin-router</span>
       </div>
       <div class="topbar-center">
@@ -42,7 +50,8 @@ const App = {
     `;
 
     topbar.querySelector('#server-addr').addEventListener('click', e => {
-      Utils.copy(e.target.textContent).then(ok => ok ? Toast.success('地址已复制') : Toast.error('复制失败'));
+      const addr = `${window.location.origin}/v1`;
+      Utils.copy(addr).then(ok => ok ? Toast.success('接口地址已复制（含 /v1）') : Toast.error('复制失败'));
     });
     topbar.querySelector('#global-key').addEventListener('click', () => {
       Utils.copy('lin-router').then(ok => ok ? Toast.success('全局 Key 已复制') : Toast.error('复制失败'));
@@ -68,17 +77,25 @@ const App = {
   },
 
   loadTheme() {
-    this.theme = localStorage.getItem('lin-router-theme') || 'system';
+    this.theme = Store.state.settings?.theme || localStorage.getItem('lin-router-theme') || 'system';
     document.documentElement.setAttribute('data-theme', this.theme);
+  },
+
+  setTheme(theme, save = true) {
+    this.theme = theme || 'system';
+    localStorage.setItem('lin-router-theme', this.theme);
+    document.documentElement.setAttribute('data-theme', this.theme);
+    if (save) {
+      API.saveSettings({ theme: this.theme }).catch(err => Toast.error('保存主题失败：' + err.message));
+    }
   },
 
   cycleTheme() {
     const order = ['light', 'dark', 'system'];
     const idx = order.indexOf(this.theme);
-    this.theme = order[(idx + 1) % order.length];
-    localStorage.setItem('lin-router-theme', this.theme);
-    document.documentElement.setAttribute('data-theme', this.theme);
-    Toast.info(`主题已切换：${{light:'浅色', dark:'深色', system:'跟随系统'}[this.theme]}`);
+    const next = order[(idx + 1) % order.length];
+    this.setTheme(next);
+    Toast.info(`主题已切换：${{light:'浅色', dark:'深色', system:'跟随系统'}[next]}`);
   },
 
   toggleSidebar() {
@@ -203,8 +220,7 @@ const App = {
   },
 
   openSettings() {
-    Tabs.switch('config');
-    Toast.info('设置面板将在迭代2中接入');
+    SettingsPanel.open();
   }
 };
 
