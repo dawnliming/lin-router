@@ -146,20 +146,20 @@ const ConfigTab = {
     return `
       <form class="config-form" id="model-form" data-type="model">
         <input type="hidden" id="model-id" value="${m?.id || ''}">
+        <div class="form-row model-group-meta">
+          <label>连接组</label>
+          <select id="model-group">${this.renderGroupOptions(groupId, group?.provider_type)}</select>
+        </div>
         <section class="form-card">
           <h3>基础配置</h3>
-          <div class="form-row">
-            <label>连接组</label>
-            <select id="model-group">${this.renderGroupOptions(groupId, group?.provider_type)}</select>
-          </div>
           <div class="form-row">
             <label>模型名称</label>
             <input id="model-name" value="${Utils.escapeHtml(m?.name || '')}" placeholder="DeepSeek">
           </div>
           ${!isArk ? `
           <div class="form-row" id="model-key-row">
-            <label>${isRelay ? '中转站 API Key' : '上游 API Key'}</label>
-            <input id="model-key" type="password" value="${Utils.escapeHtml(m?.api_key || '')}" placeholder="sk-xxxx">
+            <label>${isRelay ? '中转站 API Key' : '上游 API Key'}${isRelay ? '<span class="required-mark"> *</span>' : ''}</label>
+            <input id="model-key" type="password" value="${Utils.escapeHtml(m?.api_key || '')}" placeholder="sk-xxxx" ${isRelay ? 'required' : ''}>
           </div>
           ` : ''}
           <div class="form-row ${needUpstream ? 'hidden' : ''}" id="model-ep-row">
