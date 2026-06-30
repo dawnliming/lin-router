@@ -35,7 +35,7 @@ const App = {
     topbar.innerHTML = `
       <div class="topbar-left">
         <span class="status-dot" id="status-dot" title="运行中"></span>
-        <span class="copy-chip" id="server-addr" title="点击复制兼容 OpenAI 的接口地址（自动带 /v1）">http://127.0.0.1:8234/v1</span>
+        <span class="copy-chip" id="server-addr" title="点击复制兼容 OpenAI 的接口地址（自动带 /v1）">${window.location.origin}/v1</span>
         <span class="copy-chip" id="global-key" title="点击复制全局 Key">lin-router</span>
       </div>
       <div class="topbar-center">
@@ -43,7 +43,7 @@ const App = {
       </div>
       <div class="topbar-right">
         <button class="icon-btn" id="btn-new-group" title="新建连接组">+</button>
-        <button class="icon-btn" id="btn-export" title="导出配置">💾</button>
+        <button class="icon-btn" id="btn-export" title="导出连接组配置">💾</button>
         <button class="icon-btn" id="btn-settings" title="设置">⚙</button>
         <button class="icon-btn" id="btn-theme" title="切换主题">🌓</button>
       </div>

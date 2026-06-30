@@ -1856,6 +1856,9 @@ class RouterHandler(BaseHTTPRequestHandler):
             csv_text = self.router.export_logs_csv()
             self._send_text(csv_text, content_type="text/csv; charset=utf-8")
             return
+        if parsed.path == "/api/logs/all":
+            self._send_json([asdict(item) for item in self.router.all_logs()])
+            return
         if parsed.path == "/api/config/export":
             # 导出当前配置（groups + models），用于备份和迁移
             payload = {
@@ -2342,8 +2345,12 @@ class RouterHandler(BaseHTTPRequestHandler):
         self._send_text("not found", status=404)
 
     def do_PUT(self) -> None:
-        """把 PUT /api/groups/{id} 和 PUT /api/models/{id} 转发到对应的 POST 处理逻辑。"""
+        """把 PUT /api/groups/{id}、PUT /api/models/{id} 和 PUT /api/settings 转发到对应的 POST 处理逻辑。"""
         parsed = urlparse(self.path)
+        if parsed.path == "/api/settings":
+            # 前端设置面板使用 PUT 保存设置，复用 do_POST 的处理逻辑
+            self._put_body = self._read_raw_body()
+            return self.do_POST()
         if parsed.path.startswith("/api/groups/"):
             group_id = parsed.path.split("/")[3]
             payload = self._read_json()
@@ -2364,14 +2371,16 @@ class RouterHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/groups/"):
             group_id = parsed.path.split("/")[3]
-            if any(model.group_id == group_id for model in self.store.models):
-                self._send_text("group is still used by models", status=400)
-                return
-            before = len(self.store.groups)
-            self.store.groups = [group for group in self.store.groups if group.id != group_id]
-            if len(self.store.groups) == before:
+            # 删除连接组时级联删除组下所有模型，与前端确认文案保持一致
+            before_groups = len(self.store.groups)
+            before_models = len(self.store.models)
+            self.store.models = [m for m in self.store.models if m.group_id != group_id]
+            self.store.groups = [g for g in self.store.groups if g.id != group_id]
+            if len(self.store.groups) == before_groups:
                 self._send_text("group not found", status=404)
                 return
+            if len(self.store.models) != before_models:
+                pass  # 有模型被级联删除，属于正常情况
             self.store.save()
             self._send_json({"ok": True})
             return

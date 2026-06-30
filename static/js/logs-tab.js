@@ -18,13 +18,13 @@ const LogsTab = {
         <h2>最近请求</h2>
         <div class="logs-actions">
           <label class="checkbox">
-            <input type="checkbox" id="logs-current-only" ${this.currentOnly ? 'checked' : ''}>
-            <span>仅显示当前选中组/模型</span>
+            <input type="checkbox" id="logs-auto-refresh" ${this.autoRefresh ? 'checked' : ''}>
+            <span>自动刷新</span>
           </label>
           <button type="button" id="logs-refresh" class="btn-secondary" title="立即刷新">🔄 刷新</button>
           <label class="checkbox">
-            <input type="checkbox" id="logs-auto-refresh" ${this.autoRefresh ? 'checked' : ''}>
-            <span>自动刷新</span>
+            <input type="checkbox" id="logs-current-only" ${this.currentOnly ? 'checked' : ''}>
+            <span>仅显示当前选中组/模型</span>
           </label>
           <button type="button" id="logs-clear" class="btn-secondary">清空日志</button>
           <button type="button" id="logs-export" class="btn-secondary">导出 CSV</button>
@@ -244,7 +244,7 @@ const LogsTab = {
         <td>${Utils.escapeHtml(item.model || '-')}</td>
         <td><span class="pill ${this.statusClass(item.status)}">${Utils.escapeHtml(item.status)}</span></td>
         <td class="tiny">${Utils.escapeHtml(this.eventLabel(item.event))}</td>
-        <td class="tiny">${Number(item.attempt || 0) || '-'}</td>
+        <td class="tiny">${Number(item.attempt || 0) || 1}</td>
         <td class="tiny">${Number(item.duration_ms || 0) ? `${Number(item.duration_ms)} ms` : '-'}</td>
         <td class="tiny">${Utils.escapeHtml(this.tokenSummary(item))}</td>
         <td class="tiny result-text" title="${Utils.escapeHtml(item.detail)}">${this.formatDetailPreview(item.detail)}</td>

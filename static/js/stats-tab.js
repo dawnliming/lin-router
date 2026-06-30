@@ -7,10 +7,18 @@ const StatsTab = {
   trendMetric: 'requests',
   // 趋势图时间粒度：24h / 7d
   trendGranularity: '24h',
+  // 全量日志缓存，避免统计页受 /api/state 的 30 条最近日志限制
+  allLogs: [],
 
-  refresh() {
+  async refresh() {
     const panel = document.getElementById('panel-stats');
     if (!panel) return;
+    try {
+      this.allLogs = await API.getAllLogs();
+    } catch (err) {
+      Toast.error('加载统计数据失败：' + err.message);
+      this.allLogs = Store.state.logs || [];
+    }
     this.render();
   },
 
@@ -150,7 +158,7 @@ const StatsTab = {
   },
 
   compute(range) {
-    const logs = Store.state.logs || [];
+    const logs = this.allLogs || Store.state.logs || [];
     const models = Store.state.models || [];
     const now = new Date();
     const start = this.rangeStart(now, range);
@@ -196,7 +204,7 @@ const StatsTab = {
   },
 
   computeTrend(granularity) {
-    const logs = Store.state.logs || [];
+    const logs = this.allLogs || Store.state.logs || [];
     const models = Store.state.models || [];
     const now = new Date();
     const priceMap = new Map(models.filter(m => m.price_input || m.price_output).map(m => [m.name, m]));

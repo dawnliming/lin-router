@@ -56,6 +56,7 @@ const API = {
     const qs = new URLSearchParams(params).toString();
     return this.req(`/api/logs${qs ? '?' + qs : ''}`);
   },
+  getAllLogs() { return this.req('/api/logs/all'); },
   clearLogs() { return this.req('/api/logs/clear', { method: 'POST' }); },
   exportLogs() { return this.req('/api/logs/export'); },
   saveGroup(id, data) { return this.req(`/api/groups/${id}`, { method: 'PUT', body: JSON.stringify(data) }); },
@@ -72,7 +73,12 @@ const API = {
   setAllUsable(usable) { return this.req('/api/models/usable/all', { method: 'POST', body: JSON.stringify({ usable }) }); },
   resetCooldown(id) { return this.req(`/api/models/${id}/reset`, { method: 'POST' }); },
   resetGroupCooldown(id) { return this.req(`/api/groups/${id}/reset`, { method: 'POST' }); },
-  fetchUpstreamModels(id) { return this.req(`/api/groups/${id}/fetch-models`, { method: 'POST' }); },
+  fetchUpstreamModels(groupId, apiKey) {
+    return this.req('/api/models/fetch-upstream', {
+      method: 'POST',
+      body: JSON.stringify({ group_id: groupId, api_key: apiKey })
+    });
+  },
   getSettings() { return this.req('/api/settings'); },
   saveSettings(data) { return this.req('/api/settings', { method: 'PUT', body: JSON.stringify(data) }); },
   exportConfig() { return this.req('/api/config/export'); },

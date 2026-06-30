@@ -39,7 +39,7 @@ const ConfigTab = {
       <div class="empty-state">
         <div class="empty-icon">🚀</div>
         <h2>欢迎使用 Lin Router</h2>
-        <p class="empty-subtitle">点击左上角 + 新建你的第一个连接组，或导入已有配置</p>
+        <p class="empty-subtitle">点击右上角 + 新建你的第一个连接组，或导入已有配置</p>
         <div class="empty-actions">
           <button type="button" class="btn-primary" id="empty-new-group">新建连接组</button>
           <button type="button" class="btn-secondary" id="empty-import">导入配置</button>
@@ -123,7 +123,7 @@ const ConfigTab = {
           <div class="form-actions form-actions-split">
             <div class="form-actions-left">
               <button type="submit" class="btn-primary">保存更改</button>
-              ${g ? `<button type="button" id="group-clone">复制组</button>` : ''}
+              ${g ? `<button type="button" id="group-clone" class="btn-secondary">复制组</button>` : ''}
             </div>
             <div class="form-actions-right">
               ${g ? `<button type="button" class="btn-danger" id="group-delete">删除组</button>` : ''}
@@ -152,10 +152,6 @@ const ConfigTab = {
             <label>显示名称</label>
             <input id="model-name" value="${Utils.escapeHtml(m?.name || '')}" placeholder="DeepSeek">
           </div>
-          <div class="form-row">
-            <label>连接组</label>
-            <select id="model-group">${this.renderGroupOptions(groupId)}</select>
-          </div>
           ${!isArk ? `
           <div class="form-row" id="model-key-row">
             <label>${isRelay ? '中转站 API Key' : '上游 API Key'}</label>
@@ -172,6 +168,10 @@ const ConfigTab = {
               <select id="model-upstream"></select>
               <button type="button" id="model-fetch">获取</button>
             </div>
+          </div>
+          <div class="form-row">
+            <label>连接组</label>
+            <select id="model-group">${this.renderGroupOptions(groupId, group?.provider_type)}</select>
           </div>
         </section>
         <section class="form-card">
@@ -218,7 +218,7 @@ const ConfigTab = {
           <div class="form-actions form-actions-split">
             <div class="form-actions-left">
               <button type="submit" class="btn-primary">保存模型</button>
-              ${m ? `<button type="button" id="model-clone">复制</button>` : ''}
+              ${m ? `<button type="button" id="model-clone" class="btn-secondary">复制</button>` : ''}
             </div>
             <div class="form-actions-right">
               ${m ? `<button type="button" id="model-delete" class="btn-danger">删除</button>` : ''}
@@ -284,8 +284,8 @@ const ConfigTab = {
     `;
   },
 
-  renderGroupOptions(selectedId) {
-    return Store.state.groups?.map(g =>
+  renderGroupOptions(selectedId, providerType) {
+    return Store.state.groups?.filter(g => !providerType || g.provider_type === providerType).map(g =>
       `<option value="${g.id}" ${g.id === selectedId ? 'selected' : ''}>${Utils.escapeHtml(g.name)}</option>`
     ).join('') || '';
   },
@@ -355,6 +355,9 @@ const ConfigTab = {
   renderUpstreamOptions(groupId) {
     const select = document.getElementById('model-upstream');
     if (!select) return;
+    // 回显当前模型已选中的上游模型
+    const m = Store.getModel(document.getElementById('model-id')?.value);
+    select.dataset.current = m?.upstream_model || m?.ep_id || '';
     const group = Store.getGroup(groupId);
     const upstreams = group?.upstream_models || [];
     const current = select.dataset.current || '';
@@ -602,12 +605,13 @@ const ConfigTab = {
       Toast.warning('只有中转站或通用代理模式才能获取模型');
       return;
     }
+    const apiKey = document.getElementById('model-key')?.value?.trim() || '';
     const btn = document.getElementById('model-fetch');
     const old = btn.textContent;
     btn.disabled = true;
     btn.textContent = '获取中...';
     try {
-      await API.fetchUpstreamModels(groupId);
+      await API.fetchUpstreamModels(groupId, apiKey);
       await Store.load();
       this.syncModelModeUI();
       Toast.success('上游模型已获取');
