@@ -1515,6 +1515,20 @@ class RouterHandler(BaseHTTPRequestHandler):
     def _send_model_list(self, ctx: Any) -> None:
         group = ctx.group
         visible_group = None if ctx.is_global else group
+        # 先统计匹配模型数，便于排查“只能看到 auto”的问题
+        matched_models = [
+            model for model in self.store.models
+            if not visible_group or model.group_id == visible_group.id
+        ]
+        self.router.add_log(
+            "/v1/models",
+            "lin-router",
+            "200",
+            f"key_type={'global' if ctx.is_global else 'route'}; group_id={ctx.group_id}; "
+            f"total_models={len(self.store.models)}; matched_models={len(matched_models)}",
+            0,
+            event="models_list",
+        )
         data = [{
             "id": DEFAULT_AUTO_MODEL_NAME,
             "object": "model",
@@ -1524,9 +1538,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             "parent": None,
         }]
         # /v1/models 返回对应连接组下的全部已配置模型（包含禁用的），方便客户端查看完整列表
-        for model in self.store.models:
-            if visible_group and model.group_id != visible_group.id:
-                continue
+        for model in matched_models:
             model_group = self._group_for(model)
             data.append({
                 "id": model.name,
