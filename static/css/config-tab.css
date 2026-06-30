@@ -41,7 +41,6 @@
 .config-side {
   display: flex;
   flex-direction: column;
-  gap: 24px;
 }
 
 .form-card {
@@ -49,10 +48,11 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: 20px;
+  margin-bottom: 24px;
 }
 
-.form-card + .form-card {
-  margin-top: 0;
+.form-card:last-child {
+  margin-bottom: 0;
 }
 
 .form-card h3 {
@@ -202,6 +202,11 @@
   color: var(--danger);
   font-size: 12px;
   word-break: break-word;
+}
+
+.batch-import-card .batch-add-model-btn {
+  width: 100%;
+  margin-bottom: 16px;
 }
 
 .batch-example {

@@ -13,6 +13,8 @@ const App = {
     await Store.load();
     // 应用服务器端保存的设置
     this.applySettings(Store.state.settings);
+    // 显式触发一次配置页渲染，确保首次进入/刷新时引导页能正确显示
+    ConfigTab.onShow();
 
     Store.subscribe((state) => {
       document.getElementById('server-addr').textContent = `${window.location.origin}/v1`;

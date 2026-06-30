@@ -107,6 +107,10 @@ const SettingsPanel = {
     try {
       await API.saveSettings({ [key]: value });
       await Store.load();
+      // 日志自动刷新开关修改后立即同步到日志页
+      if (key === 'auto_refresh_logs') {
+        LogsTab.setAutoRefresh(value);
+      }
       Toast.success('设置已保存');
     } catch (err) {
       Toast.error('保存设置失败：' + err.message);

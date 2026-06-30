@@ -39,7 +39,7 @@ const ConfigTab = {
       <div class="empty-state">
         <div class="empty-icon">🚀</div>
         <h2>欢迎使用 Lin Router</h2>
-        <p class="empty-subtitle">点击右上角 + 新建你的第一个连接组，或导入已有配置</p>
+        <p class="empty-subtitle">点击左上角 + 新建你的第一个连接组，或导入已有配置</p>
         <div class="empty-actions">
           <button type="button" class="btn-primary" id="empty-new-group">新建连接组</button>
           <button type="button" class="btn-secondary" id="empty-import">导入配置</button>
@@ -149,6 +149,10 @@ const ConfigTab = {
         <section class="form-card">
           <h3>基础配置</h3>
           <div class="form-row">
+            <label>连接组</label>
+            <select id="model-group">${this.renderGroupOptions(groupId, group?.provider_type)}</select>
+          </div>
+          <div class="form-row">
             <label>显示名称</label>
             <input id="model-name" value="${Utils.escapeHtml(m?.name || '')}" placeholder="DeepSeek">
           </div>
@@ -165,13 +169,10 @@ const ConfigTab = {
           <div class="form-row ${needUpstream ? '' : 'hidden'}" id="model-upstream-row">
             <label>上游模型</label>
             <div class="input-with-btn">
-              <select id="model-upstream"></select>
+              <input list="model-upstream-list" id="model-upstream" value="${Utils.escapeHtml(m?.upstream_model || '')}" placeholder="输入或选择上游模型">
+              <datalist id="model-upstream-list"></datalist>
               <button type="button" id="model-fetch">获取</button>
             </div>
-          </div>
-          <div class="form-row">
-            <label>连接组</label>
-            <select id="model-group">${this.renderGroupOptions(groupId, group?.provider_type)}</select>
           </div>
         </section>
         <section class="form-card">
@@ -238,11 +239,9 @@ const ConfigTab = {
 
   renderBatchImport() {
     return `
-      <section class="form-card">
+      <section class="form-card batch-import-card">
         <h3>批量添加模型</h3>
-        <div class="form-row">
-          <button type="button" id="group-add-model" class="btn-primary" style="width:100%">+ 添加模型</button>
-        </div>
+        <button type="button" id="group-add-model" class="btn-primary batch-add-model-btn">+ 添加模型</button>
         <div class="form-row">
           <label>连接组</label>
           <select id="batch-group">${this.renderGroupOptions()}</select>
@@ -353,21 +352,22 @@ const ConfigTab = {
   },
 
   renderUpstreamOptions(groupId) {
-    const select = document.getElementById('model-upstream');
-    if (!select) return;
+    const input = document.getElementById('model-upstream');
+    const list = document.getElementById('model-upstream-list');
+    if (!input || !list) return;
     // 回显当前模型已选中的上游模型
     const m = Store.getModel(document.getElementById('model-id')?.value);
-    select.dataset.current = m?.upstream_model || m?.ep_id || '';
+    input.value = m?.upstream_model || m?.ep_id || '';
     const group = Store.getGroup(groupId);
     const upstreams = group?.upstream_models || [];
-    const current = select.dataset.current || '';
-    select.innerHTML = [
-      '<option value="">请选择上游模型</option>',
-      ...upstreams.map(m => {
-        const value = m.ep_id || m.root || m.name;
-        return `<option value="${Utils.escapeHtml(value)}" ${value === current ? 'selected' : ''}>${Utils.escapeHtml(m.name || value)}</option>`;
-      })
-    ].join('');
+    const current = input.value || '';
+    list.innerHTML = upstreams.map(m => {
+      const value = m.ep_id || m.root || m.name;
+      return `<option value="${Utils.escapeHtml(value)}">${Utils.escapeHtml(m.name || value)}</option>`;
+    }).join('');
+    if (current && !upstreams.find(u => (u.ep_id || u.root || u.name) === current)) {
+      list.innerHTML += `<option value="${Utils.escapeHtml(current)}"></option>`;
+    }
   },
 
   attachEvents(panel) {
