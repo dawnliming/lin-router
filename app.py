@@ -22,15 +22,16 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-import certifi
 import ssl
+
+try:
+    import certifi
+    _ssl_context = ssl.create_default_context(cafile=certifi.where())
+except Exception:  # certifi 未安装时回退到系统默认，Windows 不受影响
+    _ssl_context = ssl.create_default_context()
 
 from linrouter_platform import get_platform
 from settings_store import SettingsStore
-
-
-# 全局 SSL context：使用 certifi 提供的 CA bundle 验证所有 HTTPS 上游
-_ssl_context = ssl.create_default_context(cafile=certifi.where())
 
 
 DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"

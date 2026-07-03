@@ -2,6 +2,10 @@ const ConfigTab = {
   onShow() {
     const panel = document.getElementById('panel-config');
     if (!panel) return;
+    if (!this._upstreamDropdownBound) {
+      document.addEventListener('mousedown', (e) => this._onUpstreamOutsideClick(e));
+      this._upstreamDropdownBound = true;
+    }
     this.render();
   },
 
@@ -177,8 +181,9 @@ const ConfigTab = {
           <div class="form-row ${needUpstream ? '' : 'hidden'}" id="model-upstream-row">
             <label>上游模型</label>
             <div class="input-with-btn">
-              <input list="model-upstream-list" id="model-upstream" value="${Utils.escapeHtml(m?.upstream_model || '')}" placeholder="输入或选择上游模型">
-              <datalist id="model-upstream-list"></datalist>
+              <div id="model-upstream-wrapper">
+                <input id="model-upstream" value="${Utils.escapeHtml(m?.upstream_model || '')}" placeholder="输入或选择上游模型" autocomplete="off">
+              </div>
               <button type="button" id="model-fetch">获取</button>
             </div>
           </div>
@@ -341,22 +346,124 @@ const ConfigTab = {
     this.updateCooldownDisplay();
   },
 
-  renderUpstreamOptions(groupId) {
+  renderUpstreamOptions(groupId, preserveValue = false) {
     const input = document.getElementById('model-upstream');
-    const list = document.getElementById('model-upstream-list');
-    if (!input || !list) return;
-    // 回显当前模型已选中的上游模型
-    const m = Store.getModel(document.getElementById('model-id')?.value);
-    input.value = m?.upstream_model || m?.ep_id || '';
+    const wrapper = document.getElementById('model-upstream-wrapper');
+    if (!input || !wrapper) return;
+    // 回显当前模型已选中的上游模型（获取新列表时不覆盖，让用户看到完整候选）
+    if (!preserveValue) {
+      const m = Store.getModel(document.getElementById('model-id')?.value);
+      input.value = m?.upstream_model || m?.ep_id || '';
+    }
+    input.placeholder = '输入或选择上游模型';
     const group = Store.getGroup(groupId);
     const upstreams = group?.upstream_models || [];
-    const current = input.value || '';
-    list.innerHTML = upstreams.map(m => {
-      const value = m.ep_id || m.root || m.name;
-      return `<option value="${Utils.escapeHtml(value)}">${Utils.escapeHtml(m.name || value)}</option>`;
-    }).join('');
-    if (current && !upstreams.find(u => (u.ep_id || u.root || u.name) === current)) {
-      list.innerHTML += `<option value="${Utils.escapeHtml(current)}"></option>`;
+    this._upstreamOptions = upstreams.map(u => ({
+      value: u.ep_id || u.root || u.name,
+      label: u.name || u.ep_id || u.root || '',
+    }));
+    this._activeUpstreamIndex = -1;
+    this._buildUpstreamDropdown(input, wrapper);
+  },
+
+  _buildUpstreamDropdown(input, wrapper) {
+    const existing = wrapper.querySelector('.upstream-dropdown');
+    if (existing) existing.remove();
+    if (!this._upstreamOptions || !this._upstreamOptions.length) return;
+
+    const list = document.createElement('div');
+    list.className = 'upstream-dropdown';
+    this._upstreamOptions.forEach((opt, idx) => {
+      const item = document.createElement('div');
+      item.className = 'upstream-option';
+      item.textContent = opt.label && opt.label !== opt.value ? `${opt.label} (${opt.value})` : opt.value;
+      item.dataset.value = opt.value;
+      item.dataset.label = opt.label || '';
+      item.dataset.index = idx;
+      item.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        this._selectUpstreamOption(opt.value);
+      });
+      list.appendChild(item);
+    });
+    wrapper.appendChild(list);
+    list.style.display = 'none';
+  },
+
+  _showUpstreamDropdown() {
+    const list = document.querySelector('#model-upstream-wrapper .upstream-dropdown');
+    if (list) list.style.display = 'block';
+  },
+
+  _hideUpstreamDropdown() {
+    const list = document.querySelector('#model-upstream-wrapper .upstream-dropdown');
+    if (list) list.style.display = 'none';
+    this._activeUpstreamIndex = -1;
+    this._updateUpstreamActive();
+  },
+
+  _filterUpstreamDropdown(query) {
+    const q = (query || '').toLowerCase().trim();
+    const items = document.querySelectorAll('#model-upstream-wrapper .upstream-option');
+    items.forEach(el => {
+      const value = (el.dataset.value || '').toLowerCase();
+      const label = (el.dataset.label || '').toLowerCase();
+      el.style.display = (!q || value.includes(q) || label.includes(q)) ? 'block' : 'none';
+    });
+    this._activeUpstreamIndex = -1;
+    this._updateUpstreamActive();
+  },
+
+  _updateUpstreamActive() {
+    const items = [...document.querySelectorAll('#model-upstream-wrapper .upstream-option')]
+      .filter(el => el.style.display !== 'none');
+    items.forEach(el => el.classList.remove('active'));
+    if (this._activeUpstreamIndex >= 0 && this._activeUpstreamIndex < items.length) {
+      items[this._activeUpstreamIndex].classList.add('active');
+      items[this._activeUpstreamIndex].scrollIntoView({ block: 'nearest' });
+    }
+  },
+
+  _selectUpstreamOption(value) {
+    const input = document.getElementById('model-upstream');
+    if (!input) return;
+    input.value = value;
+    this._hideUpstreamDropdown();
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    input.focus();
+  },
+
+  _onUpstreamOutsideClick(e) {
+    if (e.target.closest('#model-upstream-wrapper') || e.target.closest('#model-fetch')) return;
+    this._hideUpstreamDropdown();
+  },
+
+  _onUpstreamKeydown(e) {
+    const list = document.querySelector('#model-upstream-wrapper .upstream-dropdown');
+    if (!list || list.style.display === 'none') {
+      if ((e.key === 'ArrowDown' || e.key === 'ArrowUp') && this._upstreamOptions?.length) {
+        e.preventDefault();
+        this._showUpstreamDropdown();
+      }
+      return;
+    }
+    const visible = [...list.querySelectorAll('.upstream-option')].filter(el => el.style.display !== 'none');
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      this._activeUpstreamIndex = Math.min(this._activeUpstreamIndex + 1, visible.length - 1);
+      this._updateUpstreamActive();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      this._activeUpstreamIndex = Math.max(this._activeUpstreamIndex - 1, -1);
+      this._updateUpstreamActive();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (this._activeUpstreamIndex >= 0 && visible[this._activeUpstreamIndex]) {
+        this._selectUpstreamOption(visible[this._activeUpstreamIndex].dataset.value);
+      }
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      this._hideUpstreamDropdown();
     }
   },
 
@@ -386,7 +493,17 @@ const ConfigTab = {
     if (modelForm) {
       modelForm.addEventListener('submit', e => this.onModelSubmit(e));
       panel.querySelector('#model-group')?.addEventListener('change', () => { this.syncModelModeUI(); this.autoSaveModel(); });
-      panel.querySelector('#model-upstream')?.addEventListener('change', () => this.autoSaveModel());
+      const upstreamInput = panel.querySelector('#model-upstream');
+      if (upstreamInput) {
+        upstreamInput.addEventListener('focus', () => this._showUpstreamDropdown());
+        upstreamInput.addEventListener('input', () => {
+          this._showUpstreamDropdown();
+          this._filterUpstreamDropdown(upstreamInput.value);
+        });
+        upstreamInput.addEventListener('blur', () => this._hideUpstreamDropdown());
+        upstreamInput.addEventListener('keydown', (e) => this._onUpstreamKeydown(e));
+        upstreamInput.addEventListener('change', () => this.autoSaveModel());
+      }
       panel.querySelector('#model-delete')?.addEventListener('click', () => this.onModelDelete());
       panel.querySelector('#model-clone')?.addEventListener('click', () => this.onModelClone());
       panel.querySelector('#model-fetch')?.addEventListener('click', () => this.onFetchUpstream());
@@ -657,10 +774,10 @@ const ConfigTab = {
     try {
       await API.fetchUpstreamModels(groupId, apiKey);
       await Store.load();
-      // 重新渲染上游模型下拉列表，并清空旧值，确保用户看到新获取的完整候选列表
+      // 获取到新列表后清空旧值，并直接渲染下拉，避免 datalist 在 Safari 中不刷新
       const upstreamInput = document.getElementById('model-upstream');
       if (upstreamInput) upstreamInput.value = '';
-      this.renderUpstreamOptions(groupId);
+      this.renderUpstreamOptions(groupId, true);
       Toast.success('上游模型已获取');
     } catch (err) {
       Toast.error('获取失败：' + err.message);
