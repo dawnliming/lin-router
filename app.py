@@ -1688,7 +1688,7 @@ class ArkProxyRouter:
                 if self._is_rate_limited(err.code, raw):
                     try:
                         retry_started_at = time.perf_counter()
-                        with urlopen(request, timeout=120, context=_ssl_context) as resp:
+                        with self._upstream_client.request("POST", target_url, outbound_headers, body, stream=False, timeout=120) as resp:
                             data = resp.read()
                             retry_duration_ms = int((time.perf_counter() - retry_started_at) * 1000)
                             prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens = self._usage_from_response(data)
@@ -1697,7 +1697,7 @@ class ArkProxyRouter:
                                 path,
                                 candidate.label,
                                 str(resp.status),
-                                self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "retry ok", lock_wait_ms=lock_wait_ms, lock_release_reason="retry_ok"),
+                                self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "retry ok", resp=resp, lock_wait_ms=lock_wait_ms, lock_release_reason="retry_ok"),
                                 retry_duration_ms,
                                 prompt_tokens,
                                 completion_tokens,
