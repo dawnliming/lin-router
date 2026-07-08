@@ -1,17 +1,33 @@
+# Runtime local config/data
 lin-router-config.json
 lin-router-settings.json
 lin-router-logs.jsonl
+*config-test*.json
+*.tmp.json
+
+# Python caches
 __pycache__/
 *.py[cod]
+.pytest_cache/
+
+# Local agent/tooling workspaces
 .tmp/
-.tmp/cache-debug/
+.agents/
+.trae/
+
+# Build artifacts
 build/
 dist/
 *.spec
-PRD/lin-router-config-test.json
-*config-test*.json
-*.tmp.json
+*.exe
+*.dmg
+*.app/
+
+# Logs and backups
+*.log
 *.bak
 *.bak-*
 *.backup
+
+# Local planning docs / drafts
 PRD/
