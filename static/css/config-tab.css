@@ -452,7 +452,7 @@
 
 .batch-preview-table {
   width: 100%;
-  min-width: 560px;
+  min-width: 820px;
   border-collapse: collapse;
   font-size: 13px;
   table-layout: auto;
@@ -731,4 +731,53 @@
 .btn-recover.btn-sm {
   padding: 5px 10px;
   font-size: 12px;
+}
+
+
+.aggregate-members-table .truncate-cell {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.aggregate-members-table .price-col {
+  width: 100px;
+  max-width: 110px;
+}
+
+.aggregate-members-table .price-col input {
+  width: 86px;
+  padding: 5px 6px;
+}
+
+.batch-preview-table-wrap {
+  max-height: 420px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.batch-preview-table th,
+.batch-preview-table td {
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.batch-preview-table th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-secondary);
+  z-index: 1;
+}
+
+.batch-preview-summary {
+  margin-bottom: 10px;
+  color: var(--text-secondary);
+}
+
+.batch-row-invalid {
+  background: rgba(239, 68, 68, 0.06);
 }

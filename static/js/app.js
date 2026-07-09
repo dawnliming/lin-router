@@ -13,12 +13,14 @@ const App = {
     await Store.load();
     // 应用服务器端保存的设置
     this.applySettings(Store.state.settings);
-    // 显式触发一次配置页渲染，确保首次进入/刷新时引导页能正确显示
+    // 首次进入显示可回访首页，同时预渲染配置页以保留原有引导能力
+    DashboardTab.refresh();
     ConfigTab.onShow();
 
     Store.subscribe((state) => {
       document.getElementById('server-addr').textContent = `${window.location.origin}/v1`;
       this.updateStatusDot(state);
+      DashboardTab.refresh();
       ConfigTab.onShow();
       Tree.render();
     });
@@ -142,9 +144,9 @@ const App = {
         e.preventDefault();
         this.saveCurrentConfig();
       }
-      if ((e.ctrlKey || e.metaKey) && /^[1-4]$/.test(e.key)) {
+      if ((e.ctrlKey || e.metaKey) && /^[1-5]$/.test(e.key)) {
         e.preventDefault();
-        const map = {1:'config',2:'test',3:'logs',4:'stats'};
+        const map = {1:'dashboard',2:'config',3:'logs',4:'test',5:'stats'};
         Tabs.switch(map[e.key]);
       }
     });
@@ -152,6 +154,7 @@ const App = {
 
   saveCurrentConfig() {
     const sel = Store.selected;
+    if (Tabs.current === 'dashboard') return;
     if (sel.type === 'group') {
       const form = document.getElementById('group-form');
       if (form) form.dispatchEvent(new Event('submit'));

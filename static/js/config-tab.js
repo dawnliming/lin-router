@@ -338,12 +338,11 @@ const ConfigTab = {
             <thead>
               <tr>
                 <th>顺序</th>
-                <th>启用</th>
                 <th>连接组</th>
                 <th>模型</th>
                 <th>上游模型</th>
                 <th>优先级</th>
-                <th>手动价格</th>
+                <th class="price-col">手动价格</th>
                 <th>状态</th>
                 <th>操作</th>
               </tr>
@@ -376,12 +375,11 @@ const ConfigTab = {
     return `
       <tr data-member-id="${member.id}">
         <td class="tiny">${idx + 1}</td>
-        <td><input type="checkbox" class="aggregate-member-enabled" data-member-id="${member.id}" ${member.enabled !== false ? 'checked' : ''}></td>
-        <td>${Utils.escapeHtml(group?.name || '-')}${warningBadge}</td>
-        <td>${Utils.escapeHtml(model?.name || '-')}</td>
-        <td>${Utils.escapeHtml(model?.upstream_model || model?.ep_id || '-')}</td>
+        <td class="truncate-cell" title="${Utils.escapeHtml(group?.name || '-')}">${Utils.escapeHtml(group?.name || '-')}${warningBadge}</td>
+        <td class="truncate-cell" title="${Utils.escapeHtml(model?.name || '-')}">${Utils.escapeHtml(model?.name || '-')}</td>
+        <td class="truncate-cell" title="${Utils.escapeHtml(model?.upstream_model || model?.ep_id || '-')}">${Utils.escapeHtml(model?.upstream_model || model?.ep_id || '-')}</td>
         <td class="tiny">${idx + 1}</td>
-        <td><input type="number" class="aggregate-member-price" data-member-id="${member.id}" value="${member.manual_price != null ? member.manual_price : ''}" step="0.001" placeholder="未填"></td>
+        <td class="price-col"><input type="number" class="aggregate-member-price" data-member-id="${member.id}" value="${member.manual_price != null ? member.manual_price : ''}" step="0.001" placeholder="继承"></td>
         <td class="tiny"><span class="pill ${status.class}" title="${Utils.escapeHtml(status.title)}">${status.text}</span></td>
         <td class="aggregate-member-actions">
           ${toggleBtn}
@@ -760,9 +758,6 @@ const ConfigTab = {
       panel.querySelector('#aggregate-delete')?.addEventListener('click', () => this.onAggregateDelete());
       panel.querySelector('#aggregate-copy-route-key')?.addEventListener('click', () => this.onCopyAggregateRouteKey());
       panel.querySelector('#aggregate-add-member')?.addEventListener('click', () => this.onAddAggregateMember());
-      panel.querySelectorAll('.aggregate-member-enabled').forEach(el => {
-        el.addEventListener('change', () => this.onToggleAggregateMember(el.dataset.memberId, el.checked));
-      });
       panel.querySelectorAll('.aggregate-member-price').forEach(el => {
         const save = () => this.onUpdateAggregateMemberPrice(el.dataset.memberId, el.value);
         el.addEventListener('change', save);
@@ -788,7 +783,7 @@ const ConfigTab = {
     form.querySelectorAll('input, select, textarea').forEach(el => {
       // 聚合成员字段有独立保存逻辑，避免 autoSaveAggregate 的 blur 事件与成员保存竞争
       const cls = el.className || '';
-      if (cls.includes('aggregate-member-price') || cls.includes('aggregate-member-enabled')) return;
+      if (cls.includes('aggregate-member-price')) return;
       const event = el.tagName === 'SELECT' || el.type === 'checkbox' ? 'change' : 'blur';
       el.addEventListener(event, () => callback());
     });
@@ -1121,7 +1116,7 @@ const ConfigTab = {
       </div>
       <div class="form-row">
         <label>手动价格（可选）</label>
-        <input id="member-price" type="number" step="0.001" placeholder="价格优先策略下用于排序，留空则排最后">
+        <input id="member-price" type="number" step="0.001" placeholder="默认继承底层模型价格，可手动覆盖">
       </div>
       <div class="form-row">
         <label>预览</label>
@@ -1133,6 +1128,13 @@ const ConfigTab = {
       const modelSelect = overlay.querySelector('#member-model');
       const preview = overlay.querySelector('#member-preview');
       if (!groupSelect || !modelSelect) return;
+      const priceInput = overlay.querySelector('#member-price');
+      const applyDefaultPrice = () => {
+        const model = Store.getModel(modelSelect.value);
+        if (!priceInput || !model || priceInput.dataset.touched === 'true') return;
+        const candidates = [model.price_input, model.price_output].map(v => Number(v || 0)).filter(v => v > 0);
+        priceInput.value = candidates.length ? String(Math.min(...candidates)) : '';
+      };
       const refresh = () => {
         const groupId = groupSelect.value;
         const group = Store.getGroup(groupId);
@@ -1148,8 +1150,15 @@ const ConfigTab = {
         ).join('');
         this._updateMemberPreview(groupSelect.value, modelSelect.value, preview);
       };
-      groupSelect.addEventListener('change', refresh);
-      modelSelect.addEventListener('change', () => this._updateMemberPreview(groupSelect.value, modelSelect.value, preview));
+      priceInput?.addEventListener('input', () => { priceInput.dataset.touched = 'true'; });
+      groupSelect.addEventListener('change', () => {
+        if (priceInput) { priceInput.dataset.touched = ''; priceInput.value = ''; }
+        refresh();
+      });
+      modelSelect.addEventListener('change', () => {
+        applyDefaultPrice();
+        this._updateMemberPreview(groupSelect.value, modelSelect.value, preview);
+      });
       refresh();
     };
     const values = await Modal.form({
@@ -1187,7 +1196,10 @@ const ConfigTab = {
       return;
     }
     const upstream = model.upstream_model || model.ep_id || model.name;
-    previewEl.innerHTML = Utils.escapeHtml(`${group.name} / ${model.name} → ${upstream}${model.price_group ? ' / 价格组 ' + model.price_group : ''}`);
+    const priceHint = (Number(model.price_input || 0) || Number(model.price_output || 0))
+      ? ` / 底层价格 输入 ${model.price_input || 0} 输出 ${model.price_output || 0}`
+      : '';
+    previewEl.innerHTML = Utils.escapeHtml(`${group.name} / ${model.name} → ${upstream}${model.price_group ? ' / 价格组 ' + model.price_group : ''}${priceHint}`);
   },
 
   onAggregateMemberAction(action, memberId) {
@@ -1371,7 +1383,8 @@ const ConfigTab = {
     };
     const isRelay = group?.provider_type === 'relay';
     const rows = items.map(item => `
-      <tr>
+      <tr class="batch-row-${item.status}">
+        <td>${Number(item.line || 0) || '-'}</td>
         <td class="wrap-cell" title="${Utils.escapeHtml(item.name)}">${Utils.escapeHtml(item.name)}</td>
         <td class="wrap-cell" title="${Utils.escapeHtml(item.ep_id)}">${Utils.escapeHtml(item.ep_id)}</td>
         ${isRelay ? `
@@ -1380,11 +1393,12 @@ const ConfigTab = {
           <td class="wrap-cell" title="${Utils.escapeHtml(item.price_group || '')}">${Utils.escapeHtml(item.price_group || '-')}</td>
         ` : ''}
         <td>${statusMap[item.status] || item.status}</td>
+        <td class="wrap-cell" title="${Utils.escapeHtml(item.reason || '')}">${Utils.escapeHtml(item.reason || '-')}</td>
       </tr>
     `).join('');
     const header = isRelay
-      ? '<tr><th>名称</th><th>上游模型/EP</th><th>中转模型</th><th>API Key</th><th>价格组</th><th>状态</th></tr>'
-      : '<tr><th>名称</th><th>上游模型/EP</th><th>状态</th></tr>';
+      ? '<tr><th>行号</th><th>名称</th><th>上游模型/EP</th><th>中转模型</th><th>API Key</th><th>价格组</th><th>状态</th><th>原因</th></tr>'
+      : '<tr><th>行号</th><th>名称</th><th>上游模型/EP</th><th>状态</th><th>原因</th></tr>';
     const summaryText = `将导入 ${summary.total} 个模型：新增 ${summary.new}，跳过重复 ${summary.duplicate}，无效 ${summary.invalid}。`;
     const tableClass = isRelay ? 'batch-preview-table relay-preview-table' : 'batch-preview-table';
     const body = `

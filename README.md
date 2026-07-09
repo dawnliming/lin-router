@@ -24,10 +24,10 @@ python -m linrouter --tray
 
 ```text
 dist\LinRouter_windows.exe
-dist\LinRouter-Setup-v0.5.1-win-x64.exe
+dist\LinRouter-Setup-v0.5.2-win-x64.exe
 ```
 
-推荐分发安装包 `LinRouter-Setup-v0.5.1-win-x64.exe`；单文件免安装使用时可直接运行 `LinRouter_windows.exe`。
+推荐分发安装包 `LinRouter-Setup-v0.5.2-win-x64.exe`；单文件免安装使用时可直接运行 `LinRouter_windows.exe`。
 
 ### macOS 产物
 
@@ -157,11 +157,11 @@ scripts/build.sh --target win32
 
 # Windows + 安装包（默认使用内置自举安装器；装了 Inno Setup 6 会优先使用 ISCC）
 scripts/build.sh --target win32 --installer
-# -> dist/LinRouter_windows.exe + dist/LinRouter-v0.5.1-win-x64.zip + dist/LinRouter-Setup-v0.5.1-win-x64.exe
+# -> dist/LinRouter_windows.exe + dist/LinRouter-v0.5.2-win-x64.zip + dist/LinRouter-Setup-v0.5.2-win-x64.exe
 
 # 指定安装包版本号
-scripts/build.sh --target win32 --installer --version 0.5.1
-# -> dist/LinRouter-Setup-v0.5.1-win-x64.exe
+scripts/build.sh --target win32 --installer --version 0.5.2
+# -> dist/LinRouter-Setup-v0.5.2-win-x64.exe
 
 # macOS
 scripts/build.sh --target darwin
@@ -176,7 +176,7 @@ scripts/build.sh --target darwin --dmg
 
 Windows 安装包默认通过 `scripts/installer/build_self_installer.py` 生成，未安装 Inno Setup 也可出包；如本机存在 Inno Setup 6 / `ISCC`，则优先使用 `scripts/installer/LinRouter.iss`。安装包默认安装到当前用户的 `%LOCALAPPDATA%\Programs\LinRouter`，不需要管理员权限，默认创建桌面快捷方式；配置和日志写入 `%APPDATA%\LinRouter`。支持静默安装参数 `--silent --desktop --no-desktop --autostart --no-run`。
 
-v0.5.1 发布前检查清单见 `scripts/release-checklist-v0.5.1.md`；构建脚本会自动对 zip / setup 产物执行脱敏扫描。
+v0.5.2 发布前检查清单见 `scripts/release-checklist-v0.5.2.md`；构建脚本会自动对 zip / setup 产物执行脱敏扫描。
 
 ```bash
 python -m PyInstaller --noconfirm LinRouter.spec
@@ -184,7 +184,7 @@ python -m PyInstaller --noconfirm LinRouter.spec
 
 ## 新手安装说明（Windows）
 
-1. 下载 `LinRouter-Setup-v0.5.1-win-x64.exe`，双击安装；如果 Windows Defender 提示未知发布者，确认来源是本项目发布包后选择“仍要运行”。
+1. 下载 `LinRouter-Setup-v0.5.2-win-x64.exe`，双击安装；如果 Windows Defender 提示未知发布者，确认来源是本项目发布包后选择“仍要运行”。
 2. 安装完成后桌面会出现 `Lin Router` 图标；双击启动后会自动打开管理页面。
 3. 首次启动会自动生成空配置，你需要在“配置”页添加连接组并填写上游 Base URL / API Key。
 4. 客户端 Base URL 填 `http://127.0.0.1:18400/v1`，API Key 填页面中连接组 Key（`lr-...`）或聚合模型 Key（`lr-ag-...`）。

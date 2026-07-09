@@ -4114,27 +4114,33 @@ class RouterHandler(BaseHTTPRequestHandler):
                     arr = json.loads(text)
                     if not isinstance(arr, list):
                         raise ValueError("JSON 格式必须是数组")
-                    for entry in arr:
+                    for idx, entry in enumerate(arr, start=1):
                         if isinstance(entry, dict):
-                            items.append(entry)
+                            copied = dict(entry)
+                            copied["line"] = idx
+                            items.append(copied)
                         elif isinstance(entry, str):
-                            items.append({"ep_id": entry.strip()})
+                            items.append({"ep_id": entry.strip(), "line": idx})
+                        else:
+                            items.append({"ep_id": "", "line": idx, "parse_error": "JSON 数组项必须是对象或字符串"})
                 elif fmt == "models_response":
                     obj = json.loads(text)
                     data = obj.get("data") if isinstance(obj, dict) else None
                     if not isinstance(data, list):
                         raise ValueError("/v1/models 响应必须包含 data 数组")
-                    for entry in data:
+                    for idx, entry in enumerate(data, start=1):
                         if isinstance(entry, dict):
-                            items.append({"ep_id": str(entry.get("id") or "").strip()})
+                            items.append({"ep_id": str(entry.get("id") or "").strip(), "line": idx})
                         elif isinstance(entry, str):
-                            items.append({"ep_id": entry.strip()})
+                            items.append({"ep_id": entry.strip(), "line": idx})
+                        else:
+                            items.append({"ep_id": "", "line": idx, "parse_error": "data 项必须是对象或字符串"})
                 else:
-                    # lines 格式：每行一个模型名，空行跳过
-                    for line in text.splitlines():
+                    # lines 格式：每行一个模型名，空行跳过但保留原始行号
+                    for idx, line in enumerate(text.splitlines(), start=1):
                         ep = line.strip()
                         if ep:
-                            items.append({"ep_id": ep})
+                            items.append({"ep_id": ep, "line": idx})
                 return items
 
             try:
@@ -4152,10 +4158,10 @@ class RouterHandler(BaseHTTPRequestHandler):
             processed: List[Dict[str, Any]] = []
             seen_ep_ids: set[str] = set()
             seen_names: set[str] = set()
+            name_re = re.compile(r"^[^\s,;]+$")
             for item in raw_items:
+                line_no = int(item.get("line") or 0)
                 ep_id = str(item.get("ep_id") or item.get("upstream_model") or "").strip()
-                if not ep_id:
-                    continue
                 name = str(item.get("name") or "").strip() or ep_id
                 upstream_model = str(item.get("upstream_model") or "").strip() or ep_id
                 # 单个模型字段 > 批量统一字段 > 默认值
@@ -4166,16 +4172,32 @@ class RouterHandler(BaseHTTPRequestHandler):
                 price_output = float(item.get("price_output") if item.get("price_output") is not None else defaults.get("price_output") or 0)
 
                 status = "new"
-                if ep_id in existing_ep_ids or name in existing_names or ep_id in seen_ep_ids or name in seen_names:
+                reason = "将新增"
+                if item.get("parse_error"):
+                    status = "invalid"
+                    reason = str(item.get("parse_error"))
+                elif not ep_id:
+                    status = "invalid"
+                    reason = "模型名为空"
+                elif not name_re.match(ep_id) or not name_re.match(name):
+                    status = "invalid"
+                    reason = "模型名不能包含空白、逗号或分号"
+                elif ep_id in existing_ep_ids or name in existing_names:
                     status = "duplicate"
+                    reason = "已存在同名模型，默认跳过"
+                elif ep_id in seen_ep_ids or name in seen_names:
+                    status = "duplicate"
+                    reason = "本次导入列表中重复，默认跳过"
                 elif need_upstream and not upstream_model:
                     status = "invalid"
-                elif not name:
-                    status = "invalid"
+                    reason = "缺少上游模型名"
 
-                seen_ep_ids.add(ep_id)
-                seen_names.add(name)
+                if ep_id:
+                    seen_ep_ids.add(ep_id)
+                if name:
+                    seen_names.add(name)
                 processed.append({
+                    "line": line_no,
                     "name": name,
                     "ep_id": ep_id,
                     "upstream_model": upstream_model if need_upstream else "",
@@ -4186,6 +4208,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                     "price_output": price_output,
                     "usable": usable,
                     "status": status,
+                    "reason": reason,
                 })
 
             total = len(processed)

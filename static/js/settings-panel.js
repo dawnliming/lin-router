@@ -131,7 +131,7 @@ const SettingsPanel = {
           <section class="settings-section">
             <h3>关于</h3>
             <div class="settings-about">
-              <div class="settings-about-row"><span>版本</span><span>v0.5.1</span></div>
+              <div class="settings-about-row"><span>版本</span><span>v0.5.2</span></div>
               <div class="settings-about-row"><span>项目地址</span><a href="https://github.com/dawnliming/lin-router" target="_blank" rel="noopener">GitHub</a></div>
             </div>
           </section>

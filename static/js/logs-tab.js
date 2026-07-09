@@ -236,10 +236,9 @@ const LogsTab = {
     const output = Number(item.completion_tokens || 0);
     const total = Number(item.total_tokens || 0);
     const cached = Number(item.cached_tokens || 0);
-    const reasoning = Number(item.reasoning_tokens || 0);
-    if (!total && !input && !output && !cached && !reasoning) return '-';
+    if (!total && !input && !output && !cached) return '-';
     const hit = input ? Math.round((cached / input) * 100) : 0;
-    return `input/prompt ${input} / output/completion ${output} / cached ${cached} (${hit}%) / reasoning ${reasoning} / total ${total}`;
+    return `输入 ${input} / 输出 ${output} / 命中 ${cached} (${hit}%) / total ${total}`;
   },
 
   parseDetail(detail) {

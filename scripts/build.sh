@@ -13,7 +13,7 @@ TARGET=""
 BUILD_DMG=0
 BUILD_INSTALLER=0
 COPY_TO_DESKTOP=0
-APP_VERSION="0.5.1"
+APP_VERSION="0.5.2"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

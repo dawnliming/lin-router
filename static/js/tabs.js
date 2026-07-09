@@ -1,9 +1,10 @@
 const Tabs = {
-  current: 'config',
+  current: 'dashboard',
   tabs: [
-    { id: 'config', label: '配置', icon: '📝' },
-    { id: 'test', label: '代理测试', icon: '🧪' },
-    { id: 'logs', label: '最近请求', icon: '📜' },
+    { id: 'dashboard', label: '首页', icon: '🏠' },
+    { id: 'config', label: '配置管理', icon: '📝' },
+    { id: 'logs', label: '请求日志', icon: '📜' },
+    { id: 'test', label: '测试请求', icon: '🧪' },
     { id: 'stats', label: '统计', icon: '📊' }
   ],
 
@@ -31,6 +32,7 @@ const Tabs = {
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.dataset.tab === tabId));
 
     if (tabId === 'logs') LogsTab.refresh();
+    if (tabId === 'dashboard') DashboardTab.refresh();
     if (tabId === 'stats') StatsTab.refresh();
     if (tabId === 'test') TestTab.onShow();
     if (tabId === 'config') ConfigTab.onShow();
