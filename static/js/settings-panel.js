@@ -57,6 +57,11 @@ const SettingsPanel = {
               <span>日志页自动刷新</span>
               <input id="setting-auto-refresh-logs" type="checkbox" ${s.auto_refresh_logs !== false ? 'checked' : ''}>
             </label>
+            <label class="settings-row">
+              <span>调试模式：日志详情显示原始诊断字段</span>
+              <input id="setting-debug-mode" type="checkbox" ${s.debug_mode ? 'checked' : ''}>
+            </label>
+            <div class="settings-hint">调试模式只展示脱敏后的 request_id、member_id、failure_scope、fallback_chain 等摘要，不展示完整 Key、Authorization 或请求 body。</div>
           </section>
 
           <section class="settings-section">
@@ -131,7 +136,7 @@ const SettingsPanel = {
           <section class="settings-section">
             <h3>关于</h3>
             <div class="settings-about">
-              <div class="settings-about-row"><span>版本</span><span>v0.5.2</span></div>
+              <div class="settings-about-row"><span>版本</span><span>v0.5.3</span></div>
               <div class="settings-about-row"><span>项目地址</span><a href="https://github.com/dawnliming/lin-router" target="_blank" rel="noopener">GitHub</a></div>
             </div>
           </section>
@@ -147,6 +152,7 @@ const SettingsPanel = {
     panel.querySelector('#setting-auto-start')?.addEventListener('change', e => this.updateSetting('auto_start', e.target.checked));
     panel.querySelector('#setting-start-minimized')?.addEventListener('change', e => this.updateSetting('start_minimized', e.target.checked));
     panel.querySelector('#setting-auto-refresh-logs')?.addEventListener('change', e => this.updateSetting('auto_refresh_logs', e.target.checked));
+    panel.querySelector('#setting-debug-mode')?.addEventListener('change', e => this.updateSetting('debug_mode', e.target.checked));
 
     panel.querySelectorAll('input[name="setting-theme"]').forEach(radio => {
       radio.addEventListener('change', e => {

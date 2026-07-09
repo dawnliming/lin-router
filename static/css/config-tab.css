@@ -781,3 +781,85 @@
 .batch-row-invalid {
   background: rgba(239, 68, 68, 0.06);
 }
+
+
+.config-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.aggregate-status-note {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.aggregate-gain-card {
+  margin-top: 16px;
+}
+
+.aggregate-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.aggregate-stat-card {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+}
+
+.aggregate-stat-card span,
+.aggregate-stat-card small {
+  display: block;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.aggregate-stat-card strong {
+  display: block;
+  margin: 6px 0;
+  font-size: 18px;
+}
+
+.aggregate-risk-list {
+  grid-column: 1 / -1;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+}
+
+.preview-impact p {
+  margin: 6px 0;
+}
+
+.danger-text {
+  color: var(--danger);
+}
+
+.preview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+.preview-grid pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  max-height: 260px;
+  overflow: auto;
+}

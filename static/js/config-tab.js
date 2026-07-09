@@ -33,7 +33,10 @@ const ConfigTab = {
     panel.innerHTML = `
       <div class="config-header">
         <h2>${title}</h2>
-        <div class="save-status" id="save-status"></div>
+        <div class="config-header-actions">
+          <button type="button" id="config-runtime-refresh" class="btn-secondary btn-sm" title="立即刷新运行状态">刷新状态</button>
+          <div class="save-status" id="save-status"></div>
+        </div>
       </div>
       <div class="config-layout">
         <div class="config-main">
@@ -320,8 +323,68 @@ const ConfigTab = {
           </div>
         </section>
         ${a ? this.renderAggregateMembers(a) : ''}
+        ${a ? this.renderAggregateGainBoard(a) : ''}
       </form>
     `;
+  },
+
+  renderAggregateGainBoard(a) {
+    return `
+      <section class="form-card aggregate-gain-card" data-aggregate-stats-id="${a.id}">
+        <div class="aggregate-members-header">
+          <div>
+            <h3>调度收益看板</h3>
+            <div class="form-hint">按 request_id 聚合真实请求，配置型 skip 不计入请求总数。</div>
+          </div>
+          <select id="aggregate-stats-limit" class="btn-sm">
+            <option value="50">最近 50 条</option>
+            <option value="100" selected>最近 100 条</option>
+            <option value="500">最近 500 条</option>
+          </select>
+        </div>
+        <div id="aggregate-stats-body" class="aggregate-stats-grid">
+          <div class="form-hint">加载调度收益数据中…</div>
+        </div>
+      </section>
+    `;
+  },
+
+  async refreshAggregateStats() {
+    const aggregateId = document.getElementById('aggregate-id')?.value;
+    const body = document.getElementById('aggregate-stats-body');
+    if (!aggregateId || !body) return;
+    const limit = Number(document.getElementById('aggregate-stats-limit')?.value || 100);
+    try {
+      const stats = await API.getAggregateStats(aggregateId, limit);
+      body.innerHTML = this.renderAggregateStats(stats);
+    } catch (err) {
+      body.innerHTML = `<div class="form-hint">收益数据加载失败：${Utils.escapeHtml(err.message)}</div>`;
+    }
+  },
+
+  renderAggregateStats(stats) {
+    if (!stats || !stats.ok || !stats.request_count) {
+      return '<div class="form-hint">暂无数据：还没有可统计的真实聚合请求。</div>';
+    }
+    const pct = v => v == null ? '暂无数据' : `${(Number(v) * 100).toFixed(1)}%`;
+    const ms = v => v == null ? '暂无数据' : `${Math.round(Number(v))} ms`;
+    const num = v => v == null ? '暂无数据' : String(v);
+    const cards = [
+      ['请求总数', num(stats.request_count), '不含配置型 skip'],
+      ['成功率', pct(stats.success_rate), `${stats.success_count || 0} 次成功`],
+      ['fallback 成功', num(stats.fallback_success_count), '首选失败/忙后仍成功'],
+      ['首选命中率', pct(stats.first_choice_success_rate), 'attempt=1 成功占比'],
+      ['cooldown 跳过', num(stats.cooldown_skip_count), '避免等待不健康成员'],
+      ['候选忙切换', num(stats.busy_switch_count), '大上下文并发占用'],
+      ['cache 命中率', pct(stats.cache_hit_rate), `${stats.cached_tokens || 0} / ${stats.prompt_tokens || 0}`],
+      ['平均首包', ms(stats.avg_first_chunk_ms), 'stream_ok 平均耗时'],
+    ];
+    const risk = (stats.high_risk_members || []).length
+      ? `<div class="aggregate-risk-list"><strong>高风险成员</strong>${stats.high_risk_members.map(item => `<div>${Utils.escapeHtml(item.model || item.member_id)}：timeout ${item.timeout_count || 0} / WAF ${item.waf_blocked_count || 0} / 失败 ${item.failure_count || 0}</div>`).join('')}</div>`
+      : '<div class="form-hint">暂无高风险成员。</div>';
+    return cards.map(([label, value, hint]) => `
+      <div class="aggregate-stat-card"><span>${label}</span><strong>${value}</strong><small>${hint}</small></div>
+    `).join('') + risk;
   },
 
   renderAggregateMembers(a) {
@@ -332,6 +395,7 @@ const ConfigTab = {
           <h3>聚合成员</h3>
           <button type="button" id="aggregate-add-member" class="btn-secondary btn-sm">+ 添加成员</button>
         </div>
+        <div class="aggregate-status-note">成员状态不等于底层真实模型状态：手动停用只影响聚合成员；自动冷却表示上游健康失败；底层停用需要到真实模型配置中恢复。</div>
         ${members.length ? `
         <div class="aggregate-members-table-wrap">
           <table class="aggregate-members-table">
@@ -380,7 +444,7 @@ const ConfigTab = {
         <td class="truncate-cell" title="${Utils.escapeHtml(model?.upstream_model || model?.ep_id || '-')}">${Utils.escapeHtml(model?.upstream_model || model?.ep_id || '-')}</td>
         <td class="tiny">${idx + 1}</td>
         <td class="price-col"><input type="number" class="aggregate-member-price" data-member-id="${member.id}" value="${member.manual_price != null ? member.manual_price : ''}" step="0.001" placeholder="继承"></td>
-        <td class="tiny"><span class="pill ${status.class}" title="${Utils.escapeHtml(status.title)}">${status.text}</span></td>
+        <td class="tiny" data-member-status-cell="${member.id}"><span class="pill ${status.class}" title="${Utils.escapeHtml(status.title)}">${status.text}</span></td>
         <td class="aggregate-member-actions">
           ${toggleBtn}
           ${recoverBtn}
@@ -393,6 +457,16 @@ const ConfigTab = {
   },
 
   aggregateMemberStatus(member, model) {
+    const derivedMap = {
+      manual_disabled: { class: 'warning', text: '已停用', title: member.derived_reason || '该聚合成员已手动停用，不参与调度' },
+      cooling: { class: 'cooldown', text: '冷却中', title: member.derived_reason || member.cooldown_reason || '聚合成员正在冷却' },
+      underlying_model_disabled: { class: 'warning', text: '底层模型已停用', title: member.derived_reason || '请先启用底层真实模型' },
+      underlying_model_cooling: { class: 'cooldown', text: '底层模型冷却中', title: member.derived_reason || '底层真实模型正在冷却' },
+      config_error: { class: 'danger', text: '配置异常', title: member.derived_reason || '底层连接组或模型缺失' },
+      warning: { class: 'warning', text: '最近错误', title: member.derived_reason || member.last_error || '最近发生错误' },
+      healthy: { class: 'success', text: '正常', title: member.derived_reason || '该成员可参与聚合调度' },
+    };
+    if (member.derived_status && derivedMap[member.derived_status]) return derivedMap[member.derived_status];
     if (member.enabled === false) return { class: 'warning', text: '已停用', title: '该聚合成员已手动停用，不参与调度' };
     if (member.cooldown_until && member.cooldown_until * 1000 > Date.now()) {
       const remainSec = Math.max(0, Math.ceil((member.cooldown_until * 1000 - Date.now()) / 1000));
@@ -709,6 +783,8 @@ const ConfigTab = {
   },
 
   attachEvents(panel) {
+    panel.querySelector('#config-runtime-refresh')?.addEventListener('click', () => this.refreshRuntimeNow());
+
     // 组表单
     const groupForm = panel.querySelector('#group-form');
     if (groupForm) {
@@ -758,6 +834,8 @@ const ConfigTab = {
       panel.querySelector('#aggregate-delete')?.addEventListener('click', () => this.onAggregateDelete());
       panel.querySelector('#aggregate-copy-route-key')?.addEventListener('click', () => this.onCopyAggregateRouteKey());
       panel.querySelector('#aggregate-add-member')?.addEventListener('click', () => this.onAddAggregateMember());
+      panel.querySelector('#aggregate-stats-limit')?.addEventListener('change', () => this.refreshAggregateStats());
+      this.refreshAggregateStats();
       panel.querySelectorAll('.aggregate-member-price').forEach(el => {
         const save = () => this.onUpdateAggregateMemberPrice(el.dataset.memberId, el.value);
         el.addEventListener('change', save);
@@ -776,6 +854,49 @@ const ConfigTab = {
     panel.querySelector('#config-export')?.addEventListener('click', () => App.exportConfig());
     panel.querySelector('#config-import')?.addEventListener('click', () => panel.querySelector('#config-import-file')?.click());
     panel.querySelector('#config-import-file')?.addEventListener('change', e => this.onConfigImport(e));
+  },
+
+  isEditingConfigForm() {
+    const active = document.activeElement;
+    return !!(active && active.closest && active.closest('#panel-config .config-form') && ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName));
+  },
+
+  onRuntimeStateUpdate() {
+    const panel = document.getElementById('panel-config');
+    if (!panel || Tabs.current !== 'config') return;
+    this.updateCooldownDisplay();
+    this.patchVisibleRuntimeStatus();
+  },
+
+  patchVisibleRuntimeStatus() {
+    const selected = Store.selected;
+    if (selected.type === 'aggregate') {
+      Store.getAggregateMembers(selected.id).forEach(member => {
+        const cell = document.querySelector(`[data-member-status-cell="${member.id}"]`);
+        if (!cell) return;
+        const status = this.aggregateMemberStatus(member, Store.getModel(member.model_id));
+        const next = `<span class="pill ${status.class}" title="${Utils.escapeHtml(status.title)}">${status.text}</span>`;
+        if (cell.innerHTML !== next) cell.innerHTML = next;
+      });
+    }
+  },
+
+  async refreshRuntimeNow() {
+    try {
+      const data = await API.getRuntimeState();
+      const runtimeByModel = new Map((data.models || []).map(item => [item.model_id, item]));
+      const runtimeByMember = new Map((data.aggregate_members || []).map(item => [item.member_id, item]));
+      Store.update({
+        logs: data.logs || Store.state.logs || [],
+        models: (Store.state.models || []).map(model => runtimeByModel.has(model.id) ? { ...model, ...runtimeByModel.get(model.id) } : model),
+        aggregate_members: (Store.state.aggregate_members || []).map(member => runtimeByMember.has(member.id) ? { ...member, ...runtimeByMember.get(member.id) } : member),
+        log_write_error: data.log_write_error || '',
+      });
+      this.render();
+      Toast.success('运行状态已刷新');
+    } catch (err) {
+      Toast.error('刷新状态失败：' + err.message);
+    }
   },
 
   bindAutoSave(form, callback) {
@@ -924,9 +1045,20 @@ const ConfigTab = {
   async onGroupDelete() {
     const id = document.getElementById('group-id').value;
     const group = Store.getGroup(id);
+    let preview = null;
+    try { preview = await API.previewDeleteGroup(id); } catch (_) {}
+    const impact = preview?.ok ? `
+      <div class="preview-impact">
+        <p>将删除连接组「${Utils.escapeHtml(group?.name || id)}」以及 ${preview.affected_models || 0} 个模型。</p>
+        ${(preview.affected_model_names || []).length ? `<p>受影响模型：${Utils.escapeHtml(preview.affected_model_names.join('、'))}</p>` : ''}
+        ${(preview.affected_aggregate_members || []).length ? `<p>受影响聚合成员：${preview.affected_aggregate_members.map(item => `${Utils.escapeHtml(item.aggregate_name)} / ${Utils.escapeHtml(item.model)}`).join('；')}</p>` : ''}
+        ${(preview.warnings || []).map(w => `<p class="danger-text">${Utils.escapeHtml(w)}</p>`).join('')}
+        <p>此操作不可恢复，建议先导出备份。</p>
+      </div>` : `确定删除连接组「${Utils.escapeHtml(group?.name || id)}」吗？组下所有模型也会被删除，此操作不可恢复。`;
     const ok = await Modal.confirm({
-      title: '删除连接组',
-      message: `确定删除连接组「${Utils.escapeHtml(group?.name || id)}」吗？组下所有模型也会被删除，此操作不可恢复。`,
+      title: '删除连接组影响预览',
+      message: impact,
+      allowHtml: !!preview?.ok,
       confirmText: '确定删除',
       confirmClass: 'btn-danger'
     });
@@ -1006,9 +1138,19 @@ const ConfigTab = {
   async onModelDelete() {
     const id = document.getElementById('model-id').value;
     const model = Store.getModel(id);
+    let preview = null;
+    try { preview = await API.previewDeleteModel(id); } catch (_) {}
+    const impact = preview?.ok ? `
+      <div class="preview-impact">
+        <p>将删除模型「${Utils.escapeHtml(model?.name || id)}」。</p>
+        ${(preview.affected_aggregate_members || []).length ? `<p>依赖它的聚合成员：${preview.affected_aggregate_members.map(item => `${Utils.escapeHtml(item.aggregate_name)} / ${Utils.escapeHtml(item.member_id)}`).join('；')}</p>` : '<p>没有聚合成员依赖该模型。</p>'}
+        ${(preview.warnings || []).map(w => `<p class="danger-text">${Utils.escapeHtml(w)}</p>`).join('')}
+        <p>此操作不可恢复，建议先导出备份。</p>
+      </div>` : `确定删除模型「${Utils.escapeHtml(model?.name || id)}」吗？此操作不可恢复。`;
     const ok = await Modal.confirm({
-      title: '删除模型',
-      message: `确定删除模型「${Utils.escapeHtml(model?.name || id)}」吗？此操作不可恢复。`,
+      title: '删除模型影响预览',
+      message: impact,
+      allowHtml: !!preview?.ok,
       confirmText: '确定删除',
       confirmClass: 'btn-danger'
     });
@@ -1210,8 +1352,40 @@ const ConfigTab = {
     if (['up', 'down', 'top', 'bottom'].includes(action)) return this.onMoveAggregateMember(memberId, action);
   },
 
+  aggregateChainSummary(chain) {
+    const items = (chain || []).slice(0, 8).map((item, idx) => {
+      const status = item.derived_status && item.derived_status !== 'healthy' ? `（${item.derived_reason || item.derived_status}）` : '';
+      return `${idx + 1}. ${item.group_name || '-'} / ${item.model_name || '-'}${status}`;
+    });
+    const suffix = (chain || []).length > 8 ? `\n… 其余 ${(chain || []).length - 8} 个候选` : '';
+    return items.join('\n') + suffix;
+  },
+
+  async confirmAggregateMemberPreview(title, preview, confirmText) {
+    if (!preview?.ok) return false;
+    const before = Utils.escapeHtml(this.aggregateChainSummary(preview.candidate_chain_before || []));
+    const after = Utils.escapeHtml(this.aggregateChainSummary(preview.candidate_chain_after || []));
+    return Modal.confirm({
+      title,
+      message: `
+        <p>聚合模型：${Utils.escapeHtml(preview.aggregate_name || preview.aggregate_id || '-')}</p>
+        <div class="preview-grid">
+          <div><strong>变更前候选链</strong><pre>${before || '-'}</pre></div>
+          <div><strong>变更后候选链</strong><pre>${after || '-'}</pre></div>
+        </div>
+      `,
+      confirmText,
+      cancelText: '取消',
+      allowHtml: true,
+      wide: true,
+    });
+  },
+
   async onRecoverAggregateMember(memberId) {
     try {
+      const preview = await API.previewAggregateMemberClearCooldown(memberId);
+      const ok = await this.confirmAggregateMemberPreview('恢复成员预览', preview, '确认恢复');
+      if (!ok) return;
       await API.clearAggregateMemberCooldown(memberId);
       await Store.load();
       Toast.success('成员已恢复并启用');
@@ -1222,6 +1396,11 @@ const ConfigTab = {
 
   async onMoveAggregateMember(memberId, direction) {
     try {
+      const preview = await API.previewAggregateMemberSort(memberId, direction);
+      if (preview.changed) {
+        const ok = await this.confirmAggregateMemberPreview('排序变更预览', preview, '确认调整排序');
+        if (!ok) return;
+      }
       await API.saveAggregateMember(memberId, { direction });
       await Store.load();
     } catch (err) {

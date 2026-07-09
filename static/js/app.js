@@ -1,6 +1,8 @@
 const App = {
   theme: 'system',
   sidebarCollapsed: false,
+  _lastSelectionKey: '',
+  _runtimeRefreshTimer: null,
 
   async init() {
     this.renderTopbar();
@@ -17,14 +19,22 @@ const App = {
     DashboardTab.refresh();
     ConfigTab.onShow();
 
-    Store.subscribe((state) => {
+    this._lastSelectionKey = `${Store.selected.type || ''}:${Store.selected.id || ''}`;
+    Store.subscribe((state, selected) => {
       document.getElementById('server-addr').textContent = `${window.location.origin}/v1`;
       this.updateStatusDot(state);
-      DashboardTab.refresh();
-      ConfigTab.onShow();
+      if (Tabs.current === 'dashboard') DashboardTab.refresh();
+      const selectionKey = `${selected.type || ''}:${selected.id || ''}`;
+      const selectionChanged = selectionKey !== this._lastSelectionKey;
+      this._lastSelectionKey = selectionKey;
+      if (Tabs.current === 'config') {
+        if (selectionChanged) ConfigTab.onShow();
+        else ConfigTab.onRuntimeStateUpdate();
+      }
       Tree.render();
     });
 
+    this.startRuntimeRefresh();
     setInterval(() => Tree.render(), 1000);
   },
 
@@ -32,6 +42,36 @@ const App = {
     const s = settings || {};
     this.setTheme(s.theme || localStorage.getItem('lin-router-theme') || 'system', false);
     LogsTab.setAutoRefresh(s.auto_refresh_logs !== false);
+  },
+
+
+  startRuntimeRefresh() {
+    if (this._runtimeRefreshTimer) clearInterval(this._runtimeRefreshTimer);
+    this._runtimeRefreshTimer = setInterval(() => this.refreshRuntimeState(), 5000);
+  },
+
+  async refreshRuntimeState() {
+    if (document.hidden) return;
+    if (!['dashboard', 'config', 'logs'].includes(Tabs.current)) return;
+    try {
+      const data = await API.getRuntimeState({ silent: true });
+      const patch = {
+        logs: data.logs || Store.state.logs || [],
+        log_write_error: data.log_write_error || '',
+      };
+      if (data.models) {
+        const runtimeById = new Map(data.models.map(item => [item.model_id, item]));
+        patch.models = (Store.state.models || []).map(model => runtimeById.has(model.id) ? { ...model, ...runtimeById.get(model.id) } : model);
+      }
+      if (data.aggregate_members) {
+        const runtimeById = new Map(data.aggregate_members.map(item => [item.member_id, item]));
+        patch.aggregate_members = (Store.state.aggregate_members || []).map(member => runtimeById.has(member.id) ? { ...member, ...runtimeById.get(member.id) } : member);
+      }
+      Store.update(patch);
+      if (Tabs.current === 'logs') LogsTab.renderRows(true);
+    } catch (err) {
+      console.warn('运行态刷新失败', err);
+    }
   },
 
   renderTopbar() {

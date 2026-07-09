@@ -4,6 +4,7 @@ const LogsTab = {
   autoRefresh: true,
   refreshTimer: null,
   REFRESH_INTERVAL: 5000,
+  _lastRenderSignature: '',
 
   refresh() {
     const panel = document.getElementById('panel-logs');
@@ -80,6 +81,7 @@ const LogsTab = {
       </div>
     `;
     this.attachEvents(panel);
+    this._lastRenderSignature = '';
     this.renderRows();
     this.startAutoRefresh();
   },
@@ -159,7 +161,7 @@ const LogsTab = {
   isStableConfigSkip(item) {
     if (!item || item.event !== 'skip') return false;
     const parsed = this.parseDetail(item.detail);
-    return parsed.skip_reason === 'member_disabled';
+    return ['member_disabled', 'member_cooling', 'underlying_model_disabled', 'underlying_model_cooling'].includes(parsed.skip_reason);
   },
 
   requestRelatedLogs(item) {
@@ -257,37 +259,82 @@ const LogsTab = {
     const empty = document.getElementById('logs-empty');
     const wrap = document.querySelector('.logs-table-wrap');
     if (!tbody) return;
-    const wasAtBottom = keepScroll && wrap ? (wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 30) : false;
-    // 记住当前展开的详情行，避免自动刷新时把它关上
-    const openIdx = Array.from(document.querySelectorAll('[data-log-detail-row]')).findIndex(r => !r.classList.contains('hidden'));
     const filtered = this.filterLogs();
+    const signature = filtered.map(item => this.rowSignature(item)).join('\n');
+    if (signature === this._lastRenderSignature && tbody.children.length > 0) return;
+    this._lastRenderSignature = signature;
+    const wasAtBottom = keepScroll && wrap ? (wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 30) : false;
+    const scrollTop = wrap ? wrap.scrollTop : 0;
+    const openKeys = new Set(Array.from(tbody.querySelectorAll('[data-log-detail-row]'))
+      .filter(row => !row.classList.contains('hidden'))
+      .map(row => row.dataset.logDetailRow));
+
     if (filtered.length === 0) {
       tbody.innerHTML = '';
       empty.classList.remove('hidden');
       return;
     }
     empty.classList.add('hidden');
-    tbody.innerHTML = filtered.map((item, idx) => this.rowHtml(item, idx)).join('');
-    if (openIdx >= 0 && openIdx < filtered.length) {
-      const row = document.querySelector(`[data-log-detail-row="${openIdx}"]`);
-      row?.classList.remove('hidden');
-    }
-    tbody.querySelectorAll('[data-log-detail]').forEach(btn => {
-      btn.addEventListener('click', () => this.toggleDetail(Number(btn.dataset.logDetail)));
-    });
-    // 点击详情单元格也可展开/收起详情行，解决列表截断后无法查看完整内容的问题
-    tbody.querySelectorAll('[data-log-detail-preview]').forEach(cell => {
-      cell.addEventListener('click', () => this.toggleDetail(Number(cell.dataset.logDetailPreview)));
+
+    const seen = new Set();
+    let cursor = tbody.firstChild;
+    filtered.forEach((item, idx) => {
+      const key = this.rowKey(item);
+      seen.add(key);
+      const temp = document.createElement('tbody');
+      temp.innerHTML = this.rowHtml(item, idx, key).trim();
+      const nextMain = temp.children[0];
+      const nextDetail = temp.children[1];
+      const currentMain = tbody.querySelector(`[data-log-main-row="${CSS.escape(key)}"]`);
+      const currentDetail = tbody.querySelector(`[data-log-detail-row="${CSS.escape(key)}"]`);
+      if (openKeys.has(key)) nextDetail.classList.remove('hidden');
+      if (currentMain && currentDetail) {
+        if (currentMain.outerHTML !== nextMain.outerHTML) currentMain.replaceWith(nextMain);
+        if (currentDetail.outerHTML !== nextDetail.outerHTML) currentDetail.replaceWith(nextDetail);
+        const main = tbody.querySelector(`[data-log-main-row="${CSS.escape(key)}"]`);
+        const detail = tbody.querySelector(`[data-log-detail-row="${CSS.escape(key)}"]`);
+        if (main !== cursor) tbody.insertBefore(main, cursor);
+        cursor = main.nextSibling;
+        if (detail !== cursor) tbody.insertBefore(detail, cursor);
+        cursor = detail.nextSibling;
+      } else {
+        tbody.insertBefore(nextMain, cursor);
+        tbody.insertBefore(nextDetail, cursor);
+        cursor = nextDetail.nextSibling;
+      }
     });
 
-    if (wasAtBottom && wrap) {
-      wrap.scrollTop = wrap.scrollHeight;
-    }
+    Array.from(tbody.querySelectorAll('[data-log-main-row]')).forEach(row => {
+      const key = row.dataset.logMainRow;
+      if (!seen.has(key)) row.remove();
+    });
+    Array.from(tbody.querySelectorAll('[data-log-detail-row]')).forEach(row => {
+      const key = row.dataset.logDetailRow;
+      if (!seen.has(key)) row.remove();
+    });
+
+    tbody.querySelectorAll('[data-log-detail-key]').forEach(btn => {
+      btn.addEventListener('click', () => this.toggleDetailByKey(btn.dataset.logDetailKey));
+    });
+    tbody.querySelectorAll('[data-log-detail-preview-key]').forEach(cell => {
+      cell.addEventListener('click', () => this.toggleDetailByKey(cell.dataset.logDetailPreviewKey));
+    });
+
+    if (wasAtBottom && wrap) wrap.scrollTop = wrap.scrollHeight;
+    else if (wrap) wrap.scrollTop = scrollTop;
   },
 
-  rowHtml(item, idx) {
+  rowKey(item) {
+    return [item.request_id || item.time || '', item.event || '', item.fallback_index || 0, item.aggregate_member_id || '', item.status || ''].join('|');
+  },
+
+  rowSignature(item) {
+    return [this.rowKey(item), item.time, item.status, item.event, item.duration_ms, item.detail, item.prompt_tokens, item.completion_tokens, item.cached_tokens, item.total_tokens].join('|');
+  },
+
+  rowHtml(item, idx, key = this.rowKey(item)) {
     return `
-      <tr>
+      <tr data-log-main-row="${Utils.escapeHtml(key)}">
         <td class="tiny">${Utils.escapeHtml(item.time)}</td>
         <td class="tiny">${Utils.escapeHtml(this.groupName(item))}</td>
         <td>${Utils.escapeHtml(item.model || '-')}</td>
@@ -296,26 +343,34 @@ const LogsTab = {
         <td class="tiny">${Number(item.attempt || 0) || 1}</td>
         <td class="tiny">${Number(item.duration_ms || 0) ? `${Number(item.duration_ms)} ms` : '-'}</td>
         <td class="tiny">${Utils.escapeHtml(this.tokenSummary(item))}</td>
-        <td class="tiny result-text log-detail-preview" title="${Utils.escapeHtml(item.detail)}" data-log-detail-preview="${idx}">${this.formatDetailPreview(item.detail)}</td>
-        <td><button type="button" data-log-detail="${idx}">查看</button></td>
+        <td class="tiny result-text log-detail-preview" title="${Utils.escapeHtml(Utils.redactSensitive(item.detail || ''))}" data-log-detail-preview-key="${Utils.escapeHtml(key)}">${this.formatDetailPreview(item.detail)}</td>
+        <td><button type="button" data-log-detail-key="${Utils.escapeHtml(key)}">查看</button></td>
       </tr>
-      <tr class="log-detail-row hidden" data-log-detail-row="${idx}">
+      <tr class="log-detail-row hidden" data-log-detail-row="${Utils.escapeHtml(key)}">
         <td colspan="10">${this.detailHtml(item)}</td>
       </tr>
     `;
   },
 
+  toggleDetailByKey(key) {
+    const row = document.querySelector(`[data-log-detail-row="${CSS.escape(key)}"]`);
+    if (!row) return;
+    const willOpen = row.classList.contains('hidden');
+    document.querySelectorAll('[data-log-detail-row]').forEach(r => r.classList.add('hidden'));
+    row.classList.toggle('hidden', !willOpen);
+  },
+
   formatDetailPreview(detail) {
     if (!detail) return '-';
     // 把分号分隔的 detail 做简单可读化处理
-    const text = String(detail).replace(/;/g, '; ');
+    const text = Utils.redactSensitive(String(detail)).replace(/;/g, '; ');
     const escaped = Utils.escapeHtml(text);
     return escaped.length > 200 ? escaped.slice(0, 200) + '…' : escaped;
   },
 
   formatJsonBlock(value) {
     if (!value) return '-';
-    const str = String(value);
+    const str = Utils.redactSensitive(String(value));
     // 尝试把分号键值对或 JSON 字符串格式化显示
     let formatted = Utils.escapeHtml(str);
     // 如果有 model=... 这类键值对，高亮关键 key
@@ -354,7 +409,7 @@ const LogsTab = {
       });
     if (!related.length) return '';
     const rows = related.map(({ log, parsed }) => {
-      const isStable = parsed.skip_reason === 'member_disabled';
+      const isStable = ['member_disabled', 'member_cooling', 'underlying_model_disabled', 'underlying_model_cooling'].includes(parsed.skip_reason);
       const severity = isStable ? 'info' : (log.cooldown_applied || log.failure_scope === 'upstream' ? 'warning' : 'info');
       const reason = parsed.skip_reason ? this.skipReasonLabel(parsed.skip_reason) : this.runtimeReasonLabel(parsed, log);
       return `
@@ -400,10 +455,11 @@ const LogsTab = {
 
   detailHtml(item) {
     const parsed = this.parseDetail(item.detail);
-    const rawDetail = item.detail ? String(item.detail) : '';
-    const rawBlock = rawDetail ? `
+    const debugMode = Store.state.settings?.debug_mode === true;
+    const rawDetail = item.detail ? Utils.redactSensitive(String(item.detail)) : '';
+    const rawBlock = debugMode && rawDetail ? `
       <div class="log-detail-block log-detail-raw-block">
-        <h4>详情原文</h4>
+        <h4>调试模式：详情原文（已脱敏）</h4>
         <div class="log-detail-raw">${this.formatJsonBlock(rawDetail)}</div>
       </div>
     ` : '';
@@ -463,19 +519,23 @@ const LogsTab = {
       ${aggregateChain}
       ${candidateFilterDetails}
       <details style="margin-top:10px;">
-        <summary style="font-size:12px; color:var(--text-tertiary); cursor:pointer;">技术细节</summary>
+        <summary style="font-size:12px; color:var(--text-tertiary); cursor:pointer;">${debugMode ? '调试字段' : '技术细节'}</summary>
         <div class="log-detail-grid" style="margin-top:8px;">
           <div class="log-detail-block">
             <dl>
               <dt>上游地址</dt><dd>${Utils.escapeHtml(parsed.upstream || '-')}</dd>
               <dt>Body 模式</dt><dd>${Utils.escapeHtml(parsed.body || '-')}</dd>
               <dt>Fingerprint</dt><dd>${Utils.escapeHtml(parsed.fingerprint || '-')}</dd>
+              <dt>Request ID</dt><dd>${debugMode ? Utils.escapeHtml(item.request_id || '-') : '开启调试模式后显示'}</dd>
+              <dt>Member ID</dt><dd>${debugMode ? Utils.escapeHtml(item.aggregate_member_id || parsed.aggregate_member_id || '-') : '开启调试模式后显示'}</dd>
+              <dt>Cooldown Applied</dt><dd>${debugMode ? Utils.escapeHtml(String(item.cooldown_applied || parsed.cooldown_applied || false)) : '开启调试模式后显示'}</dd>
             </dl>
           </div>
           <div class="log-detail-block">
             <dl>
               <dt>Tokens</dt><dd>${Utils.escapeHtml(this.tokenSummary(item))}</dd>
-              <dt>详情原文</dt><dd class="log-detail-raw">${this.formatJsonBlock(item.detail)}</dd>
+              <dt>Fallback Chain</dt><dd class="log-detail-raw">${debugMode ? this.formatJsonBlock(parsed.fallback_chain || item.fallback_chain || '-') : '开启调试模式后显示'}</dd>
+              <dt>详情原文</dt><dd class="log-detail-raw">${debugMode ? this.formatJsonBlock(item.detail) : '开启调试模式后显示脱敏原文'}</dd>
             </dl>
           </div>
         </div>

@@ -3576,6 +3576,402 @@ class RouterHandler(BaseHTTPRequestHandler):
             if model.usable and (group is None or model.group_id == group.id)
         ]
 
+    CONFIG_SKIP_REASONS = {
+        "member_disabled",
+        "member_cooling",
+        "underlying_model_disabled",
+        "underlying_model_cooling",
+        "underlying_group_disabled",
+    }
+
+    def _log_detail_dict(self, detail: str) -> Dict[str, str]:
+        result: Dict[str, str] = {}
+        if not detail:
+            return result
+        for part in str(detail).split(";"):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            result[key.strip()] = value.strip()
+        return result
+
+    def _log_value(self, log: Any, key: str, default: Any = "") -> Any:
+        if isinstance(log, dict):
+            return log.get(key, default)
+        return getattr(log, key, default)
+
+    def _is_config_skip_log(self, log: Any) -> bool:
+        if self._log_value(log, "event") != "skip":
+            return False
+        detail = self._log_detail_dict(str(self._log_value(log, "detail", "") or ""))
+        return detail.get("skip_reason") in self.CONFIG_SKIP_REASONS
+
+    def _log_matches_aggregate(self, log: RequestLog, aggregate: AggregateModel) -> bool:
+        return (
+            log.aggregate_id == aggregate.id
+            or log.aggregate_model == aggregate.name
+            or log.requested_model == aggregate.name
+            or log.model == aggregate.name
+        )
+
+    def _aggregate_stats_payload(self, aggregate_id: str, limit: int = 100) -> Dict[str, Any]:
+        aggregate = self.store.find_aggregate(aggregate_id)
+        if not aggregate:
+            return {"ok": False, "message": "聚合模型不存在"}
+        limit = max(1, min(int(limit or 100), 500))
+        logs = [log for log in reversed(self.router.all_logs()) if self._log_matches_aggregate(log, aggregate)]
+        by_request: Dict[str, List[RequestLog]] = {}
+        synthetic_idx = 0
+        for log in logs:
+            key = log.request_id or f"__log_{synthetic_idx}"
+            if not log.request_id:
+                synthetic_idx += 1
+            by_request.setdefault(key, []).append(log)
+
+        request_groups: List[List[RequestLog]] = []
+        for group_logs in by_request.values():
+            if any(not self._is_config_skip_log(log) for log in group_logs):
+                request_groups.append(group_logs)
+        request_groups = request_groups[:limit]
+
+        request_count = len(request_groups)
+        success_count = 0
+        fallback_success_count = 0
+        first_choice_success = 0
+        cooldown_skip_count = 0
+        busy_switch_count = 0
+        prompt_tokens = 0
+        cached_tokens = 0
+        first_chunk_durations: List[int] = []
+        done_durations: List[int] = []
+        member_risk: Dict[str, Dict[str, Any]] = {}
+
+        for group_logs in request_groups:
+            non_skip = [log for log in group_logs if not self._is_config_skip_log(log)]
+            success_logs = [log for log in non_skip if str(log.status).startswith("2") and log.event in {"ok", "stream_ok", "stream_done", "retry_ok"}]
+            final_success = next((log for log in non_skip if str(log.status).startswith("2") and log.event in {"stream_done", "ok", "retry_ok"}), None) or (success_logs[-1] if success_logs else None)
+            if final_success:
+                success_count += 1
+                prompt_tokens += int(final_success.prompt_tokens or 0)
+                cached_tokens += int(final_success.cached_tokens or 0)
+                if int(final_success.attempt or 1) <= 1 and int(final_success.fallback_index or 0) <= 0:
+                    first_choice_success += 1
+            first_stream = next((log for log in non_skip if log.event == "stream_ok" and int(log.duration_ms or 0) > 0), None)
+            if first_stream:
+                first_chunk_durations.append(int(first_stream.duration_ms or 0))
+            done = next((log for log in non_skip if log.event == "stream_done" and int(log.duration_ms or 0) > 0), None)
+            if done:
+                done_durations.append(int(done.duration_ms or 0))
+
+            had_prior_runtime_issue = False
+            for log in group_logs:
+                detail = self._log_detail_dict(log.detail)
+                reason = detail.get("skip_reason") or detail.get("fallback_reason") or detail.get("cooldown_reason") or ""
+                event_blob = f"{log.event};{log.detail};{reason}"
+                if reason in {"member_cooling", "underlying_model_cooling"}:
+                    cooldown_skip_count += 1
+                if "candidate_busy" in event_blob or "large_task_in_progress" in event_blob or log.event == "waf_lock_timeout":
+                    busy_switch_count += 1
+                    had_prior_runtime_issue = True
+                if log.event in {"fallback", "cooldown", "network", "stream_timeout", "stream_idle_timeout"} or log.failure_scope in {"upstream", "candidate", "busy", "local_lock"}:
+                    had_prior_runtime_issue = True
+                if log.aggregate_member_id:
+                    risk = member_risk.setdefault(log.aggregate_member_id, {
+                        "member_id": log.aggregate_member_id,
+                        "model": log.selected_model or log.model,
+                        "timeout_count": 0,
+                        "waf_blocked_count": 0,
+                        "failure_count": 0,
+                        "last_error": "",
+                    })
+                    if "timeout" in event_blob:
+                        risk["timeout_count"] += 1
+                    if "waf" in event_blob.lower():
+                        risk["waf_blocked_count"] += 1
+                    if not str(log.status).startswith("2") and not self._is_config_skip_log(log):
+                        risk["failure_count"] += 1
+                        risk["last_error"] = self.router._short_error(log.detail or log.status)
+            if final_success and had_prior_runtime_issue:
+                fallback_success_count += 1
+
+        success_rate = (success_count / request_count) if request_count else None
+        first_choice_success_rate = (first_choice_success / success_count) if success_count else None
+        cache_hit_rate = (cached_tokens / prompt_tokens) if prompt_tokens else None
+        avg_first_chunk_ms = round(sum(first_chunk_durations) / len(first_chunk_durations)) if first_chunk_durations else None
+        avg_done_ms = round(sum(done_durations) / len(done_durations)) if done_durations else None
+        high_risk_members = [
+            item for item in member_risk.values()
+            if item.get("timeout_count") or item.get("waf_blocked_count") or item.get("failure_count", 0) >= 2
+        ]
+        high_risk_members.sort(key=lambda x: (x.get("timeout_count", 0) + x.get("waf_blocked_count", 0) + x.get("failure_count", 0)), reverse=True)
+
+        return {
+            "ok": True,
+            "aggregate_id": aggregate.id,
+            "aggregate_name": aggregate.name,
+            "range": {"type": "last_n", "limit": limit},
+            "request_count": request_count,
+            "success_count": success_count,
+            "success_rate": success_rate,
+            "fallback_success_count": fallback_success_count,
+            "first_choice_success_rate": first_choice_success_rate,
+            "cooldown_skip_count": cooldown_skip_count,
+            "busy_switch_count": busy_switch_count,
+            "avg_first_chunk_ms": avg_first_chunk_ms,
+            "avg_done_ms": avg_done_ms,
+            "prompt_tokens": prompt_tokens,
+            "cached_tokens": cached_tokens,
+            "cache_hit_rate": cache_hit_rate,
+            "high_risk_members": high_risk_members[:5],
+        }
+
+    def _model_runtime_item(self, model: ModelConfig) -> Dict[str, Any]:
+        now = int(time.time())
+        if model.cooldown_until and model.cooldown_until > now:
+            status = "cooling"
+            reason = model.cooldown_reason or "模型正在健康冷却"
+        elif model.usable is False and model.disabled_by_user:
+            status = "manual_disabled"
+            reason = "用户已停用该模型"
+        elif model.usable is False:
+            status = "unavailable"
+            reason = model.last_error or "模型当前不可用"
+        elif model.last_error:
+            status = "warning"
+            reason = model.last_error
+        else:
+            status = "healthy"
+            reason = "模型可参与调度"
+        return {
+            "group_id": model.group_id,
+            "model_id": model.id,
+            "derived_status": status,
+            "derived_reason": reason,
+            "usable": model.usable,
+            "disabled_by_user": model.disabled_by_user,
+            "cooldown_until": model.cooldown_until,
+            "cooldown_reason": model.cooldown_reason,
+            "last_error": model.last_error,
+            "last_success_at": getattr(model, "last_success_at", ""),
+            "last_failure_at": getattr(model, "last_failure_at", ""),
+        }
+
+    def _member_runtime_item(self, member: AggregateMember) -> Dict[str, Any]:
+        now = int(time.time())
+        group = self.store.find_group(member.group_id)
+        model = self.store.find_model(member.model_id)
+        if member.enabled is False:
+            status = "manual_disabled"
+            reason = "用户已停用该聚合成员"
+        elif member.cooldown_until and member.cooldown_until > now:
+            status = "cooling"
+            reason = member.cooldown_reason or "聚合成员因上游健康失败短期冷却"
+        elif not group:
+            status = "config_error"
+            reason = "底层连接组缺失"
+        elif not model:
+            status = "config_error"
+            reason = "底层真实模型缺失"
+        elif model.usable is False and model.disabled_by_user:
+            status = "underlying_model_disabled"
+            reason = "底层真实模型已手动停用"
+        elif model.cooldown_until and model.cooldown_until > now:
+            status = "underlying_model_cooling"
+            reason = model.cooldown_reason or "底层真实模型正在冷却"
+        elif member.last_error:
+            status = "warning"
+            reason = member.last_error
+        else:
+            status = "healthy"
+            reason = "成员可参与聚合调度"
+        return {
+            "aggregate_id": member.aggregate_id,
+            "member_id": member.id,
+            "derived_status": status,
+            "derived_reason": reason,
+            "enabled": member.enabled,
+            "cooldown_until": member.cooldown_until,
+            "cooldown_reason": member.cooldown_reason,
+            "last_error": member.last_error,
+            "last_success_at": getattr(member, "last_success_at", ""),
+            "last_failure_at": getattr(member, "last_failure_at", ""),
+            "underlying_model_status": self._model_runtime_item(model)["derived_status"] if model else "missing",
+        }
+
+    def _filtered_recent_logs(self, include_skip: bool = False) -> List[RequestLog]:
+        logs = self.router.recent_logs()
+        if include_skip:
+            return logs
+        return [log for log in logs if not self._is_config_skip_log(log)]
+
+    def _runtime_state_payload(self, include_skip: bool = False) -> Dict[str, Any]:
+        self.store.refresh_expired_cooldowns()
+        return {
+            "ok": True,
+            "models": [self._model_runtime_item(model) for model in self.store.models],
+            "aggregate_members": [self._member_runtime_item(member) for member in self.store.aggregate_members],
+            "logs": self._filtered_recent_logs(include_skip=include_skip),
+            "log_write_error": self.router.log_write_error,
+        }
+
+    def _aggregate_member_chain_item(self, member: AggregateMember) -> Dict[str, Any]:
+        group = self.store.find_group(member.group_id)
+        model = self.store.find_model(member.model_id)
+        runtime = self._member_runtime_item(member)
+        return {
+            "member_id": member.id,
+            "aggregate_id": member.aggregate_id,
+            "priority": member.priority,
+            "group_id": member.group_id,
+            "group_name": group.name if group else "未知连接组",
+            "model_id": member.model_id,
+            "model_name": model.name if model else "未知模型",
+            "enabled": member.enabled,
+            "cooldown_until": member.cooldown_until,
+            "cooldown_reason": member.cooldown_reason,
+            "derived_status": runtime["derived_status"],
+            "derived_reason": runtime["derived_reason"],
+        }
+
+    def _candidate_chain_for_members(self, members: List[AggregateMember]) -> List[Dict[str, Any]]:
+        return [self._aggregate_member_chain_item(member) for member in sorted(members, key=lambda m: m.priority)]
+
+    def _aggregate_member_sort_preview(self, member_id: str, direction: str) -> Dict[str, Any]:
+        member = self.store.find_aggregate_member(member_id)
+        if not member:
+            return {"ok": False, "message": "成员不存在", "can_apply": False}
+        direction = str(direction or "").strip()
+        if direction not in {"up", "down", "top", "bottom"}:
+            return {"ok": False, "message": "排序方向无效", "can_apply": False}
+        siblings = sorted(self.store.get_aggregate_members(member.aggregate_id), key=lambda m: m.priority)
+        idx = next((i for i, item in enumerate(siblings) if item.id == member_id), -1)
+        if idx < 0:
+            return {"ok": False, "message": "成员不存在", "can_apply": False}
+        target_idx = {"up": idx - 1, "down": idx + 1, "top": 0, "bottom": len(siblings) - 1}[direction]
+        target_idx = max(0, min(target_idx, len(siblings) - 1))
+        after = list(siblings)
+        changed = target_idx != idx
+        if changed:
+            moved = after.pop(idx)
+            after.insert(target_idx, moved)
+        after_chain = []
+        for order, item in enumerate(after, start=1):
+            chain_item = self._aggregate_member_chain_item(item)
+            chain_item["priority"] = order
+            after_chain.append(chain_item)
+        aggregate = self.store.find_aggregate(member.aggregate_id)
+        return {
+            "ok": True,
+            "can_apply": True,
+            "changed": changed,
+            "direction": direction,
+            "aggregate_id": member.aggregate_id,
+            "aggregate_name": aggregate.name if aggregate else "未知聚合模型",
+            "member_id": member.id,
+            "candidate_chain_before": self._candidate_chain_for_members(siblings),
+            "candidate_chain_after": after_chain,
+        }
+
+    def _aggregate_member_clear_cooldown_preview(self, member_id: str) -> Dict[str, Any]:
+        member = self.store.find_aggregate_member(member_id)
+        if not member:
+            return {"ok": False, "message": "成员不存在", "can_apply": False}
+        before_chain = self._candidate_chain_for_members(self.store.get_aggregate_members(member.aggregate_id))
+        after_member = AggregateMember.from_dict(asdict(member))
+        after_member.enabled = True
+        after_member.cooldown_until = 0
+        after_member.cooldown_reason = ""
+        after_member.last_error = ""
+        after_members = []
+        for item in self.store.get_aggregate_members(member.aggregate_id):
+            after_members.append(after_member if item.id == member_id else item)
+        aggregate = self.store.find_aggregate(member.aggregate_id)
+        return {
+            "ok": True,
+            "can_apply": True,
+            "changed": bool((not member.enabled) or member.cooldown_until or member.cooldown_reason or member.last_error),
+            "aggregate_id": member.aggregate_id,
+            "aggregate_name": aggregate.name if aggregate else "未知聚合模型",
+            "member_id": member.id,
+            "cooldown_before": {
+                "enabled": member.enabled,
+                "cooldown_until": member.cooldown_until,
+                "cooldown_reason": member.cooldown_reason,
+                "last_error": member.last_error,
+            },
+            "cooldown_after": {
+                "enabled": True,
+                "cooldown_until": 0,
+                "cooldown_reason": "",
+                "last_error": "",
+            },
+            "candidate_chain_before": before_chain,
+            "candidate_chain_after": self._candidate_chain_for_members(after_members),
+        }
+
+    def _group_delete_preview(self, group_id: str) -> Dict[str, Any]:
+        group = self.store.find_group(group_id)
+        if not group:
+            return {"ok": False, "message": "连接组不存在", "can_delete": False}
+        models = [m for m in self.store.models if m.group_id == group_id]
+        model_ids = {m.id for m in models}
+        affected_members = []
+        for member in self.store.aggregate_members:
+            if member.group_id == group_id or member.model_id in model_ids:
+                aggregate = self.store.find_aggregate(member.aggregate_id)
+                model = self.store.find_model(member.model_id)
+                affected_members.append({
+                    "aggregate_id": member.aggregate_id,
+                    "aggregate_name": aggregate.name if aggregate else "未知聚合模型",
+                    "member_id": member.id,
+                    "model": model.name if model else member.model_id,
+                })
+        warnings = []
+        aggregate_counts: Dict[str, int] = {}
+        for item in affected_members:
+            aggregate_counts[item["aggregate_name"]] = aggregate_counts.get(item["aggregate_name"], 0) + 1
+        for name, count in aggregate_counts.items():
+            warnings.append(f"删除后聚合模型 {name} 将失去 {count} 个成员")
+        return {
+            "ok": True,
+            "group_id": group.id,
+            "group_name": group.name,
+            "can_delete": True,
+            "affected_models": len(models),
+            "affected_model_names": [m.name for m in models],
+            "affected_aggregate_members": affected_members,
+            "warnings": warnings,
+            "reversible": False,
+        }
+
+    def _model_delete_preview(self, model_id: str) -> Dict[str, Any]:
+        model = self.store.find_model(model_id)
+        if not model:
+            return {"ok": False, "message": "模型不存在", "can_delete": False}
+        group = self.store.find_group(model.group_id)
+        affected_members = []
+        for member in self.store.aggregate_members:
+            if member.model_id == model_id:
+                aggregate = self.store.find_aggregate(member.aggregate_id)
+                affected_members.append({
+                    "aggregate_id": member.aggregate_id,
+                    "aggregate_name": aggregate.name if aggregate else "未知聚合模型",
+                    "member_id": member.id,
+                    "model": model.name,
+                })
+        warnings = [f"聚合模型 {item['aggregate_name']} 依赖该模型，删除后对应成员会失效" for item in affected_members]
+        return {
+            "ok": True,
+            "model_id": model.id,
+            "model_name": model.name,
+            "group_id": model.group_id,
+            "group_name": group.name if group else "未知连接组",
+            "can_delete": True,
+            "affected_aggregate_members": affected_members,
+            "warnings": warnings,
+            "reversible": False,
+        }
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
@@ -3650,6 +4046,22 @@ class RouterHandler(BaseHTTPRequestHandler):
                 "log_write_error": self.router.log_write_error,
             })
             return
+        if parsed.path == "/api/runtime-state":
+            params = parse_qs(parsed.query)
+            include_skip = str((params.get("include_skip") or params.get("debug") or [""])[0] or "").lower() in {"1", "true", "yes", "on"}
+            self._send_json(self._runtime_state_payload(include_skip=include_skip))
+            return
+        if parsed.path.startswith("/api/aggregates/") and parsed.path.endswith("/stats"):
+            parts = parsed.path.split("/")
+            aggregate_id = parts[3] if len(parts) >= 4 else ""
+            params = parse_qs(parsed.query)
+            limit = int((params.get("limit") or [100])[0] or 100)
+            payload = self._aggregate_stats_payload(aggregate_id, limit)
+            if not payload.get("ok"):
+                self._send_json(payload, status=404)
+            else:
+                self._send_json(payload)
+            return
         if parsed.path.startswith("/api/client-config/"):
             group_id = parsed.path.split("/", 3)[3]
             group = self.store.find_group(group_id)
@@ -3691,6 +4103,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             group_filter = _first(params.get("group"))
             status_filter = _first(params.get("status"))
             event_filter = _first(params.get("event"))
+            include_skip = str(_first(params.get("include_skip")) or _first(params.get("debug")) or "").lower() in {"1", "true", "yes", "on"}
             aggregate_filter = _first(params.get("aggregate"))
             start_str = _first(params.get("start"))
             end_str = _first(params.get("end"))
@@ -3705,6 +4118,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             end_ts = _ts(end_str) if end_str else 0
 
             def _keep(item):
+                if not include_skip and self._is_config_skip_log(item):
+                    return False
                 if group_filter and getattr(item, "group_id", "") != group_filter:
                     return False
                 if aggregate_filter:
@@ -3989,7 +4404,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             allowed = {
                 "auto_start", "start_minimized", "theme", "auto_refresh_logs",
                 "upstream_http_client", "upstream_http2", "upstream_keepalive",
-                "debug_capture_enabled", "debug_capture_last_body",
+                "debug_mode", "debug_capture_enabled", "debug_capture_last_body",
                 "normalize_tools_order",
             }
             new_settings = {k: v for k, v in settings_raw.items() if k in allowed}
@@ -4400,6 +4815,27 @@ class RouterHandler(BaseHTTPRequestHandler):
                 return
             self._send_json({"ok": True})
             return
+        if parsed.path.startswith("/api/groups/") and parsed.path.endswith("/delete-preview"):
+            group_id = parsed.path.split("/")[3]
+            payload = self._group_delete_preview(group_id)
+            self._send_json(payload, status=200 if payload.get("ok") else 404)
+            return
+        if parsed.path.startswith("/api/models/") and parsed.path.endswith("/delete-preview"):
+            model_id = parsed.path.split("/")[3]
+            payload = self._model_delete_preview(model_id)
+            self._send_json(payload, status=200 if payload.get("ok") else 404)
+            return
+        if parsed.path.startswith("/api/aggregate-members/") and parsed.path.endswith("/sort-preview"):
+            member_id = parsed.path.split("/")[3]
+            payload_in = self._read_json()
+            payload = self._aggregate_member_sort_preview(member_id, str(payload_in.get("direction") or ""))
+            self._send_json(payload, status=200 if payload.get("ok") else 404)
+            return
+        if parsed.path.startswith("/api/aggregate-members/") and parsed.path.endswith("/clear-cooldown-preview"):
+            member_id = parsed.path.split("/")[3]
+            payload = self._aggregate_member_clear_cooldown_preview(member_id)
+            self._send_json(payload, status=200 if payload.get("ok") else 404)
+            return
         if parsed.path == "/api/reset":
             self.store.reset_usable()
             self._send_json({"ok": True})
@@ -4418,7 +4854,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             allowed = {
                 "auto_start", "start_minimized", "theme", "auto_refresh_logs",
                 "upstream_http_client", "upstream_http2", "upstream_keepalive",
-                "debug_capture_enabled", "debug_capture_last_body",
+                "debug_mode", "debug_capture_enabled", "debug_capture_last_body",
                 "normalize_tools_order",
             }
             new_settings = {k: v for k, v in payload.items() if k in allowed}

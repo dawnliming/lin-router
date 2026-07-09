@@ -11,6 +11,7 @@ DEFAULT_SETTINGS = {
     "start_minimized": False,
     "theme": "system",
     "auto_refresh_logs": True,
+    "debug_mode": False,
     "upstream_http_client": "urllib",
     "upstream_http2": False,
     "upstream_keepalive": False,

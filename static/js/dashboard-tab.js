@@ -13,7 +13,7 @@ const DashboardTab = {
     const aggregates = state.aggregate_models || [];
     const members = state.aggregate_members || [];
     const logs = state.logs || [];
-    const recent = logs.slice(0, 30);
+    const recent = logs.filter(log => !this.isConfigSkip(log)).slice(0, 30);
     const success = recent.filter(l => String(l.status || '').startsWith('2')).length;
     const successRate = recent.length ? `${Math.round((success / recent.length) * 100)}%` : '-';
     const fallbackCount = recent.filter(l => ['fallback', 'retry_ok'].includes(String(l.event || ''))).length;
@@ -26,9 +26,9 @@ const DashboardTab = {
     const availableGroups = groups.filter(g => g.usable !== false).length;
     const enabledAggregates = aggregates.filter(a => a.enabled !== false).length;
     const baseUrl = `${window.location.origin}/v1`;
-    const firstAggregate = aggregates.find(a => a.enabled !== false) || aggregates[0];
-    const aggregateKey = firstAggregate?.route_key || '';
+    const enabledAggregateList = aggregates.filter(a => a.enabled !== false);
     const hasConfig = groups.length > 0 || aggregates.length > 0;
+    const aggregateSummary = this.aggregateSummaryCards(aggregates, recent);
 
     return `
       <div class="dashboard-page">
@@ -52,12 +52,11 @@ const DashboardTab = {
           ${this.metricCard('候选忙', `${busyCount} 次`, '大上下文或锁等待切换')}
           ${this.metricCard('上游超时 / WAF', `${upstreamTimeoutCount} / ${wafBlockedCount}`, '最近请求健康信号')}
         </div>
+        ${aggregateSummary}
         <div class="dashboard-two-col">
-          <section class="dashboard-card">
+          <section class="dashboard-card dashboard-access-section">
             <h3>客户端接入</h3>
-            <div class="copy-row"><span>Base URL</span><code>${Utils.escapeHtml(baseUrl)}</code><button type="button" class="btn-secondary btn-sm" data-copy-value="${Utils.escapeHtml(baseUrl)}">复制</button></div>
-            <div class="copy-row"><span>聚合 Key</span><code>${Utils.escapeHtml(aggregateKey || '暂无聚合模型')}</code><button type="button" class="btn-secondary btn-sm" data-copy-value="${Utils.escapeHtml(aggregateKey)}" ${aggregateKey ? '' : 'disabled'}>复制</button></div>
-            <div class="copy-row"><span>模型名</span><code>${Utils.escapeHtml(firstAggregate?.name || '选择你的模型名')}</code><button type="button" class="btn-secondary btn-sm" data-copy-value="${Utils.escapeHtml(firstAggregate?.name || '')}" ${firstAggregate?.name ? '' : 'disabled'}>复制</button></div>
+            ${this.renderAggregateAccessCards(enabledAggregateList, baseUrl)}
           </section>
           <section class="dashboard-card">
             <h3>${hasConfig ? '快捷操作' : '新手步骤'}</h3>
@@ -78,6 +77,56 @@ const DashboardTab = {
     return `<section class="dashboard-metric"><span>${Utils.escapeHtml(label)}</span><strong>${Utils.escapeHtml(value)}</strong><small>${Utils.escapeHtml(hint || '')}</small></section>`;
   },
 
+  renderAggregateAccessCards(aggregates, baseUrl) {
+    if (!aggregates.length) {
+      return `
+        <div class="dashboard-empty-access">
+          <p>暂无启用的聚合模型。</p>
+          <button type="button" class="btn-primary btn-sm" data-dashboard-action="new-aggregate">去创建聚合模型</button>
+        </div>
+      `;
+    }
+    return `<div class="dashboard-access-grid">${aggregates.map(aggregate => `
+      <div class="dashboard-access-card">
+        <div class="dashboard-access-title">${Utils.escapeHtml(aggregate.display_name || aggregate.name)}</div>
+        <div class="copy-row"><span>Base URL</span><code>${Utils.escapeHtml(baseUrl)}</code><button type="button" class="btn-secondary btn-sm" data-copy-value="${Utils.escapeHtml(baseUrl)}">复制</button></div>
+        <div class="copy-row"><span>API Key</span><code>${Utils.escapeHtml(aggregate.route_key || '未生成')}</code><button type="button" class="btn-secondary btn-sm" data-copy-value="${Utils.escapeHtml(aggregate.route_key || '')}" ${aggregate.route_key ? '' : 'disabled'}>复制</button></div>
+        <div class="copy-row"><span>Model</span><code>${Utils.escapeHtml(aggregate.name || '-')}</code><button type="button" class="btn-secondary btn-sm" data-copy-value="${Utils.escapeHtml(aggregate.name || '')}" ${aggregate.name ? '' : 'disabled'}>复制</button></div>
+      </div>
+    `).join('')}</div>`;
+  },
+
+  aggregateSummaryCards(aggregates, logs) {
+    if (!aggregates.length) return '';
+    const cards = aggregates.slice(0, 4).map(aggregate => {
+      const related = logs.filter(log => log.aggregate_id === aggregate.id || log.aggregate_model === aggregate.name || log.model === aggregate.name);
+      const real = related.filter(log => !this.isConfigSkip(log));
+      const success = real.filter(log => String(log.status || '').startsWith('2') && ['ok', 'stream_done', 'retry_ok', 'stream_ok'].includes(String(log.event || ''))).length;
+      const busy = related.filter(log => `${log.event || ''};${log.detail || ''}`.includes('candidate_busy') || `${log.detail || ''}`.includes('large_task_in_progress')).length;
+      const cached = real.reduce((sum, log) => sum + Number(log.cached_tokens || 0), 0);
+      const prompt = real.reduce((sum, log) => sum + Number(log.prompt_tokens || 0), 0);
+      const rate = real.length ? `${Math.round((success / real.length) * 100)}%` : '暂无数据';
+      const cacheRate = prompt ? `${Math.round((cached / prompt) * 100)}%` : '暂无数据';
+      return `
+        <section class="dashboard-card dashboard-aggregate-card" data-dashboard-action="aggregate" data-aggregate-id="${aggregate.id}">
+          <h3>${Utils.escapeHtml(aggregate.display_name || aggregate.name)}</h3>
+          <div class="dashboard-mini-grid">
+            <span>成功率 <strong>${rate}</strong></span>
+            <span>候选忙 <strong>${busy}</strong></span>
+            <span>Cache <strong>${cacheRate}</strong></span>
+          </div>
+        </section>
+      `;
+    }).join('');
+    return `<div class="dashboard-aggregate-summary"><h3>聚合收益摘要</h3><div class="dashboard-aggregate-grid">${cards}</div></div>`;
+  },
+
+  isConfigSkip(log) {
+    if (log.event !== 'skip') return false;
+    const detail = String(log.detail || '');
+    return ['member_disabled', 'member_cooling', 'underlying_model_disabled', 'underlying_model_cooling'].some(reason => detail.includes(`skip_reason=${reason}`));
+  },
+
   attachEvents(panel) {
     panel.querySelectorAll('[data-copy-value]').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -94,6 +143,7 @@ const DashboardTab = {
         if (action === 'config') return Tabs.switch('config');
         if (action === 'test') return Tabs.switch('test');
         if (action === 'logs') return Tabs.switch('logs');
+        if (action === 'aggregate') { Store.select('aggregate', btn.dataset.aggregateId); return Tabs.switch('config'); }
       });
     });
   }

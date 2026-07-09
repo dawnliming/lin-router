@@ -54,6 +54,7 @@ const API = {
   },
 
   getState() { return this.req('/api/state'); },
+  getRuntimeState(opts = {}) { return this.req('/api/runtime-state', opts); },
   getLogs(params = {}) {
     const qs = new URLSearchParams(params).toString();
     return this.req(`/api/logs${qs ? '?' + qs : ''}`);
@@ -64,9 +65,11 @@ const API = {
   saveGroup(id, data) { return this.req(`/api/groups/${id}`, { method: 'PUT', body: JSON.stringify(data) }); },
   createGroup(data) { return this.req('/api/groups', { method: 'POST', body: JSON.stringify(data) }); },
   deleteGroup(id) { return this.req(`/api/groups/${id}`, { method: 'DELETE' }); },
+  previewDeleteGroup(id) { return this.req(`/api/groups/${id}/delete-preview`, { method: 'POST' }); },
   saveModel(id, data) { return this.req(`/api/models/${id}`, { method: 'PUT', body: JSON.stringify(data) }); },
   createModel(data) { return this.req('/api/models', { method: 'POST', body: JSON.stringify(data) }); },
   deleteModel(id) { return this.req(`/api/models/${id}`, { method: 'DELETE' }); },
+  previewDeleteModel(id) { return this.req(`/api/models/${id}/delete-preview`, { method: 'POST' }); },
   moveModel(id, data) { return this.req(`/api/models/${id}/move`, { method: 'POST', body: JSON.stringify(data) }); },
   cloneGroup(id) { return this.req(`/api/groups/${id}/clone`, { method: 'POST' }); },
   cloneModel(id) { return this.req(`/api/models/${id}/clone`, { method: 'POST' }); },
@@ -85,12 +88,15 @@ const API = {
   saveSettings(data) { return this.req('/api/settings', { method: 'PUT', body: JSON.stringify(data) }); },
   exportConfig() { return this.req('/api/config/export'); },
   getAggregates() { return this.req('/api/aggregates'); },
+  getAggregateStats(id, limit = 100) { return this.req(`/api/aggregates/${id}/stats?limit=${encodeURIComponent(limit)}`); },
   createAggregate(data) { return this.req('/api/aggregates', { method: 'POST', body: JSON.stringify(data) }); },
   saveAggregate(id, data) { return this.req(`/api/aggregates/${id}`, { method: 'PUT', body: JSON.stringify(data) }); },
   deleteAggregate(id) { return this.req(`/api/aggregates/${id}`, { method: 'DELETE' }); },
   createAggregateMember(aggregateId, data) { return this.req(`/api/aggregates/${aggregateId}/members`, { method: 'POST', body: JSON.stringify(data) }); },
   saveAggregateMember(id, data) { return this.req(`/api/aggregate-members/${id}`, { method: 'PUT', body: JSON.stringify(data) }); },
   clearAggregateMemberCooldown(id) { return this.req(`/api/aggregate-members/${id}/clear-cooldown`, { method: 'POST' }); },
+  previewAggregateMemberClearCooldown(id) { return this.req(`/api/aggregate-members/${id}/clear-cooldown-preview`, { method: 'POST' }); },
+  previewAggregateMemberSort(id, direction) { return this.req(`/api/aggregate-members/${id}/sort-preview`, { method: 'POST', body: JSON.stringify({ direction }) }); },
   deleteAggregateMember(id) { return this.req(`/api/aggregate-members/${id}`, { method: 'DELETE' }); },
   importConfig(file) {
     const form = new FormData();

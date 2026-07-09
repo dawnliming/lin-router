@@ -130,6 +130,8 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  width: var(--sidebar-w);
+  min-width: 0;
   transition: width .2s ease;
 }
 
@@ -234,4 +236,13 @@
   background: var(--text-tertiary);
   cursor: not-allowed;
   transform: none;
+}
+
+
+.app.sidebar-collapsed .sidebar {
+  width: var(--sidebar-collapsed-w);
+}
+
+.app.sidebar-collapsed .main {
+  min-width: 0;
 }
