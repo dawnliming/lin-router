@@ -208,7 +208,7 @@ def test_aggregate_fallback_preserves_same_reasoning_effort():
                 {"id": "m1", "name": "one", "ep_id": "target-one", "upstream_model": "target-one", "group_id": "g1", "api_key": "sk-one", "usable": True},
                 {"id": "m2", "name": "two", "ep_id": "target-two", "upstream_model": "target-two", "group_id": "g1", "api_key": "sk-two", "usable": True},
             ],
-            "aggregate_models": [{"id": "ag1", "name": "agg-reasoning", "route_key": "lr-ag-reasoning", "enabled": True, "strategy": "priority"}],
+            "aggregate_models": [{"id": "ag1", "name": "agg-reasoning", "route_key": "lr-ag-reasoning", "client_model_aliases": ["gpt-5.5"], "enabled": True, "strategy": "priority"}],
             "aggregate_members": [
                 {"id": "am1", "aggregate_id": "ag1", "group_id": "g1", "model_id": "m1", "priority": 1, "enabled": True},
                 {"id": "am2", "aggregate_id": "ag1", "group_id": "g1", "model_id": "m2", "priority": 2, "enabled": True},
@@ -219,7 +219,7 @@ def test_aggregate_fallback_preserves_same_reasoning_effort():
         server.router.log_file = Path(tmp) / "test-logs.jsonl"
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
-            response = post_responses(port, "high", model="agg-reasoning", route_key="lr-ag-reasoning")
+            response = post_responses(port, "high", model="gpt-5.5", route_key="lr-ag-reasoning")
             assert response["usage"]["output_tokens_details"]["reasoning_tokens"] == 96
             assert [capture["payload"]["model"] for capture in upstream.captures] == ["target-one", "target-two"]
             assert all(capture["payload"]["reasoning"]["effort"] == "high" for capture in upstream.captures)
@@ -227,6 +227,7 @@ def test_aggregate_fallback_preserves_same_reasoning_effort():
             assert len(request_logs) >= 2
             assert all("requested_reasoning_effort=high" in item.detail for item in request_logs[:2])
             assert all("reasoning_preserved=true" in item.detail for item in request_logs[:2])
+            assert any("requested=gpt-5.5" in item.detail and "resolved_as=aggregate_alias" in item.detail for item in request_logs)
         finally:
             server.shutdown()
             server.server_close()

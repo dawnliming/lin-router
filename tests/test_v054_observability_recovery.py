@@ -194,6 +194,8 @@ def test_v054_frontend_contracts():
     assert "requested_reasoning_effort" in logs_js
     assert "reasoningPreservedLabel" in logs_js
     assert "group-reasoning-support" in config_js
+    assert "aggregate-client-model-aliases" in config_js
+    assert r"split(/[\n,]+/)" in config_js
     assert "panel.querySelector('#group-waf')?.addEventListener('change'" in config_js
     assert "API.recoverModel" in config_js
     assert "API.recoverAggregateMember" in config_js

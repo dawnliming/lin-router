@@ -314,6 +314,11 @@ const ConfigTab = {
             <textarea id="aggregate-description" rows="2" placeholder="可选">${Utils.escapeHtml(a?.description || '')}</textarea>
           </div>
           <div class="form-row">
+            <label>客户端公开模型别名</label>
+            <textarea id="aggregate-client-model-aliases" rows="3" placeholder="每行一个，例如：gpt-5.5&#10;gpt-5.6-terra">${Utils.escapeHtml((a?.client_model_aliases || []).join('\n'))}</textarea>
+            <div class="form-hint">用于 Codex 等客户端按已知模型名识别能力。命中任一别名仍进入当前聚合策略，不代表固定上游；仅填写已在目标客户端实测可携带目标协议字段的模型名。</div>
+          </div>
+          <div class="form-row">
             <label class="checkbox">
               <input id="aggregate-enabled" type="checkbox" ${a?.enabled !== false ? 'checked' : ''}>
               <span>启用</span>
@@ -1258,6 +1263,7 @@ const ConfigTab = {
       name: document.getElementById('aggregate-name').value.trim(),
       display_name: document.getElementById('aggregate-display-name').value.trim(),
       description: document.getElementById('aggregate-description').value.trim(),
+      client_model_aliases: document.getElementById('aggregate-client-model-aliases').value.split(/[\n,]+/).map(value => value.trim()).filter(Boolean),
       enabled: document.getElementById('aggregate-enabled').checked,
       cooldown_minutes: Math.max(0, Number(document.getElementById('aggregate-cooldown').value || 0)),
       strategy: document.getElementById('aggregate-strategy').value,

@@ -209,6 +209,12 @@ const LogsTab = {
       const parsed = this.parseDetail(item.detail);
       if (parsed.skip_reason === 'member_disabled') return '已停用成员未参与';
     }
+    if (event === 'stream_ok' && item) {
+      const finalResult = this.parseDetail(item.detail).final_result;
+      if (finalResult === 'stream_done') return '首包成功 / 流式完成';
+      if (finalResult === 'stream_idle_timeout') return '首包成功 / 流式空闲超时';
+      if (finalResult === 'client_disconnected') return '首包成功 / 客户端断开';
+    }
     const map = { ok:'成功', stream_ok:'首包成功', retry_ok:'重试成功', cooldown:'冷却切换', fallback:'自动切换', skip:'跳过', network:'网络错误', error:'错误', system:'系统', stream_timeout:'流式超时', waf_lock_timeout:'候选忙', stream_done:'流式完成', stream_idle_timeout:'流式空闲超时', client_disconnected:'客户端断开', manual_probe:'人工探测' };
     return map[event] || event || '-';
   },
@@ -236,6 +242,8 @@ const LogsTab = {
       network: '网络错误',
       timeout: '请求超时',
       busy: '候选忙',
+      streaming: '流式中',
+      client_disconnected: '客户端断开',
     };
     return map[value] || value || '-';
   },
@@ -267,6 +275,37 @@ const LogsTab = {
       result[match[1].trim()] = match[2].trim();
     }
     return result;
+  },
+
+  formatDurationSeconds(value) {
+    const milliseconds = Number(value);
+    if (!Number.isFinite(milliseconds) || milliseconds < 0) return '-';
+    return `${(milliseconds / 1000).toFixed(2)} 秒`;
+  },
+
+  streamTiming(item) {
+    const totalMilliseconds = Number(item?.duration_ms);
+    if (!Number.isFinite(totalMilliseconds) || totalMilliseconds < 0) return null;
+    const parsed = this.parseDetail(item?.detail);
+    if (parsed.first_byte_ms === undefined || parsed.first_byte_ms === '') {
+      return { totalMilliseconds, firstByteMilliseconds: null, streamMilliseconds: null };
+    }
+    const firstByteMilliseconds = Number(parsed.first_byte_ms);
+    if (!Number.isFinite(firstByteMilliseconds) || firstByteMilliseconds < 0) {
+      return { totalMilliseconds, firstByteMilliseconds: null, streamMilliseconds: null };
+    }
+    return {
+      totalMilliseconds,
+      firstByteMilliseconds,
+      streamMilliseconds: Math.max(0, totalMilliseconds - firstByteMilliseconds),
+    };
+  },
+
+  durationSummary(item) {
+    const timing = this.streamTiming(item);
+    if (!timing || !timing.totalMilliseconds) return '-';
+    if (timing.firstByteMilliseconds === null) return `总 ${this.formatDurationSeconds(timing.totalMilliseconds)}`;
+    return `首 ${this.formatDurationSeconds(timing.firstByteMilliseconds)} / 流 ${this.formatDurationSeconds(timing.streamMilliseconds)} / 总 ${this.formatDurationSeconds(timing.totalMilliseconds)}`;
   },
 
   renderRows(keepScroll = false) {
@@ -350,7 +389,7 @@ const LogsTab = {
         <td><span class="pill ${this.statusClass(item.status, item)}">${Utils.escapeHtml(this.statusLabel(item.status))}</span></td>
         <td class="tiny">${Utils.escapeHtml(this.eventLabel(item.event, item))}</td>
         <td class="tiny">${Number(item.attempt || 0) || 1}</td>
-        <td class="tiny">${Number(item.duration_ms || 0) ? `${Number(item.duration_ms)} ms` : '-'}</td>
+        <td class="tiny">${Utils.escapeHtml(this.durationSummary(item))}</td>
         <td class="tiny">${Utils.escapeHtml(this.tokenSummary(item))}</td>
         <td class="tiny result-text log-detail-preview" title="${Utils.escapeHtml(this.formatDetailPreview(item))}" data-log-detail-preview-key="${Utils.escapeHtml(key)}">${Utils.escapeHtml(this.formatDetailPreview(item))}</td>
         <td><button type="button" data-log-detail-key="${Utils.escapeHtml(key)}">查看</button></td>
@@ -377,7 +416,12 @@ const LogsTab = {
         ? '最小探测成功，候选已恢复参与调度'
         : '最小探测未通过，候选保持冷却';
     }
-    if (event === 'stream_ok') return '首包成功，流式响应仍在进行';
+    if (event === 'stream_ok') {
+      if (parsed.final_result === 'stream_done') return '流式响应已完成';
+      if (parsed.final_result === 'stream_idle_timeout') return '上游流式响应空闲超时';
+      if (parsed.final_result === 'client_disconnected') return '客户端已断开连接';
+      return '首包成功，流式响应仍在进行';
+    }
     if (event === 'stream_done' || event === 'stream_finalized') return '流式响应已完成';
     if (event === 'client_disconnected') return '客户端已断开连接';
     if (event === 'waf_lock_timeout') return '候选忙，等待锁超时后已切换';
@@ -653,6 +697,13 @@ const LogsTab = {
     const errorReason = this.userFacingErrorReason(item, parsed);
     const fallbackReason = this.userFacingFallbackReason(item, parsed);
     const cooldownApplied = this.firstValue(item.cooldown_applied, parsed.cooldown_applied, parsed.cooldown_reason ? 'true' : 'false');
+    const timing = this.streamTiming(item);
+    const streamLifecycle = {
+      stream_done: '流式响应已完成',
+      stream_idle_timeout: '上游流式响应空闲超时',
+      client_disconnected: '客户端已断开连接',
+      streaming: '流式响应进行中',
+    }[parsed.final_result || parsed.lifecycle || ''] || '-';
     const deepDiagnostics = debugMode ? `
       <div class="log-detail-block log-detail-raw-block">
         <h4>调试模式：深度诊断（已脱敏）</h4>
@@ -677,7 +728,10 @@ const LogsTab = {
           <h4>基础信息</h4>
           <dl>
             <dt>时间</dt><dd>${Utils.escapeHtml(item.time)}</dd>
-            <dt>耗时</dt><dd>${Number(item.duration_ms || 0) ? `${Number(item.duration_ms)} ms` : '-'}</dd>
+            <dt>首包耗时</dt><dd>${timing?.firstByteMilliseconds !== null && timing?.firstByteMilliseconds !== undefined ? this.formatDurationSeconds(timing.firstByteMilliseconds) : '-'}</dd>
+            <dt>流式耗时</dt><dd>${timing?.streamMilliseconds !== null && timing?.streamMilliseconds !== undefined ? this.formatDurationSeconds(timing.streamMilliseconds) : '-'}</dd>
+            <dt>总耗时</dt><dd>${timing ? this.formatDurationSeconds(timing.totalMilliseconds) : '-'}</dd>
+            <dt>流生命周期</dt><dd>${Utils.escapeHtml(streamLifecycle)}</dd>
             <dt>状态</dt><dd><span class="pill ${this.statusClass(item.status, item)}">${Utils.escapeHtml(this.statusLabel(item.status))}</span> ${Utils.escapeHtml(this.eventLabel(item.event, item))}</dd>
             <dt>请求 ID / 次</dt><dd>${Utils.escapeHtml(requestIdDisplay)} / ${Number(item.attempt || 0) || 1}</dd>
             <dt>成员 ID</dt><dd>${Utils.escapeHtml(memberIdDisplay)}</dd>

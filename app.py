@@ -286,6 +286,7 @@ class AggregateModel:
     display_name: str = ""
     description: str = ""
     route_key: str = ""
+    client_model_aliases: List[str] = field(default_factory=list)
     enabled: bool = True
     strategy: str = "priority"
     cooldown_minutes: int = DEFAULT_AUTO_MODEL_COOLDOWN_MINUTES
@@ -301,12 +302,31 @@ class AggregateModel:
             display_name=str(data.get("display_name") or "").strip(),
             description=str(data.get("description") or "").strip(),
             route_key=str(data.get("route_key") or "").strip(),
+            client_model_aliases=cls._normalize_client_model_aliases(data.get("client_model_aliases")),
             enabled=bool(data.get("enabled", True)),
             strategy=str(data.get("strategy") or "priority").strip() or "priority",
             cooldown_minutes=int(data.get("cooldown_minutes") or DEFAULT_AUTO_MODEL_COOLDOWN_MINUTES),
             created_at=str(data.get("created_at") or now),
             updated_at=str(data.get("updated_at") or now),
         )
+
+    @staticmethod
+    def _normalize_client_model_aliases(value: Any) -> List[str]:
+        if isinstance(value, str):
+            items = re.split(r"[\r\n,]+", value)
+        elif isinstance(value, list):
+            items = value
+        else:
+            items = []
+        aliases: List[str] = []
+        seen: set[str] = set()
+        for item in items:
+            for raw_alias in re.split(r"[\r\n,]+", str(item or "")):
+                alias = raw_alias.strip()
+                if alias and alias not in seen:
+                    aliases.append(alias)
+                    seen.add(alias)
+        return aliases
 
 
 @dataclass
@@ -605,6 +625,15 @@ class ConfigStore:
                 return False, "聚合模型 Key 已存在"
         return True, ""
 
+    def _validate_aggregate_client_aliases(self, aliases: List[str]) -> Tuple[bool, str]:
+        reserved = {DEFAULT_AUTO_MODEL_NAME, "all-router-auto", DEFAULT_PUBLIC_API_KEY}
+        for alias in aliases:
+            if not alias:
+                return False, "客户端公开模型别名不能为空"
+            if alias in reserved:
+                return False, f"客户端公开模型别名不能为保留名 {alias}"
+        return True, ""
+
     @staticmethod
     def _group_auto_model_name_static(group: ConnectionGroup) -> str:
         if group and group.auto_model_name and group.auto_model_name.strip():
@@ -613,7 +642,11 @@ class ConfigStore:
 
     def upsert_aggregate(self, aggregate: AggregateModel) -> Tuple[bool, str]:
         with self._lock:
+            aggregate.client_model_aliases = AggregateModel._normalize_client_model_aliases(aggregate.client_model_aliases)
             ok, msg = self._validate_aggregate_name(aggregate.name, aggregate.id)
+            if not ok:
+                return False, msg
+            ok, msg = self._validate_aggregate_client_aliases(aggregate.client_model_aliases)
             if not ok:
                 return False, msg
             # 新建或更新时若 route_key 为空，自动生成 lr-ag- 前缀 Key
@@ -1223,6 +1256,74 @@ class ArkProxyRouter:
         except Exception:
             return
 
+    def _find_stream_log(
+        self,
+        request_id: str,
+        attempt: Optional[int] = None,
+        candidate_label: str = "",
+    ) -> Optional[RequestLog]:
+        for item in self.logs:
+            if item.request_id != request_id or item.event != "stream_ok":
+                continue
+            if attempt is not None and item.attempt != attempt:
+                continue
+            if candidate_label and item.model != candidate_label:
+                continue
+            return item
+        return None
+
+    def patch_stream_lifecycle(
+        self,
+        request_id: str,
+        attempt: int,
+        candidate_label: str,
+        usage: Tuple[int, int, int, int, int],
+        usage_source: str,
+        *,
+        final_status: str,
+        lifecycle: str,
+        final_result: str,
+        chunks_received: int,
+        bytes_received: int,
+        duration_ms: Optional[int] = None,
+        lock_wait_ms: Optional[int] = None,
+        lock_release_reason: str = "",
+        cooldown_applied: Optional[bool] = None,
+        failure_scope: str = "",
+    ) -> bool:
+        """回填已首包成功的单条 stream_ok 主记录，避免新增生命周期重复日志。"""
+        item = self._find_stream_log(request_id, attempt, candidate_label)
+        if not item:
+            return False
+        prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens = usage
+        item.status = final_status
+        item.duration_ms = duration_ms if duration_ms is not None else item.duration_ms
+        item.prompt_tokens = prompt_tokens
+        item.completion_tokens = completion_tokens
+        item.total_tokens = total_tokens
+        item.cached_tokens = cached_tokens
+        item.reasoning_tokens = reasoning_tokens
+        item.usage_source = usage_source
+        if cooldown_applied is not None:
+            item.cooldown_applied = cooldown_applied
+        if failure_scope:
+            item.failure_scope = failure_scope
+        suffix_parts = [
+            "stream_finalized=true",
+            f"lifecycle={lifecycle}",
+            f"final_result={final_result}",
+            f"chunks_received={chunks_received}",
+            f"bytes_received={bytes_received}",
+            "lock_released=true",
+        ]
+        if lock_wait_ms is not None:
+            suffix_parts.append(f"lock_wait_ms={lock_wait_ms}")
+        if lock_release_reason:
+            suffix_parts.append(f"lock_release_reason={lock_release_reason}")
+        item.detail = self._append_detail(item.detail, "; ".join(suffix_parts))
+        self._rewrite_log_file()
+        return True
+
     def update_latest_stream_usage(
         self,
         request_id: str,
@@ -1232,39 +1333,51 @@ class ArkProxyRouter:
         lock_wait_ms: Optional[int] = None,
         lock_release_reason: str = "",
     ) -> None:
-        if not request_id:
+        item = self._find_stream_log(request_id)
+        if not item:
             return
-        prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens = usage
-        for item in self.logs:
-            if item.request_id == request_id and item.event == "stream_ok":
-                item.prompt_tokens = prompt_tokens
-                item.completion_tokens = completion_tokens
-                item.total_tokens = total_tokens
-                item.cached_tokens = cached_tokens
-                item.reasoning_tokens = reasoning_tokens
-                item.usage_source = usage_source
-                suffix_parts = ["lock_released=true"]
-                if lock_wait_ms is not None:
-                    suffix_parts.append(f"lock_wait_ms={lock_wait_ms}")
-                if lock_release_reason:
-                    suffix_parts.append(f"lock_release_reason={lock_release_reason}")
-                if not usage_source:
-                    suffix_parts.append("stream_not_finalized=true")
-                item.detail = self._append_detail(item.detail, "; ".join(suffix_parts))
-                break
-        # 同步回写日志文件，避免重启后流式请求的 token 使用量丢失
-        self._rewrite_log_file()
+        self.patch_stream_lifecycle(
+            request_id,
+            item.attempt,
+            item.model,
+            usage,
+            usage_source,
+            final_status=item.status,
+            lifecycle="stream_usage_updated",
+            final_result="streaming",
+            chunks_received=int(self._detail_value(item.detail, "chunks_received") or 0),
+            bytes_received=int(self._detail_value(item.detail, "bytes_received") or 0),
+            lock_wait_ms=lock_wait_ms,
+            lock_release_reason=lock_release_reason,
+        )
 
     def finalize_stream_if_needed(self, request_id: str) -> None:
-        """客户端断连或 handler 异常退出后，若 stream_ok 日志仍未回填 usage_source，则标记异常样本。"""
+        """客户端断连或 handler 异常退出后，回填未终结的 stream_ok 主记录。"""
         if not request_id:
             return
-        for item in self.logs:
-            if item.request_id == request_id and item.event == "stream_ok":
-                if not item.usage_source:
-                    item.detail = self._append_detail(item.detail, "stream_not_finalized=true")
-                    self._rewrite_log_file()
-                break
+        item = self._find_stream_log(request_id)
+        if not item or "stream_finalized=true" in item.detail:
+            return
+        try:
+            started_at_ms = int(self._detail_value(item.detail, "stream_started_at_ms") or 0)
+        except ValueError:
+            started_at_ms = 0
+        duration_ms = max(item.duration_ms, int(time.time() * 1000) - started_at_ms) if started_at_ms else item.duration_ms
+        self.patch_stream_lifecycle(
+            request_id,
+            item.attempt,
+            item.model,
+            (item.prompt_tokens, item.completion_tokens, item.total_tokens, item.cached_tokens, item.reasoning_tokens),
+            "stream_incomplete",
+            final_status="client_disconnected",
+            lifecycle="client_disconnected",
+            final_result="client_disconnected",
+            chunks_received=int(self._detail_value(item.detail, "chunks_received") or 1),
+            bytes_received=int(self._detail_value(item.detail, "bytes_received") or 0),
+            duration_ms=duration_ms,
+            lock_release_reason="client_disconnect",
+            failure_scope="request",
+        )
 
     def _rewrite_log_file(self) -> None:
         """将内存中的日志按时间顺序（旧在前，新在后）重新写入文件。"""
@@ -2434,9 +2547,11 @@ class ArkProxyRouter:
                 )
             if requested_model == aggregate.name:
                 return aggregate, "aggregate"
-            # 聚合模型 Key 只能请求自身聚合模型名
+            if requested_model in aggregate.client_model_aliases:
+                return aggregate, "aggregate_alias"
+            # 聚合模型 Key 只能请求自身聚合模型名或已配置别名
             raise AllModelsFailedError(
-                f"聚合模型 Key 只能请求 {aggregate.name}",
+                f"聚合模型 Key 只能请求 {aggregate.name} 或已配置客户端别名",
                 attempted=0,
                 error_code="model_not_found",
             )
@@ -3169,13 +3284,15 @@ class ArkProxyRouter:
                     body,
                     payload_for_upstream,
                     outbound_headers,
-                    f"stream ok; idle_timeout_seconds={idle_timeout}; chunks_received=1; bytes_received={len(first_chunk)}; final_result=streaming",
+                    f"stream ok; first_byte_ms={duration_ms}; stream_started_at_ms={int(time.time() * 1000) - duration_ms}; "
+                    f"idle_timeout_seconds={idle_timeout}; initial_chunks_received=1; initial_bytes_received={len(first_chunk)}; "
+                    f"chunks_received=1; bytes_received={len(first_chunk)}; final_result=streaming",
                     resp=resp,
                     tools_normalized=tools_normalized,
                     lock_wait_ms=lock_wait_ms,
                     aggregate_suffix=aggregate_suffix,
                 )
-                self.add_log(path, candidate.label, "200", detail, duration_ms, *latest_usage, group=group, request_id=request_id, attempt=attempt, event="stream_ok")
+                self.add_log(path, candidate.label, "streaming", detail, duration_ms, *latest_usage, group=group, request_id=request_id, attempt=attempt, event="stream_ok")
                 self._live_request_update(request_id, stage="streaming", stage_label="接收流式响应")
                 self._mark_stream_active(candidate, 1)
                 try:
@@ -3208,30 +3325,6 @@ class ArkProxyRouter:
                             except StreamIdleTimeoutError:
                                 stream_state["timeout"] = True
                                 release_reason = "stream_idle_timeout"
-                                self.add_log(
-                                    path,
-                                    candidate.label,
-                                    "timeout",
-                                    self._debug_detail(
-                                        candidate,
-                                        requested_label,
-                                        target_url,
-                                        body_mode,
-                                        body,
-                                        payload,
-                                        outbound_headers,
-                                        f"reason=stream_idle_timeout; idle_timeout_seconds={idle_timeout}; chunks_received={chunks_received}; bytes_received={bytes_received}; final_result=client_stream_aborted",
-                                        lock_wait_ms=lock_wait_ms,
-                                        lock_release_reason=release_reason,
-                                    ),
-                                    int((time.perf_counter() - started_at) * 1000),
-                                    *usage_total,
-                                    group=group,
-                                    request_id=request_id,
-                                    attempt=attempt,
-                                    event="stream_timeout",
-                                    usage_source="stream_incomplete",
-                                )
                                 break
                             if not chunk:
                                 stream_state["completed_normally"] = True
@@ -3246,37 +3339,39 @@ class ArkProxyRouter:
                     finally:
                         if resp:
                             resp.close()
+                        final_duration_ms = int((time.perf_counter() - started_at) * 1000)
                         if stream_state["timeout"]:
                             usage_source = "stream_incomplete"
-                            lifecycle_event = "stream_idle_timeout"
                             lifecycle_status = "timeout"
                             lifecycle_result = "stream_idle_timeout"
+                            lifecycle_scope = "upstream"
                         elif stream_state["completed_normally"]:
                             usage_source = "stream_final" if any(usage_total) else "missing"
-                            lifecycle_event = "stream_done"
                             lifecycle_status = "200"
                             lifecycle_result = "stream_done"
+                            lifecycle_scope = ""
                         else:
                             usage_source = "stream_incomplete"
-                            lifecycle_event = "client_disconnected"
                             lifecycle_status = "client_disconnected"
                             lifecycle_result = "client_disconnected"
-                        self.update_latest_stream_usage(request_id, usage_total, usage_source, lock_wait_ms=lock_wait_ms, lock_release_reason=release_reason)
-                        self._live_request_finish(request_id, "done" if stream_state["completed_normally"] else "ended")
-                        lifecycle_detail = self._debug_detail(
-                            candidate,
-                            requested_label,
-                            target_url,
-                            body_mode,
-                            body,
-                            payload_for_upstream,
-                            outbound_headers,
-                            f"stream_finalized=true; final_result={lifecycle_result}; chunks_received={chunks_received}; bytes_received={bytes_received}",
+                            lifecycle_scope = "request"
+                        self.patch_stream_lifecycle(
+                            request_id,
+                            attempt,
+                            candidate.label,
+                            usage_total,
+                            usage_source,
+                            final_status=lifecycle_status,
+                            lifecycle=lifecycle_result,
+                            final_result=lifecycle_result,
+                            chunks_received=chunks_received,
+                            bytes_received=bytes_received,
+                            duration_ms=final_duration_ms,
                             lock_wait_ms=lock_wait_ms,
                             lock_release_reason=release_reason,
-                            aggregate_suffix=aggregate_suffix,
+                            failure_scope=lifecycle_scope,
                         )
-                        self.add_log(path, candidate.label, lifecycle_status, lifecycle_detail, int((time.perf_counter() - started_at) * 1000), *usage_total, group=group, request_id=request_id, attempt=attempt, event=lifecycle_event, usage_source=usage_source)
+                        self._live_request_finish(request_id, "done" if stream_state["completed_normally"] else "ended")
                         self._mark_stream_active(candidate, -1)
                         self._release_lock(upstream_lock)
 
@@ -3646,21 +3741,33 @@ class RouterHandler(BaseHTTPRequestHandler):
                     }
                 }, status=403)
                 return
-            self._send_json({
-                "object": "list",
-                "data": [{
-                    "id": aggregate.name,
+            model_data = [{
+                "id": aggregate.name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "lin-router",
+                "root": aggregate.name,
+                "parent": None,
+                "display_name": aggregate.display_name or aggregate.name,
+                "is_aggregate": True,
+                "aggregate_id": aggregate.id,
+                "usable": True,
+            }]
+            for alias in aggregate.client_model_aliases:
+                model_data.append({
+                    "id": alias,
                     "object": "model",
                     "created": 0,
                     "owned_by": "lin-router",
                     "root": aggregate.name,
-                    "parent": None,
-                    "display_name": aggregate.display_name or aggregate.name,
+                    "parent": aggregate.name,
+                    "display_name": alias,
                     "is_aggregate": True,
+                    "is_client_alias": True,
                     "aggregate_id": aggregate.id,
                     "usable": True,
-                }]
-            })
+                })
+            self._send_json({"object": "list", "data": model_data})
             return
         group = ctx.group
         visible_group = group
@@ -4670,14 +4777,19 @@ class RouterHandler(BaseHTTPRequestHandler):
                             break
                     else:
                         self.store.models.append(model)
-                # 导入聚合模型：按 id 覆盖，name 校验不通过则跳过
+                # 导入聚合模型：按 id 覆盖；别名冲突跳过并返回中文原因
                 imported_aggregate_ids: set = set()
+                aggregate_skip_reasons: List[str] = []
                 for item in aggregates_raw:
                     if not isinstance(item, dict) or not item.get("name"):
+                        aggregate_skip_reasons.append("聚合模型缺少名称")
                         continue
                     aggregate = AggregateModel.from_dict(item)
-                    ok, _ = self.store._validate_aggregate_name(aggregate.name, aggregate.id)
+                    ok, message = self.store._validate_aggregate_name(aggregate.name, aggregate.id)
+                    if ok:
+                        ok, message = self.store._validate_aggregate_client_aliases(aggregate.client_model_aliases)
                     if not ok:
+                        aggregate_skip_reasons.append(f"聚合模型 {aggregate.name}：{message}")
                         continue
                     for idx, existing in enumerate(self.store.aggregate_models):
                         if existing.id == aggregate.id:
@@ -4721,6 +4833,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 "models": len(self.store.models),
                 "aggregate_models": len(self.store.aggregate_models),
                 "aggregate_members": len(self.store.aggregate_members),
+                "skipped_aggregates": aggregate_skip_reasons,
             })
             return
         if parsed.path == "/api/backup/import":
