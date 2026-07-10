@@ -55,6 +55,8 @@ const API = {
 
   getState() { return this.req('/api/state'); },
   getRuntimeState(opts = {}) { return this.req('/api/runtime-state', opts); },
+  getLiveRequests(opts = {}) { return this.req('/api/live-requests', opts); },
+  diagnoseRequest(requestId, opts = {}) { return this.req(`/api/diagnose/${encodeURIComponent(requestId)}`, opts); },
   getLogs(params = {}) {
     const qs = new URLSearchParams(params).toString();
     return this.req(`/api/logs${qs ? '?' + qs : ''}`);
@@ -77,6 +79,7 @@ const API = {
   setGroupUsable(id, usable) { return this.req(`/api/groups/${id}/usable`, { method: 'POST', body: JSON.stringify({ usable }) }); },
   setAllUsable(usable) { return this.req('/api/models/usable/all', { method: 'POST', body: JSON.stringify({ usable }) }); },
   resetCooldown(id) { return this.req(`/api/models/${id}/reset`, { method: 'POST' }); },
+  recoverModel(id) { return this.req(`/api/models/${id}/recover`, { method: 'POST' }); },
   resetGroupCooldown(id) { return this.req(`/api/groups/${id}/reset`, { method: 'POST' }); },
   fetchUpstreamModels(groupId, apiKey) {
     return this.req('/api/models/fetch-upstream', {
@@ -95,6 +98,7 @@ const API = {
   createAggregateMember(aggregateId, data) { return this.req(`/api/aggregates/${aggregateId}/members`, { method: 'POST', body: JSON.stringify(data) }); },
   saveAggregateMember(id, data) { return this.req(`/api/aggregate-members/${id}`, { method: 'PUT', body: JSON.stringify(data) }); },
   clearAggregateMemberCooldown(id) { return this.req(`/api/aggregate-members/${id}/clear-cooldown`, { method: 'POST' }); },
+  recoverAggregateMember(id) { return this.req(`/api/aggregate-members/${id}/recover`, { method: 'POST' }); },
   previewAggregateMemberClearCooldown(id) { return this.req(`/api/aggregate-members/${id}/clear-cooldown-preview`, { method: 'POST' }); },
   previewAggregateMemberSort(id, direction) { return this.req(`/api/aggregate-members/${id}/sort-preview`, { method: 'POST', body: JSON.stringify({ direction }) }); },
   deleteAggregateMember(id) { return this.req(`/api/aggregate-members/${id}`, { method: 'DELETE' }); },

@@ -247,6 +247,7 @@ const ConfigTab = {
           <div class="form-row read-only">
             <label>冷却截止</label>
             <span id="model-cooldown-display">-</span>
+            ${m && m.cooldown_until && m.cooldown_until * 1000 > Date.now() && !m.disabled_by_user ? `<button type="button" id="model-recover" class="btn-recover btn-sm">重试恢复</button>` : ''}
           </div>
           <div class="form-row read-only">
             <label>最近错误</label>
@@ -823,6 +824,7 @@ const ConfigTab = {
       }
       panel.querySelector('#model-delete')?.addEventListener('click', () => this.onModelDelete());
       panel.querySelector('#model-clone')?.addEventListener('click', () => this.onModelClone());
+      panel.querySelector('#model-recover')?.addEventListener('click', () => this.onRecoverModel());
       panel.querySelector('#model-fetch')?.addEventListener('click', () => this.onFetchUpstream());
       this.bindAutoSave(modelForm, () => this.autoSaveModel());
     }
@@ -981,6 +983,27 @@ const ConfigTab = {
       display.textContent = `${Utils.formatDate(m.cooldown_until)}（还剩 ${mm}:${ss}）`;
     } else {
       display.textContent = '-';
+    }
+  },
+
+  async onRecoverModel() {
+    const id = document.getElementById('model-id')?.value;
+    const model = id ? Store.getModel(id) : null;
+    if (!id || !model) return;
+    const ok = await Modal.confirm({
+      title: '重试恢复模型',
+      message: `将向当前模型发送最小探测请求；仅探测成功后才恢复参与调度，不影响其他冷却模型。确认继续？`,
+      confirmText: '确认重试恢复',
+      allowHtml: true,
+    });
+    if (!ok) return;
+    try {
+      const res = await API.recoverModel(id);
+      await Store.load();
+      if (Tabs.current === 'config' && Store.selected.type === 'model' && Store.selected.id === id) this.render();
+      Toast.success(res.message || '模型已重试恢复');
+    } catch (err) {
+      Toast.error('重试恢复失败：' + err.message);
     }
   },
 
@@ -1322,7 +1345,7 @@ const ConfigTab = {
     }
     try {
       await API.createAggregateMember(aggregateId, { group_id: values['member-group'], model_id: values['member-model'], manual_price: manualPrice });
-      await Store.load();
+      await this.reloadAfterAggregateMemberChange();
       Toast.success('成员已添加');
     } catch (err) {
       Toast.error('添加失败：' + err.message);
@@ -1381,14 +1404,21 @@ const ConfigTab = {
     });
   },
 
+
+  async reloadAfterAggregateMemberChange() {
+    await Store.load();
+    if (Tabs.current === 'config' && Store.selected.type === 'aggregate') {
+      this.render();
+    }
+  },
   async onRecoverAggregateMember(memberId) {
     try {
       const preview = await API.previewAggregateMemberClearCooldown(memberId);
       const ok = await this.confirmAggregateMemberPreview('恢复成员预览', preview, '确认恢复');
       if (!ok) return;
-      await API.clearAggregateMemberCooldown(memberId);
-      await Store.load();
-      Toast.success('成员已恢复并启用');
+      const res = await API.recoverAggregateMember(memberId);
+      await this.reloadAfterAggregateMemberChange();
+      Toast.success(res.message || '成员已重试恢复');
     } catch (err) {
       Toast.error('恢复失败：' + err.message);
     }
@@ -1396,13 +1426,8 @@ const ConfigTab = {
 
   async onMoveAggregateMember(memberId, direction) {
     try {
-      const preview = await API.previewAggregateMemberSort(memberId, direction);
-      if (preview.changed) {
-        const ok = await this.confirmAggregateMemberPreview('排序变更预览', preview, '确认调整排序');
-        if (!ok) return;
-      }
       await API.saveAggregateMember(memberId, { direction });
-      await Store.load();
+      await this.reloadAfterAggregateMemberChange();
     } catch (err) {
       Toast.error('排序失败：' + err.message);
     }
@@ -1435,7 +1460,7 @@ const ConfigTab = {
     if (manualPrice === currentPrice) return;
     try {
       await API.saveAggregateMember(memberId, { manual_price: manualPrice });
-      await Store.load();
+      await this.reloadAfterAggregateMemberChange();
     } catch (err) {
       Toast.error('价格更新失败：' + err.message);
     }
@@ -1446,7 +1471,7 @@ const ConfigTab = {
     if (!member) return;
     try {
       await API.saveAggregateMember(memberId, { enabled, clear_cooldown: enabled });
-      await Store.load();
+      await this.reloadAfterAggregateMemberChange();
       Toast.success(enabled ? '聚合成员已启用并清理冷却' : '聚合成员已停用');
     } catch (err) {
       Toast.error('状态更新失败：' + err.message);
@@ -1463,7 +1488,7 @@ const ConfigTab = {
     if (!ok) return;
     try {
       await API.deleteAggregateMember(memberId);
-      await Store.load();
+      await this.reloadAfterAggregateMemberChange();
       Toast.success('成员已删除');
     } catch (err) {
       Toast.error('删除失败：' + err.message);

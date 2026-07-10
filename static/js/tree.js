@@ -14,6 +14,7 @@ const Tree = {
       <div class="tree-container" id="tree-root"></div>
     `;
     document.getElementById('sidebar-collapse').addEventListener('click', () => App.toggleSidebar());
+    App.applySidebarState?.();
     this.hideMenu = this.hideMenu.bind(this);
     document.addEventListener('click', this.hideMenu);
     this.loadExpanded();

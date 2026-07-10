@@ -29,6 +29,7 @@ const DashboardTab = {
     const enabledAggregateList = aggregates.filter(a => a.enabled !== false);
     const hasConfig = groups.length > 0 || aggregates.length > 0;
     const aggregateSummary = this.aggregateSummaryCards(aggregates, recent);
+    const liveRequests = state.live_requests || [];
 
     return `
       <div class="dashboard-page">
@@ -52,6 +53,7 @@ const DashboardTab = {
           ${this.metricCard('候选忙', `${busyCount} 次`, '大上下文或锁等待切换')}
           ${this.metricCard('上游超时 / WAF', `${upstreamTimeoutCount} / ${wafBlockedCount}`, '最近请求健康信号')}
         </div>
+        ${this.renderLiveRequests(liveRequests)}
         ${aggregateSummary}
         <div class="dashboard-two-col">
           <section class="dashboard-card dashboard-access-section">
@@ -75,6 +77,52 @@ const DashboardTab = {
 
   metricCard(label, value, hint) {
     return `<section class="dashboard-metric"><span>${Utils.escapeHtml(label)}</span><strong>${Utils.escapeHtml(value)}</strong><small>${Utils.escapeHtml(hint || '')}</small></section>`;
+  },
+
+  renderLiveRequests(items) {
+    const rows = (items || []).slice(0, 8).map(item => {
+      const slow = item.slow ? ' slow' : '';
+      const elapsed = this.formatElapsed(item.elapsed_ms || 0);
+      const hint = item.possible_reason || (item.slow ? '请求耗时较长，请关注当前阶段' : '处理中');
+      const stageLabel = item.stage_label || this.liveStageLabel(item.stage);
+      return `
+        <div class="live-request-row${slow}">
+          <div><strong>${Utils.escapeHtml(item.request_id_short || String(item.request_id || '').slice(0, 8))}</strong><span>${Utils.escapeHtml(item.requested_model || item.model || '-')}</span></div>
+          <div>${Utils.escapeHtml(item.group || item.candidate || '-')}</div>
+          <div><span class="pill ${item.slow ? 'warning' : 'info'}">${Utils.escapeHtml(stageLabel)}</span></div>
+          <div>${Utils.escapeHtml(elapsed)}</div>
+          <small>${Utils.escapeHtml(hint)}</small>
+        </div>`;
+    }).join('');
+    return `
+      <section class="dashboard-card live-requests-card">
+        <div class="section-title-row">
+          <h3>实时请求观测</h3>
+          <span class="pill ${items.length ? 'warning' : 'success'}">${items.length ? `${items.length} 个进行中` : '空闲'}</span>
+        </div>
+        ${rows || '<div class="empty-hint">当前没有正在处理的请求。</div>'}
+      </section>
+    `;
+  },
+
+  formatElapsed(ms) {
+    const seconds = Math.max(0, Math.round(Number(ms || 0) / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  },
+
+  liveStageLabel(stage) {
+    const map = {
+      selecting_candidate: '选择候选',
+      preparing_upstream: '准备上游请求',
+      waiting_waf_lock: '等待 WAF 锁',
+      connecting_upstream: '连接上游',
+      waiting_first_byte: '等待首包',
+      streaming: '接收流式响应',
+      receiving_response: '接收响应',
+      candidate_busy: '候选忙/等待锁超时'
+    };
+    return map[stage] || stage || '处理中';
   },
 
   renderAggregateAccessCards(aggregates, baseUrl) {

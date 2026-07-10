@@ -946,6 +946,8 @@ class ArkProxyRouter:
         self.upstream_locks: Dict[str, threading.Lock] = {}
         self.upstream_active_streams: Dict[str, int] = {}
         self.upstream_locks_guard = threading.Lock()
+        self.live_requests: Dict[str, Dict[str, Any]] = {}
+        self.live_requests_lock = threading.Lock()
         self._upstream_client = self._create_upstream_client()
         self.debug_capture = DebugCapture(self, settings_store)
         self._load_log_file()
@@ -2047,6 +2049,242 @@ class ArkProxyRouter:
             return suffix
         return f"{detail}; {suffix}"
 
+    def _live_request_start(self, request_id: str, path: str, requested_model: str, *, stream: bool) -> None:
+        if not request_id:
+            return
+        now = time.time()
+        with self.live_requests_lock:
+            self.live_requests[request_id] = {
+                "request_id": request_id,
+                "path": path,
+                "requested_model": requested_model,
+                "model": requested_model,
+                "group": "",
+                "candidate": "",
+                "aggregate_model": "",
+                "stage": "selecting_candidate",
+                "stage_label": "选择候选",
+                "started_at": now,
+                "updated_at": now,
+                "elapsed_ms": 0,
+                "stream": bool(stream),
+                "attempt": 0,
+                "status": "running",
+                "slow": False,
+                "possible_reason": "",
+            }
+
+    def _live_request_update(self, request_id: str, **patch: Any) -> None:
+        if not request_id:
+            return
+        with self.live_requests_lock:
+            item = self.live_requests.get(request_id)
+            if not item:
+                return
+            item.update({k: v for k, v in patch.items() if v is not None})
+            item["updated_at"] = time.time()
+
+    def _live_request_finish(self, request_id: str, status: str = "done") -> None:
+        if not request_id:
+            return
+        with self.live_requests_lock:
+            item = self.live_requests.get(request_id)
+            if item:
+                item["status"] = status
+                item["stage"] = status
+                item["stage_label"] = "已完成" if status == "done" else "已结束"
+                item["updated_at"] = time.time()
+            self.live_requests.pop(request_id, None)
+
+    def live_requests_payload(self) -> Dict[str, Any]:
+        now = time.time()
+        items: List[Dict[str, Any]] = []
+        with self.live_requests_lock:
+            for item in self.live_requests.values():
+                row = dict(item)
+                elapsed_ms = int((now - float(row.get("started_at") or now)) * 1000)
+                row["elapsed_ms"] = elapsed_ms
+                row["slow"] = elapsed_ms >= 10000 or str(row.get("stage") or "") in {"waiting_waf_lock", "waiting_first_byte"} and elapsed_ms >= 5000
+                if row["slow"] and not row.get("possible_reason"):
+                    stage = str(row.get("stage") or "")
+                    if stage == "waiting_waf_lock":
+                        row["possible_reason"] = "候选可能正在处理大上下文请求，正在等待 WAF 锁"
+                    elif stage == "waiting_first_byte":
+                        row["possible_reason"] = "上游首包较慢，可能是模型正在执行复杂任务"
+                    else:
+                        row["possible_reason"] = "请求耗时较长，请关注上游状态"
+                row["request_id_short"] = str(row.get("request_id") or "")[:8]
+                items.append(row)
+        items.sort(key=lambda x: x.get("started_at") or 0, reverse=True)
+        return {"ok": True, "requests": items, "count": len(items), "server_time": int(now)}
+
+    def diagnose_request(self, request_id: str) -> Dict[str, Any]:
+        related = [item for item in self.logs if item.request_id == request_id]
+        if not related:
+            for item in self.all_logs():
+                if item.request_id == request_id:
+                    related.append(item)
+        if not related:
+            return {"ok": False, "message": "未找到该请求记录", "code": "request_not_found"}
+        related_chrono = list(reversed(related))
+        return {"ok": True, "diagnosis": self._diagnose_logs(related_chrono)}
+
+    def _diagnose_logs(self, logs: List[RequestLog]) -> Dict[str, Any]:
+        text = "\n".join(f"{l.status} {l.event} {l.failure_scope} {l.detail}" for l in logs).lower()
+        final = next((l for l in reversed(logs) if str(l.status).startswith("2") or l.event in {"error", "network", "stream_idle_timeout", "waf_lock_timeout"}), logs[-1])
+        title = "请求已完成"
+        severity = "success"
+        root_cause = "request_completed"
+        scope = final.failure_scope or "request"
+        suggestion = "无需处理。"
+        actions: List[Dict[str, str]] = []
+        cooldown_applied = any(bool(l.cooldown_applied) for l in logs)
+        if "waf_lock_wait_timeout" in text or "candidate_busy" in text or "large_task_in_progress" in text:
+            title = "候选忙 / 等待 WAF 锁超时"
+            severity = "warning"
+            root_cause = "candidate_busy"
+            scope = "local_lock"
+            suggestion = "候选正在处理大上下文请求，系统已尝试切换到下一个候选；通常无需清冷却。"
+        elif "stream_idle_timeout" in text:
+            title = "上游流式响应空闲超时"
+            severity = "error"
+            root_cause = "stream_idle_timeout"
+            scope = "upstream"
+            suggestion = "建议稍后重试，或对冷却中的单个模型/成员执行“重试恢复”。"
+            actions.append({"type": "recover", "label": "重试恢复冷却对象"})
+        elif "read_timeout" in text or "timed out" in text or "timeout" in text and "waf_lock" not in text:
+            title = "上游请求超时"
+            severity = "error"
+            root_cause = "upstream_timeout"
+            scope = "upstream"
+            suggestion = "如果该候选已进入冷却，可单点重试恢复；如果频繁出现，建议降低优先级或检查中转站。"
+            actions.append({"type": "recover", "label": "重试恢复冷却对象"})
+        elif "waf_blocked" in text or "request_level" in text or "upstream_request_rejected" in text:
+            title = "请求级错误 / 上游拒绝请求"
+            severity = "warning"
+            root_cause = "request_level_error"
+            scope = "request"
+            cooldown_applied = False
+            suggestion = "请检查请求参数、内容策略或 WAF 兼容设置；这类错误不会判定为模型健康失败。"
+        elif "auth_error" in text or "401" in text or "403" in text:
+            title = "鉴权失败"
+            severity = "error"
+            root_cause = "auth_error"
+            scope = "candidate"
+            suggestion = "请检查该连接组或模型的 API Key / Route Key 是否正确。"
+        elif "rate_limit" in text or "429" in text:
+            title = "上游限流"
+            severity = "warning"
+            root_cause = "rate_limit"
+            scope = "upstream"
+            suggestion = "建议稍后重试，或临时切换到其他候选。"
+        elif "server_error" in text or " 5" in text or "network" in text:
+            title = "上游健康失败"
+            severity = "error"
+            root_cause = "upstream_error"
+            scope = "upstream"
+            suggestion = "系统会对真实上游故障写入冷却；可在确认恢复后单点重试。"
+            actions.append({"type": "recover", "label": "重试恢复冷却对象"})
+        return {
+            "title": title,
+            "severity": severity,
+            "root_cause": root_cause,
+            "failure_scope": scope,
+            "cooldown_applied": cooldown_applied,
+            "suggestion": suggestion,
+            "request_id": logs[0].request_id if logs else "",
+            "related_events": len(logs),
+            "actions": actions,
+            "technical_summary": self._sanitize_detail(final.detail)[:500],
+        }
+
+    def _manual_probe_candidate(self, candidate: UpstreamCandidate) -> Tuple[bool, str, str]:
+        """对单个候选执行最小非流式探测，不计入正式请求与收益统计。"""
+        if not candidate.auth_key:
+            return False, "missing_upstream_api_key", "缺少上游 API Key"
+        target_url = self._resolve_url(candidate.group.base_url, "/v1/chat/completions")
+        payload = {
+            "model": candidate.target_model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "stream": False,
+        }
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        headers = self._headers_for(candidate.group, candidate.auth_key, {}, stream=False)
+        upstream_lock = self._candidate_lock(candidate)
+        acquired, _ = self._acquire_upstream_lock(upstream_lock, timeout=5.0)
+        if not acquired:
+            return False, "waf_lock_wait_timeout", "候选忙，等待 WAF 锁超时"
+        try:
+            with self._upstream_client.request("POST", target_url, headers, body, stream=False, timeout=20) as resp:
+                resp.read()
+                if 200 <= int(resp.status) < 300:
+                    return True, "probe_ok", "最小探测成功"
+                return False, f"http_{resp.status}", f"上游返回 HTTP {resp.status}"
+        except HTTPError as err:
+            raw = err.read().decode("utf-8", "ignore") if hasattr(err, "read") else str(err)
+            classification = self._classify_candidate_error(err.code, raw, "http")
+            return False, classification["log_reason"], self._short_error(raw)
+        except (URLError, TimeoutError, OSError) as err:
+            return False, "network", self._short_error(str(err))
+        finally:
+            self._release_lock(upstream_lock)
+
+    def recover_model(self, model_id: str) -> Dict[str, Any]:
+        model = self.store.find_model(model_id)
+        if not model:
+            return {"ok": False, "message": "模型不存在", "code": "model_not_found"}
+        if model.disabled_by_user or (not model.usable and not model.cooldown_until):
+            return {"ok": False, "message": "该模型为手动停用状态，请先手动启用；系统不会自动恢复手动停用模型。", "code": "manual_disabled"}
+        group = self.store.find_group(model.group_id)
+        if not group:
+            return {"ok": False, "message": "模型所属连接组不存在，无法执行探测。", "code": "group_not_found"}
+        before = asdict(model)
+        candidate = self._candidate_from_model(self.store.models.index(model), model, group)
+        ok, reason, detail = self._manual_probe_candidate(candidate)
+        if not ok:
+            self._set_cooldown(candidate.idx, detail, self._auto_cooldown_seconds(group), reason)
+            self.add_log("/api/models/recover", model.name, "probe_failed", f"manual_probe=true; model_id={model.id}; probe_result=failed; reason={reason}; detail={detail}; cooldown_applied=true; failure_scope=upstream", event="manual_probe", usage_source="manual_probe", cooldown_applied=True, failure_scope="upstream")
+            return {"ok": False, "message": "最小探测未通过，模型保持冷却，请稍后重试或检查上游服务。", "code": "probe_failed", "before": before, "model": asdict(model)}
+        model.cooldown_until = 0
+        model.cooldown_reason = ""
+        model.last_error = ""
+        model.usable = True
+        model.disabled_by_user = False
+        model.last_success_at = self._now()
+        model.last_checked_at = model.last_success_at
+        self.store.save()
+        self.add_log("/api/models/recover", model.name, "probe_ok", f"manual_probe=true; model_id={model.id}; probe_result=success; cooldown_applied=false; failure_scope=manual", event="manual_probe", usage_source="manual_probe")
+        return {"ok": True, "message": "最小探测成功，已恢复该模型参与调度。", "model": asdict(model), "before": before}
+
+    def recover_aggregate_member(self, member_id: str) -> Dict[str, Any]:
+        member = self.store.find_aggregate_member(member_id)
+        if not member:
+            return {"ok": False, "message": "成员不存在", "code": "aggregate_member_not_found"}
+        if member.enabled is False:
+            return {"ok": False, "message": "该聚合成员已手动停用，请先手动启用；系统不会自动恢复手动停用成员。", "code": "manual_disabled"}
+        model = self.store.find_model(member.model_id)
+        group = self.store.find_group(member.group_id)
+        aggregate = self.store.find_aggregate(member.aggregate_id)
+        if not model or not group:
+            return {"ok": False, "message": "成员底层模型或连接组不存在，无法执行探测。", "code": "member_target_missing"}
+        if model.disabled_by_user or not model.usable and not model.cooldown_until:
+            return {"ok": False, "message": "底层模型为手动停用状态，不能自动恢复聚合成员。", "code": "underlying_manual_disabled"}
+        before = asdict(member)
+        candidate = self._candidate_from_model(self.store.models.index(model), model, group)
+        ok, reason, detail = self._manual_probe_candidate(candidate)
+        if not ok:
+            self._set_aggregate_member_cooldown(member.id, detail, self._aggregate_cooldown_seconds(aggregate) if aggregate else self._auto_cooldown_seconds(group), reason)
+            self.add_log("/api/aggregate-members/recover", model.name, "probe_failed", f"manual_probe=true; aggregate_member_id={member.id}; probe_result=failed; reason={reason}; detail={detail}; cooldown_applied=true; failure_scope=upstream", event="manual_probe", usage_source="manual_probe", cooldown_applied=True, failure_scope="upstream")
+            return {"ok": False, "message": "最小探测未通过，成员保持冷却，请稍后重试或检查上游服务。", "code": "probe_failed", "before": before, "member": asdict(member)}
+        member.cooldown_until = 0
+        member.cooldown_reason = ""
+        member.last_error = ""
+        member.last_success_at = self._now()
+        member.last_checked_at = member.last_success_at
+        self.store.save()
+        self.add_log("/api/aggregate-members/recover", model.name, "probe_ok", f"manual_probe=true; aggregate_member_id={member.id}; probe_result=success; cooldown_applied=false; failure_scope=manual", event="manual_probe", usage_source="manual_probe")
+        return {"ok": True, "message": "最小探测成功，已恢复该聚合成员参与调度。", "member": asdict(member), "before": before}
     def _iter_upstream_candidates(self, requested_model: str | None, group_id: str | None = None) -> Iterator[UpstreamCandidate]:
         # 旧全局 Key 已退役，不再跨组调度真实模型
         if group_id == GLOBAL_ROUTE_GROUP_ID:
@@ -2371,6 +2609,7 @@ class ArkProxyRouter:
         # auto_fallback：组级 auto 或聚合模型下，失败时尝试下一个候选（全局 Key 已退役）
         auto_fallback = auto_mode or bool(route_aggregate)
         request_id = uuid.uuid4().hex[:12]
+        self._live_request_start(request_id, path, requested_label, stream=False)
         attempt = 0
         last_error: Optional[Exception] = None
         saw_cooldown = False
@@ -2396,6 +2635,16 @@ class ArkProxyRouter:
             attempt += 1
             group = candidate.group
             target_url = self._resolve_url(group.base_url, path)
+            self._live_request_update(
+                request_id,
+                stage="preparing_upstream",
+                stage_label="准备上游请求",
+                group=group.name,
+                candidate=candidate.label,
+                model=candidate.label,
+                aggregate_model=aggregate_model.name if aggregate_model else "",
+                attempt=attempt,
+            )
             is_aggregate_candidate = bool(candidate.aggregate_member_id)
             selection_reason = "priority_first" if fallback_index == 0 else "fallback_after_failure"
             aggregate_suffix = ""
@@ -2428,8 +2677,11 @@ class ArkProxyRouter:
             outbound_headers = self._headers_for(group, candidate.auth_key, incoming_headers, stream=False)
             upstream_lock = self._candidate_lock(candidate)
             started_at = time.perf_counter()
+            if upstream_lock:
+                self._live_request_update(request_id, stage="waiting_waf_lock", stage_label="等待 WAF 锁")
             acquired, lock_wait_ms = self._acquire_upstream_lock(upstream_lock)
             if not acquired:
+                self._live_request_update(request_id, stage="candidate_busy", stage_label="候选忙/等待锁超时", possible_reason="候选正在处理大上下文请求，已临时切换")
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 self.add_log(
                     path,
@@ -2446,10 +2698,13 @@ class ArkProxyRouter:
                 )
                 if auto_fallback:
                     continue
+                self._live_request_finish(request_id, "error")
                 return 503, {"Content-Type": "application/json; charset=utf-8"}, [json.dumps({"error": {"message": "候选正在处理大上下文请求，已临时切换到下一个候选", "type": "timeout", "code": "waf_lock_wait_timeout", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")]
             try:
+                self._live_request_update(request_id, stage="connecting_upstream", stage_label="连接上游")
                 resp = self._upstream_client.request("POST", target_url, outbound_headers, body, stream=False, timeout=120)
                 with resp:
+                    self._live_request_update(request_id, stage="receiving_response", stage_label="接收响应")
                     data = resp.read()
                     duration_ms = int((time.perf_counter() - started_at) * 1000)
                     prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens = self._usage_from_response(data)
@@ -2487,6 +2742,7 @@ class ArkProxyRouter:
                         )
                     except Exception:
                         pass
+                    self._live_request_finish(request_id, "done")
                     return resp.status, dict(resp.headers.items()), data
             except HTTPError as err:
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
@@ -2547,6 +2803,7 @@ class ArkProxyRouter:
                                 event="retry_ok",
                                 cooldown_applied=False,
                             )
+                            self._live_request_finish(request_id, "done")
                             return resp.status, dict(resp.headers.items()), data
                     except Exception as retry_err:
                         last_error = retry_err
@@ -2591,6 +2848,7 @@ class ArkProxyRouter:
                 headers = dict(getattr(err, "headers", {}) or {})
                 detail = f"error={self._short_error(raw)}"
                 self.add_log(path, candidate.label, str(err.code), self._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="error", cooldown_applied=False)
+                self._live_request_finish(request_id, "error")
                 return err.code, headers, raw.encode("utf-8")
             except (URLError, TimeoutError, OSError) as err:
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
@@ -2650,6 +2908,7 @@ class ArkProxyRouter:
                 self._release_lock(upstream_lock)
 
         if aggregate_model:
+            self._live_request_finish(request_id, "error")
             if not saw_cooldown and saw_request_level:
                 raise AllModelsFailedError(
                     f"聚合模型 {aggregate_model.name} 的所有成员均因请求级错误被拒绝{self._waf_blocked_hint(fallback_chain)}",
@@ -2665,6 +2924,7 @@ class ArkProxyRouter:
                 fallback_chain=fallback_chain,
                 aggregate_name=aggregate_model.name,
             )
+        self._live_request_finish(request_id, "error")
         if last_error is None:
             raise AllModelsFailedError("没有可用模型", attempted=attempt, error_code="no_usable_models")
         if not saw_cooldown and saw_request_level:
@@ -2698,6 +2958,7 @@ class ArkProxyRouter:
         auto_mode = self._is_auto_model(str(requested_model) if requested_model else None, route_group)
         auto_fallback = auto_mode or bool(route_aggregate)
         request_id = uuid.uuid4().hex[:12]
+        self._live_request_start(request_id, path, requested_label, stream=True)
         attempt = 0
         last_error: Optional[Exception] = None
         saw_stream_timeout = False
@@ -2724,6 +2985,16 @@ class ArkProxyRouter:
             attempt += 1
             group = candidate.group
             target_url = self._resolve_url(group.base_url, path)
+            self._live_request_update(
+                request_id,
+                stage="preparing_upstream",
+                stage_label="准备上游流式请求",
+                group=group.name,
+                candidate=candidate.label,
+                model=candidate.label,
+                aggregate_model=aggregate_model.name if aggregate_model else "",
+                attempt=attempt,
+            )
             idle_timeout = self._stream_idle_timeout_seconds(group)
             is_aggregate_candidate = bool(candidate.aggregate_member_id)
             selection_reason = "priority_first" if fallback_index == 0 else "fallback_after_failure"
@@ -2758,8 +3029,11 @@ class ArkProxyRouter:
             upstream_lock = self._candidate_lock(candidate)
             resp: Optional[Any] = None
             started_at = time.perf_counter()
+            if upstream_lock:
+                self._live_request_update(request_id, stage="waiting_waf_lock", stage_label="等待 WAF 锁")
             acquired, lock_wait_ms = self._acquire_upstream_lock(upstream_lock)
             if not acquired:
+                self._live_request_update(request_id, stage="candidate_busy", stage_label="候选忙/等待锁超时", possible_reason="候选正在处理大上下文请求，已临时切换")
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 self.add_log(
                     path,
@@ -2777,9 +3051,12 @@ class ArkProxyRouter:
                 if auto_fallback:
                     continue
                 error_body = json.dumps({"error": {"message": "候选正在处理大上下文请求，已临时切换到下一个候选", "type": "timeout", "code": "waf_lock_wait_timeout", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
+                self._live_request_finish(request_id, "error")
                 return 503, {"Content-Type": "application/json; charset=utf-8"}, [error_body], request_id
             try:
+                self._live_request_update(request_id, stage="connecting_upstream", stage_label="连接上游")
                 resp = self._upstream_client.request("POST", target_url, outbound_headers, body, stream=True, timeout=120)
+                self._live_request_update(request_id, stage="waiting_first_byte", stage_label="等待首包")
                 first_chunk = self._readline_with_idle_timeout(resp, idle_timeout)
                 if not first_chunk:
                     raise URLError("upstream stream closed before first chunk")
@@ -2803,6 +3080,7 @@ class ArkProxyRouter:
                     aggregate_suffix=aggregate_suffix,
                 )
                 self.add_log(path, candidate.label, "200", detail, duration_ms, *latest_usage, group=group, request_id=request_id, attempt=attempt, event="stream_ok")
+                self._live_request_update(request_id, stage="streaming", stage_label="接收流式响应")
                 self._mark_stream_active(candidate, 1)
                 try:
                     self.debug_capture.capture(
@@ -2888,6 +3166,7 @@ class ArkProxyRouter:
                             lifecycle_status = "client_disconnected"
                             lifecycle_result = "client_disconnected"
                         self.update_latest_stream_usage(request_id, usage_total, usage_source, lock_wait_ms=lock_wait_ms, lock_release_reason=release_reason)
+                        self._live_request_finish(request_id, "done" if stream_state["completed_normally"] else "ended")
                         lifecycle_detail = self._debug_detail(
                             candidate,
                             requested_label,
@@ -3089,6 +3368,7 @@ class ArkProxyRouter:
                 continue
 
         if aggregate_model:
+            self._live_request_finish(request_id, "error")
             if not saw_cooldown and saw_request_level:
                 raise AllModelsFailedError(
                     f"聚合模型 {aggregate_model.name} 的所有成员均因请求级错误被拒绝{self._waf_blocked_hint(fallback_chain)}",
@@ -3106,6 +3386,7 @@ class ArkProxyRouter:
                 fallback_chain=fallback_chain,
                 aggregate_name=aggregate_model.name,
             )
+        self._live_request_finish(request_id, "error")
         if last_error is None:
             raise AllModelsFailedError(
                 "没有可用模型",
@@ -4049,7 +4330,17 @@ class RouterHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/runtime-state":
             params = parse_qs(parsed.query)
             include_skip = str((params.get("include_skip") or params.get("debug") or [""])[0] or "").lower() in {"1", "true", "yes", "on"}
-            self._send_json(self._runtime_state_payload(include_skip=include_skip))
+            payload = self._runtime_state_payload(include_skip=include_skip)
+            payload["live_requests"] = self.router.live_requests_payload().get("requests", [])
+            self._send_json(payload)
+            return
+        if parsed.path == "/api/live-requests":
+            self._send_json(self.router.live_requests_payload())
+            return
+        if parsed.path.startswith("/api/diagnose/"):
+            request_id = parsed.path.split("/api/diagnose/", 1)[1].strip("/")
+            payload = self.router.diagnose_request(request_id)
+            self._send_json(payload, status=200 if payload.get("ok") else 404)
             return
         if parsed.path.startswith("/api/aggregates/") and parsed.path.endswith("/stats"):
             parts = parsed.path.split("/")
@@ -4825,6 +5116,11 @@ class RouterHandler(BaseHTTPRequestHandler):
             payload = self._model_delete_preview(model_id)
             self._send_json(payload, status=200 if payload.get("ok") else 404)
             return
+        if parsed.path.startswith("/api/models/") and parsed.path.endswith("/recover"):
+            model_id = parsed.path.split("/")[3]
+            payload = self.router.recover_model(model_id)
+            self._send_json(payload, status=200 if payload.get("ok") else 400)
+            return
         if parsed.path.startswith("/api/aggregate-members/") and parsed.path.endswith("/sort-preview"):
             member_id = parsed.path.split("/")[3]
             payload_in = self._read_json()
@@ -4945,6 +5241,11 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self.store.clear_aggregate_member_cooldown(member_id, self.router._now())
                 self._send_json({"ok": True, "member": asdict(self.store.find_aggregate_member(member.id) or member)})
                 return
+        if parsed.path.startswith("/api/aggregate-members/") and parsed.path.endswith("/recover"):
+            member_id = parsed.path.split("/")[3]
+            payload = self.router.recover_aggregate_member(member_id)
+            self._send_json(payload, status=200 if payload.get("ok") else 400)
+            return
         if parsed.path == "/api/test":
             ctx = self._require_route_context()
             if not ctx:

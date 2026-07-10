@@ -93,6 +93,8 @@ def test_aggregate_stats_runtime_state_and_delete_preview():
         config_path = Path(tmp) / "config.json"
         write_config(config_path)
         server, port, _ = create_server("127.0.0.1", get_free_port(), config_path)
+        server.router.logs = []
+        server.router.log_file = Path(tmp) / "test-logs.jsonl"
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -212,8 +214,9 @@ def test_frontend_settings_and_log_detail_contracts():
     assert "applySettingSideEffects(key, value)" in settings_js
 
     assert "开启调试模式后显示" not in logs_js
-    assert "脱敏详情摘要" in logs_js
-    assert "this.detailSummary(item.detail, 500)" in logs_js
+    assert "技术细节（已脱敏）" in logs_js
+    assert "renderTechnicalDetails(detail)" in logs_js
+    assert "this.detailSummary(detail, 500)" in logs_js
     assert "完整 Request ID" in logs_js
     assert "debugMode ?" in logs_js
     assert "Utils.redactSensitive" in logs_js

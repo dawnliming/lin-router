@@ -5,6 +5,7 @@ const App = {
   _runtimeRefreshTimer: null,
 
   async init() {
+    this.restoreSidebarState();
     this.renderTopbar();
     this.renderFabs();
     Tree.init();
@@ -58,6 +59,7 @@ const App = {
       const patch = {
         logs: data.logs || Store.state.logs || [],
         log_write_error: data.log_write_error || '',
+        live_requests: data.live_requests || [],
       };
       if (data.models) {
         const runtimeById = new Map(data.models.map(item => [item.model_id, item]));
@@ -142,7 +144,17 @@ const App = {
 
   toggleSidebar() {
     this.sidebarCollapsed = !this.sidebarCollapsed;
-    document.querySelector('.app').classList.toggle('sidebar-collapsed', this.sidebarCollapsed);
+    this.applySidebarState();
+    localStorage.setItem('lin-router-sidebar-collapsed', this.sidebarCollapsed ? '1' : '0');
+  },
+
+  restoreSidebarState() {
+    this.sidebarCollapsed = localStorage.getItem('lin-router-sidebar-collapsed') === '1';
+    this.applySidebarState();
+  },
+
+  applySidebarState() {
+    document.querySelector('.app')?.classList.toggle('sidebar-collapsed', this.sidebarCollapsed);
     const btn = document.getElementById('sidebar-collapse');
     if (btn) btn.textContent = this.sidebarCollapsed ? '▶' : '◀';
   },

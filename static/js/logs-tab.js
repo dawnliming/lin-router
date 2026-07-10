@@ -206,7 +206,7 @@ const LogsTab = {
       const parsed = this.parseDetail(item.detail);
       if (parsed.skip_reason === 'member_disabled') return '已停用成员未参与';
     }
-    const map = { ok:'成功', stream_ok:'首包成功', retry_ok:'重试成功', cooldown:'冷却切换', fallback:'自动切换', skip:'跳过', network:'网络错误', error:'错误', system:'系统', stream_timeout:'流式超时', waf_lock_timeout:'候选忙', stream_done:'流式完成', stream_idle_timeout:'流式空闲超时', client_disconnected:'客户端断开' };
+    const map = { ok:'成功', stream_ok:'首包成功', retry_ok:'重试成功', cooldown:'冷却切换', fallback:'自动切换', skip:'跳过', network:'网络错误', error:'错误', system:'系统', stream_timeout:'流式超时', waf_lock_timeout:'候选忙', stream_done:'流式完成', stream_idle_timeout:'流式空闲超时', client_disconnected:'客户端断开', manual_probe:'人工探测' };
     return map[event] || event || '-';
   },
 
@@ -223,6 +223,18 @@ const LogsTab = {
       if (parsed[key] === 'true') warnings.push(label);
     });
     return warnings.length ? `<span class="pill warning">${Utils.escapeHtml(warnings.join(' / '))}</span>` : '-';
+  },
+
+  statusLabel(status) {
+    const value = String(status || '');
+    const map = {
+      probe_ok: '探测成功',
+      probe_failed: '探测失败',
+      network: '网络错误',
+      timeout: '请求超时',
+      busy: '候选忙',
+    };
+    return map[value] || value || '-';
   },
 
   statusClass(status, item = null) {
@@ -338,12 +350,12 @@ const LogsTab = {
         <td class="tiny">${Utils.escapeHtml(item.time)}</td>
         <td class="tiny">${Utils.escapeHtml(this.groupName(item))}</td>
         <td>${Utils.escapeHtml(item.model || '-')}</td>
-        <td><span class="pill ${this.statusClass(item.status, item)}">${Utils.escapeHtml(item.status)}</span></td>
+        <td><span class="pill ${this.statusClass(item.status, item)}">${Utils.escapeHtml(this.statusLabel(item.status))}</span></td>
         <td class="tiny">${Utils.escapeHtml(this.eventLabel(item.event, item))}</td>
         <td class="tiny">${Number(item.attempt || 0) || 1}</td>
         <td class="tiny">${Number(item.duration_ms || 0) ? `${Number(item.duration_ms)} ms` : '-'}</td>
         <td class="tiny">${Utils.escapeHtml(this.tokenSummary(item))}</td>
-        <td class="tiny result-text log-detail-preview" title="${Utils.escapeHtml(Utils.redactSensitive(item.detail || ''))}" data-log-detail-preview-key="${Utils.escapeHtml(key)}">${this.formatDetailPreview(item.detail)}</td>
+        <td class="tiny result-text log-detail-preview" title="${Utils.escapeHtml(this.formatDetailPreview(item))}" data-log-detail-preview-key="${Utils.escapeHtml(key)}">${Utils.escapeHtml(this.formatDetailPreview(item))}</td>
         <td><button type="button" data-log-detail-key="${Utils.escapeHtml(key)}">查看</button></td>
       </tr>
       <tr class="log-detail-row hidden" data-log-detail-row="${Utils.escapeHtml(key)}">
@@ -360,12 +372,19 @@ const LogsTab = {
     row.classList.toggle('hidden', !willOpen);
   },
 
-  formatDetailPreview(detail) {
-    if (!detail) return '-';
-    // 把分号分隔的 detail 做简单可读化处理
-    const text = Utils.redactSensitive(String(detail)).replace(/;/g, '; ');
-    const escaped = Utils.escapeHtml(text);
-    return escaped.length > 200 ? escaped.slice(0, 200) + '…' : escaped;
+  formatDetailPreview(item) {
+    const parsed = this.parseDetail(item?.detail);
+    const event = String(item?.event || '');
+    if (event === 'manual_probe') {
+      return String(item?.status || '') === 'probe_ok'
+        ? '最小探测成功，候选已恢复参与调度'
+        : '最小探测未通过，候选保持冷却';
+    }
+    if (event === 'stream_ok') return '首包成功，流式响应仍在进行';
+    if (event === 'stream_done' || event === 'stream_finalized') return '流式响应已完成';
+    if (event === 'client_disconnected') return '客户端已断开连接';
+    if (event === 'waf_lock_timeout') return '候选忙，等待锁超时后已切换';
+    return this.userFacingErrorReason(item || {}, parsed);
   },
 
   formatJsonBlock(value) {
@@ -463,7 +482,7 @@ const LogsTab = {
 
   renderWafHint(parsed) {
     if (parsed.waf_blocked !== 'true') return '';
-    const message = parsed.message || '上游中转站拦截了请求';
+    const message = '上游中转站拦截了本次请求。';
     const suggestion = parsed.suggestion || '';
     const wafOn = parsed.waf_compatible === 'true';
     const typeClass = wafOn ? 'log-waf-hint-open' : 'log-waf-hint-closed';
@@ -478,6 +497,105 @@ const LogsTab = {
     `;
   },
 
+  diagnosisFor(item, parsed) {
+    const text = `${item.status || ''} ${item.event || ''} ${item.failure_scope || ''} ${item.detail || ''}`.toLowerCase();
+    if (text.includes('waf_lock_wait_timeout') || text.includes('candidate_busy') || text.includes('large_task_in_progress')) {
+      return { className: 'warning', title: '候选忙 / 等待锁超时', scope: 'local_lock', cooldown: '否', suggestion: '候选正在处理大上下文请求，系统会临时切换到下一个候选；通常无需清冷却。' };
+    }
+    if (text.includes('stream_idle_timeout')) {
+      return { className: 'danger', title: '上游流式响应空闲超时', scope: 'upstream', cooldown: item.cooldown_applied ? '是' : '可能', suggestion: '建议稍后重试，或对冷却中的单个模型/成员点击“重试恢复”。' };
+    }
+    if ((text.includes('timeout') || text.includes('read_timeout')) && !text.includes('waf_lock')) {
+      return { className: 'danger', title: '上游请求超时', scope: 'upstream', cooldown: item.cooldown_applied ? '是' : '可能', suggestion: '若频繁出现，检查中转站状态；确认恢复后可单点重试恢复。' };
+    }
+    if (text.includes('waf_blocked') || text.includes('request_level') || text.includes('upstream_request_rejected')) {
+      return { className: 'warning', title: '请求级错误 / 上游拒绝', scope: 'request', cooldown: '否', suggestion: '请检查请求参数、内容策略或 WAF 兼容设置；这不会被诊断为模型健康失败。' };
+    }
+    if (text.includes('auth_error') || text.includes('401') || text.includes('403')) {
+      return { className: 'danger', title: '鉴权失败', scope: 'candidate', cooldown: '否', suggestion: '检查连接组或模型的 API Key / Route Key 是否正确。' };
+    }
+    if (text.includes('rate_limit') || text.includes('429')) {
+      return { className: 'warning', title: '上游限流', scope: 'upstream', cooldown: item.cooldown_applied ? '是' : '否', suggestion: '稍后重试，或临时切换到其他候选。' };
+    }
+    if (text.includes('server_error') || text.includes('network') || String(item.status || '').startsWith('5')) {
+      return { className: 'danger', title: '上游健康失败', scope: item.failure_scope || parsed.failure_scope || 'upstream', cooldown: item.cooldown_applied ? '是' : '否', suggestion: '真实上游故障会进入冷却；确认恢复后可单点重试。' };
+    }
+    if (String(item.status || '').startsWith('2')) {
+      return { className: 'success', title: '请求成功', scope: item.failure_scope || '-', cooldown: '否', suggestion: '无需处理。' };
+    }
+    return { className: 'info', title: '需要关注', scope: item.failure_scope || parsed.failure_scope || 'request', cooldown: item.cooldown_applied ? '是' : '否', suggestion: '请结合候选过滤详情和脱敏摘要继续排查。' };
+  },
+
+  renderDiagnosisCard(item, parsed) {
+    const d = this.diagnosisFor(item, parsed);
+    return `
+      <div class="diagnosis-card ${d.className}">
+        <div>
+          <div class="diagnosis-eyebrow">智能诊断</div>
+          <strong>${Utils.escapeHtml(d.title)}</strong>
+          <p>${Utils.escapeHtml(d.suggestion)}</p>
+        </div>
+        <dl>
+          <dt>影响范围</dt><dd>${Utils.escapeHtml(this.failureScopeLabel(d.scope))}</dd>
+          <dt>触发冷却</dt><dd>${Utils.escapeHtml(d.cooldown)}</dd>
+        </dl>
+      </div>`;
+  },
+
+  userFacingErrorReason(item, parsed) {
+    const text = `${item.status || ''} ${item.event || ''} ${item.failure_scope || ''} ${item.detail || ''}`.toLowerCase();
+    if (text.includes('waf_lock_wait_timeout') || text.includes('candidate_busy') || text.includes('large_task_in_progress')) return '候选正在处理请求，等待 WAF 锁超时后已尝试切换';
+    if (text.includes('stream_idle_timeout')) return '上游流式响应长时间无数据，已判定为空闲超时';
+    if (text.includes('read_timeout') || (text.includes('timeout') && !text.includes('waf_lock'))) return '上游响应超时';
+    if (text.includes('waf_blocked')) return '上游中转站的 WAF 拦截了请求';
+    if (text.includes('auth_error') || text.includes('401') || text.includes('403')) return '上游鉴权失败，请检查 API Key 或权限';
+    if (text.includes('rate_limit') || text.includes('429')) return '上游触发限流，请稍后重试';
+    if (text.includes('request_level') || text.includes('upstream_request_rejected')) return '请求参数或内容策略被上游拒绝';
+    if (text.includes('network')) return '连接上游网络失败';
+    if (text.includes('server_error') || String(item.status || '').startsWith('5')) return '上游服务暂时异常';
+    if (String(item.status || '').startsWith('2')) return '请求成功';
+    if (parsed.skip_reason) return this.skipReasonLabel(parsed.skip_reason);
+    return '请求未完成，请查看下方诊断与技术细节';
+  },
+
+  userFacingFallbackReason(item, parsed) {
+    const reason = String(this.firstValue(parsed.fallback_reason, parsed.selection_reason, parsed.skip_reason, '') || '');
+    const map = {
+      priority_first: '按优先级选择首个候选',
+      fallback_after_failure: '前一候选失败后自动切换',
+      large_task_in_progress: '候选正在处理大上下文请求，已切换',
+      candidate_busy: '候选忙 / 等待锁超时，已切换',
+      member_disabled: '已停用成员未参与',
+      member_cooling: '成员冷却中，未参与',
+      underlying_model_disabled: '底层模型已停用，未参与',
+      underlying_model_cooling: '底层模型冷却中，未参与'
+    };
+    return map[reason] || (reason ? '系统已根据当前调度状态处理候选切换' : '-');
+  },
+
+  failureScopeLabel(scope) {
+    const map = {
+      upstream: '上游服务',
+      request: '本次请求',
+      busy: '候选繁忙',
+      local_lock: '本地候选锁',
+      candidate: '单个候选',
+      manual: '人工探测',
+    };
+    const value = String(scope || '');
+    if (!value || value === '-') return '-';
+    return map[value] || (/[\u4e00-\u9fff]/.test(value) ? value : '其他');
+  },
+
+  renderTechnicalDetails(detail) {
+    if (!detail) return '';
+    return `
+      <details class="log-technical-details">
+        <summary>技术细节（已脱敏）</summary>
+        <div class="log-detail-raw">${this.detailSummary(detail, 500)}</div>
+      </details>
+    `;
+  },
   detailHtml(item) {
     const parsed = this.parseDetail(item.detail);
     const debugMode = Store.state.settings?.debug_mode === true;
@@ -492,10 +610,11 @@ const LogsTab = {
     ];
     const aggregateChain = isAggregate ? this.renderAggregateChain(parsed) : '';
     const candidateFilterDetails = this.renderCandidateFilterDetails(item);
+    const diagnosisCard = this.renderDiagnosisCard(item, parsed);
     const requestIdDisplay = debugMode ? (item.request_id || '-') : this.shortId(item.request_id || '-');
     const memberIdDisplay = debugMode ? this.firstValue(item.aggregate_member_id, parsed.aggregate_member_id) : this.shortId(this.firstValue(item.aggregate_member_id, parsed.aggregate_member_id));
-    const errorReason = this.firstValue(parsed.error, parsed.error_reason, parsed.message, parsed.skip_reason, parsed.cooldown_reason, item.error, item.status);
-    const fallbackReason = this.firstValue(parsed.fallback_reason, parsed.selection_reason, parsed.skip_reason);
+    const errorReason = this.userFacingErrorReason(item, parsed);
+    const fallbackReason = this.userFacingFallbackReason(item, parsed);
     const cooldownApplied = this.firstValue(item.cooldown_applied, parsed.cooldown_applied, parsed.cooldown_reason ? 'true' : 'false');
     const deepDiagnostics = debugMode ? `
       <div class="log-detail-block log-detail-raw-block">
@@ -515,13 +634,14 @@ const LogsTab = {
     ` : '';
     return `
       ${wafHint}
+      ${diagnosisCard}
       <div class="log-detail-grid">
         <div class="log-detail-block">
           <h4>基础信息</h4>
           <dl>
             <dt>时间</dt><dd>${Utils.escapeHtml(item.time)}</dd>
             <dt>耗时</dt><dd>${Number(item.duration_ms || 0) ? `${Number(item.duration_ms)} ms` : '-'}</dd>
-            <dt>状态</dt><dd><span class="pill ${this.statusClass(item.status, item)}">${Utils.escapeHtml(item.status)}</span> ${Utils.escapeHtml(this.eventLabel(item.event, item))}</dd>
+            <dt>状态</dt><dd><span class="pill ${this.statusClass(item.status, item)}">${Utils.escapeHtml(this.statusLabel(item.status))}</span> ${Utils.escapeHtml(this.eventLabel(item.event, item))}</dd>
             <dt>请求 ID / 次</dt><dd>${Utils.escapeHtml(requestIdDisplay)} / ${Number(item.attempt || 0) || 1}</dd>
             <dt>成员 ID</dt><dd>${Utils.escapeHtml(memberIdDisplay)}</dd>
           </dl>
@@ -541,8 +661,8 @@ const LogsTab = {
           <dl>
             <dt>错误原因</dt><dd>${Utils.escapeHtml(errorReason)}</dd>
             <dt>Fallback 原因</dt><dd>${Utils.escapeHtml(fallbackReason)}</dd>
-            <dt>Failure Scope</dt><dd>${Utils.escapeHtml(this.firstValue(item.failure_scope, parsed.failure_scope))}</dd>
-            <dt>Cooldown Applied</dt><dd>${Utils.escapeHtml(String(cooldownApplied))}</dd>
+            <dt>影响范围</dt><dd>${Utils.escapeHtml(this.failureScopeLabel(this.firstValue(item.failure_scope, parsed.failure_scope, '')))}</dd>
+            <dt>触发冷却</dt><dd>${Utils.escapeHtml(String(cooldownApplied) === 'true' ? '是' : '否')}</dd>
             <dt>WAF 兼容</dt><dd>${Utils.escapeHtml(parsed.waf_compatible || '-')}</dd>
             <dt>WAF 锁</dt><dd>${Utils.escapeHtml(parsed.waf_lock_enabled || '-')}</dd>
             <dt>等待锁</dt><dd>${Utils.escapeHtml(parsed.lock_wait_ms ? parsed.lock_wait_ms + ' ms' : '-')}</dd>
@@ -552,10 +672,8 @@ const LogsTab = {
       </div>
       ${aggregateChain}
       ${candidateFilterDetails}
-      <div class="log-detail-block log-detail-raw-block" style="margin-top:10px;">
-        <h4>脱敏详情摘要</h4>
-        <div class="log-detail-raw">${this.detailSummary(item.detail, 500)}</div>
-      </div>
+      ${this.renderTechnicalDetails(item.detail)}
+
       ${deepDiagnostics}
     `;
   },
