@@ -17,9 +17,28 @@ class DebugCapture:
     仅用于本地调试，不进入 git，不写入日志正文。
     """
 
-    def __init__(self, router: Any, settings_store: Any) -> None:
+    def __init__(
+        self,
+        router: Any,
+        settings_store: Any,
+        *,
+        browser_user_agent: str = "",
+        ssl_context: Any = None,
+        empty_usage: Any = None,
+        usage_from_stream_chunk: Any = None,
+    ) -> None:
         self.router = router
         self.settings_store = settings_store
+        # 保留旧的两参数构造兼容：有 Router 时从其注入的诊断依赖恢复原 replay 语义；
+        # app.py 的显式参数仍优先，避免本模块反向 import app。
+        self._browser_user_agent = browser_user_agent or getattr(router, "_debug_capture_browser_user_agent", "")
+        self._ssl_context = ssl_context if ssl_context is not None else getattr(router, "_debug_capture_ssl_context", None)
+        self._empty_usage = empty_usage or getattr(router, "_empty_usage", None) or (lambda: (0, 0, 0, 0, 0))
+        self._usage_from_stream_chunk = (
+            usage_from_stream_chunk
+            or getattr(router, "_usage_from_stream_chunk", None)
+            or self._empty_usage
+        )
 
     def _enabled(self) -> bool:
         if self.settings_store is None:
@@ -148,8 +167,7 @@ class DebugCapture:
         }
         if not waf_off_variant and group.waf_compatible:
             # WAF 模式下补浏览器 UA
-            from app import BROWSER_UA
-            headers["user-agent"] = BROWSER_UA
+            headers["user-agent"] = self._browser_user_agent
 
         # 找 auth key
         model = self.router.store.find_model_by_group_ep(group.id, target_model)
@@ -173,8 +191,7 @@ class DebugCapture:
         if client_type:
             http2 = bool(self.settings_store.get("upstream_http2", False)) if self.settings_store else False
             keepalive = bool(self.settings_store.get("upstream_keepalive", False)) if self.settings_store else False
-            from app import _ssl_context
-            upstream_client = UpstreamClient(client_type=client_type, http2=http2, keepalive=keepalive, ssl_context=_ssl_context)
+            upstream_client = UpstreamClient(client_type=client_type, http2=http2, keepalive=keepalive, ssl_context=self._ssl_context)
 
         target_url = self.router._resolve_url(replay_group.base_url, path)
         results: List[Dict[str, Any]] = []
@@ -202,14 +219,12 @@ class DebugCapture:
         group: Any,
         idx: int,
     ) -> Dict[str, Any]:
-        from app import ArkProxyRouter
-
         started_at = time.perf_counter()
         try:
             resp = upstream_client.request("POST", target_url, headers, body, stream=True, timeout=120)
         except Exception as exc:
             return {"index": idx, "status": "error", "error": str(exc)}
-        usage_total = ArkProxyRouter._empty_usage()
+        usage_total = self._empty_usage()
         status = getattr(resp, "status", 200)
         http_version = getattr(resp, "http_version", "")
         try:
@@ -217,7 +232,7 @@ class DebugCapture:
                 chunk = resp.readline(120)
                 if not chunk:
                     break
-                usage = ArkProxyRouter._usage_from_stream_chunk(chunk)
+                usage = self._usage_from_stream_chunk(chunk)
                 if any(usage):
                     usage_total = usage
         except Exception:
