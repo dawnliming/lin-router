@@ -556,3 +556,452 @@ class CandidateRuntime:
             attempted=attempt,
             error_code="all_models_failed",
         ) from last_error
+
+    def execute_stream(self, path: str, payload: Dict[str, Any], route: Any = None, incoming_headers: Optional[Dict[str, str]] = None, raw_body: bytes | None = None) -> Any:
+        """Execute the frozen stream candidate/request/fallback chain via the router facade."""
+        router = self.router
+        router.store.refresh_expired_cooldowns()
+        incoming_headers = incoming_headers or {}
+        requested_model = payload.get("model")
+        requested_label = str(requested_model) if requested_model else DEFAULT_AUTO_MODEL_NAME
+        group_id = router._route_group_id(route)
+        route_group = route.group if isinstance(route, router._route_context_type) else router.store.find_group(group_id) if group_id else None
+        is_deprecated_global = isinstance(route, router._route_context_type) and route.is_deprecated_global
+        if is_deprecated_global:
+            def deprecated_iter():
+                yield json.dumps({"error": {"message": "全局 Key 已停用，请改用连接组 Key 或聚合模型 Key", "type": "global_key_deprecated", "code": "use_group_or_aggregate_key"}}, ensure_ascii=False).encode("utf-8")
+            return 403, {"Content-Type": "application/json; charset=utf-8"}, deprecated_iter()
+        route_aggregate = route.aggregate if isinstance(route, router._route_context_type) else None
+        is_global = isinstance(route, router._route_context_type) and route.is_global
+        auto_mode = router._is_auto_model(str(requested_model) if requested_model else None, route_group)
+        auto_fallback = auto_mode or bool(route_aggregate)
+        request_id = uuid.uuid4().hex[:12]
+        router._live_request_start(request_id, path, requested_label, stream=True)
+        attempt = 0
+        last_error: Optional[Exception] = None
+        saw_stream_timeout = False
+        saw_cooldown = False
+        saw_request_level = False
+
+        # 聚合模型解析
+        aggregate_info = router._resolve_aggregate(
+            str(requested_model) if requested_model else None,
+            route,
+        )
+        aggregate_model: Optional[AggregateModel] = None
+        resolved_as = ""
+        fallback_index = 0
+        fallback_chain: List[Dict[str, Any]] = []
+        if aggregate_info:
+            aggregate_model, resolved_as = aggregate_info
+            auto_fallback = True
+            candidates_iter = router._iter_aggregate_candidates(aggregate_model, log_skips=True, path=path, requested_label=requested_label, request_id=request_id, resolved_as=resolved_as)
+        else:
+            candidates_iter = router._iter_upstream_candidates(str(requested_model) if requested_model else None, group_id)
+
+        for candidate in candidates_iter:
+            attempt += 1
+            group = candidate.group
+            target_url = router._resolve_url(group.base_url, path)
+            router._live_request_update(
+                request_id,
+                stage="preparing_upstream",
+                stage_label="准备上游流式请求",
+                group=group.name,
+                candidate=candidate.label,
+                model=candidate.label,
+                aggregate_model=aggregate_model.name if aggregate_model else "",
+                attempt=attempt,
+            )
+            idle_timeout = router._stream_idle_timeout_seconds(group)
+            is_aggregate_candidate = bool(candidate.aggregate_member_id)
+            selection_reason = "priority_first" if fallback_index == 0 else "fallback_after_failure"
+            aggregate_suffix = ""
+            if is_aggregate_candidate and aggregate_model:
+                model_name = candidate.model.name if candidate.model else ""
+                aggregate_suffix = router._aggregate_log_suffix(
+                    resolved_as=resolved_as,
+                    aggregate_model=aggregate_model.name,
+                    aggregate_id=aggregate_model.id,
+                    selected_group=group.name,
+                    selected_model=model_name,
+                    selected_upstream_model=candidate.target_model,
+                    selection_reason=selection_reason,
+                    fallback_index=fallback_index,
+                    fallback_chain=fallback_chain,
+                    strategy=aggregate_model.strategy or "priority",
+                    manual_price=candidate.manual_price,
+                )
+            if not candidate.auth_key:
+                skip_detail = f"requested={requested_label}; missing upstream api key"
+                if aggregate_suffix:
+                    skip_detail += "; " + aggregate_suffix
+                router.add_log(path, candidate.label, "skip", skip_detail, group=group, request_id=request_id, attempt=attempt, event="skip")
+                continue
+            payload_for_upstream = payload
+            tools_normalized = False
+            if router._tools_order_enabled():
+                payload_for_upstream, tools_normalized = router._normalize_tools_order(payload)
+            body, body_mode = router._body_for_upstream(payload_for_upstream, raw_body, str(requested_model) if requested_model else None, candidate.target_model)
+            outbound_headers = router._headers_for(group, candidate.auth_key, incoming_headers, stream=True)
+            upstream_lock = router._candidate_lock(candidate, incoming_headers)
+            resp: Optional[Any] = None
+            started_at = time.perf_counter()
+            if upstream_lock:
+                router._live_request_update(request_id, stage="waiting_waf_lock", stage_label="等待 WAF 锁")
+            acquired, lock_wait_ms = router._acquire_upstream_lock(upstream_lock)
+            if not acquired:
+                router._live_request_update(request_id, stage="candidate_busy", stage_label="候选忙/等待锁超时", possible_reason="候选正在处理大上下文请求，已临时切换")
+                duration_ms = int((time.perf_counter() - started_at) * 1000)
+                router.add_log(
+                    path,
+                    candidate.label,
+                    "timeout",
+                    router._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, router._waf_lock_busy_detail(candidate, body, lock_wait_ms), lock_wait_ms=lock_wait_ms, aggregate_suffix=aggregate_suffix),
+                    duration_ms,
+                    group=group,
+                    request_id=request_id,
+                    attempt=attempt,
+                    event="waf_lock_timeout",
+                    cooldown_applied=False,
+                    failure_scope="busy",
+                )
+                if auto_fallback:
+                    continue
+                error_body = json.dumps({"error": {"message": "候选正在处理大上下文请求，已临时切换到下一个候选", "type": "timeout", "code": "waf_lock_wait_timeout", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
+                router._live_request_finish(request_id, "error")
+                return 503, {"Content-Type": "application/json; charset=utf-8"}, [error_body], request_id
+            try:
+                router._live_request_update(request_id, stage="connecting_upstream", stage_label="连接上游")
+                resp = router._upstream_client.request("POST", target_url, outbound_headers, body, stream=True, timeout=120)
+                router._live_request_update(request_id, stage="waiting_first_byte", stage_label="等待首包")
+                first_chunk = router._readline_with_idle_timeout(resp, idle_timeout)
+                if not first_chunk:
+                    raise URLError("upstream stream closed before first chunk")
+                duration_ms = int((time.perf_counter() - started_at) * 1000)
+                latest_usage = router._usage_from_stream_chunk(first_chunk)
+                router._mark_success(candidate)
+                if candidate.aggregate_member_id:
+                    router._mark_aggregate_member_success(candidate.aggregate_member_id)
+                detail = router._debug_detail(
+                    candidate,
+                    requested_label,
+                    target_url,
+                    body_mode,
+                    body,
+                    payload_for_upstream,
+                    outbound_headers,
+                    f"stream ok; first_byte_ms={duration_ms}; stream_started_at_ms={int(time.time() * 1000) - duration_ms}; "
+                    f"idle_timeout_seconds={idle_timeout}; initial_chunks_received=1; initial_bytes_received={len(first_chunk)}; "
+                    f"chunks_received=1; bytes_received={len(first_chunk)}; final_result=streaming",
+                    resp=resp,
+                    tools_normalized=tools_normalized,
+                    lock_wait_ms=lock_wait_ms,
+                    aggregate_suffix=aggregate_suffix,
+                )
+                router.add_log(path, candidate.label, "streaming", detail, duration_ms, *latest_usage, group=group, request_id=request_id, attempt=attempt, event="stream_ok")
+                router._live_request_update(request_id, stage="streaming", stage_label="接收流式响应")
+                router._mark_stream_active(candidate, 1)
+                try:
+                    router.debug_capture.capture(
+                        path=path,
+                        group=group,
+                        model=candidate.label,
+                        target_model=candidate.target_model,
+                        body=body,
+                        body_mode=body_mode,
+                        headers=outbound_headers,
+                        fingerprint=router._payload_fingerprint(payload_for_upstream, body, urlparse(target_url).path, tools_normalized=tools_normalized),
+                        request_id=request_id,
+                        usage_source="",
+                    )
+                except Exception:
+                    pass
+
+                def iterator() -> Iterator[bytes]:
+                    usage_total = latest_usage
+                    chunks_received = 1
+                    bytes_received = len(first_chunk)
+                    stream_state = {"timeout": False, "completed_normally": False}
+                    release_reason = "client_disconnect"
+                    try:
+                        yield first_chunk
+                        while True:
+                            try:
+                                chunk = router._readline_with_idle_timeout(resp, idle_timeout)
+                            except router._stream_idle_timeout_error_type:
+                                stream_state["timeout"] = True
+                                release_reason = "stream_idle_timeout"
+                                break
+                            if not chunk:
+                                stream_state["completed_normally"] = True
+                                release_reason = "stream_final" if any(usage_total) else "missing"
+                                break
+                            chunks_received += 1
+                            bytes_received += len(chunk)
+                            usage = router._usage_from_stream_chunk(chunk)
+                            if any(usage):
+                                usage_total = usage
+                            yield chunk
+                    finally:
+                        if resp:
+                            resp.close()
+                        final_duration_ms = int((time.perf_counter() - started_at) * 1000)
+                        if stream_state["timeout"]:
+                            usage_source = "stream_incomplete"
+                            lifecycle_status = "timeout"
+                            lifecycle_result = "stream_idle_timeout"
+                            lifecycle_scope = "upstream"
+                        elif stream_state["completed_normally"]:
+                            usage_source = "stream_final" if any(usage_total) else "missing"
+                            lifecycle_status = "200"
+                            lifecycle_result = "stream_done"
+                            lifecycle_scope = ""
+                        else:
+                            usage_source = "stream_incomplete"
+                            lifecycle_status = "client_disconnected"
+                            lifecycle_result = "client_disconnected"
+                            lifecycle_scope = "request"
+                        router.patch_stream_lifecycle(
+                            request_id,
+                            attempt,
+                            candidate.label,
+                            usage_total,
+                            usage_source,
+                            final_status=lifecycle_status,
+                            lifecycle=lifecycle_result,
+                            final_result=lifecycle_result,
+                            chunks_received=chunks_received,
+                            bytes_received=bytes_received,
+                            duration_ms=final_duration_ms,
+                            lock_wait_ms=lock_wait_ms,
+                            lock_release_reason=release_reason,
+                            failure_scope=lifecycle_scope,
+                        )
+                        router._live_request_finish(request_id, "done" if stream_state["completed_normally"] else "ended")
+                        router._mark_stream_active(candidate, -1)
+                        router._release_lock(upstream_lock)
+
+                return 200, dict(resp.headers.items()), iterator(), request_id
+            except router._stream_idle_timeout_error_type as err:
+                saw_stream_timeout = True
+                saw_cooldown = True
+                last_error = err
+                duration_ms = int((time.perf_counter() - started_at) * 1000)
+                if resp:
+                    resp.close()
+                router._release_lock(upstream_lock)
+                # 聚合成员在首包前 stream 超时：cooldown 聚合成员并继续 fallback
+                if is_aggregate_candidate and aggregate_model and candidate.aggregate_member_id:
+                    cooldown_seconds = router._aggregate_cooldown_seconds(aggregate_model)
+                    router._set_aggregate_member_cooldown(candidate.aggregate_member_id, "stream_idle_timeout", cooldown_seconds, "stream_idle_timeout")
+                    fallback_chain.append({
+                        "member_id": candidate.aggregate_member_id,
+                        "group": group.name,
+                        "model": candidate.model.name if candidate.model else candidate.label,
+                        "manual_price": candidate.manual_price,
+                        "status": "stream_idle_timeout",
+                        "reason": "stream_idle_timeout",
+                        "cooldown_applied": True,
+                        "failure_scope": "upstream",
+                        "category": "stream_idle_timeout",
+                        "waf_compatible": group.waf_compatible,
+                    })
+                    fallback_index += 1
+                    detail = f"cooldown_applied=true; failure_scope=upstream; reason=stream_idle_timeout; idle_timeout_seconds={idle_timeout}; chunks_received=0; bytes_received=0; cooldown_minutes={cooldown_seconds // 60}; fallback_next=true; final_result=timeout"
+                    router.add_log(path, candidate.label, "timeout", router._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="stream_idle_timeout", aggregate_suffix=aggregate_suffix), duration_ms, group=group, request_id=request_id, attempt=attempt, event="stream_timeout", usage_source="stream_incomplete", cooldown_applied=True, failure_scope="upstream")
+                    continue
+                cooldown_seconds = router._mark_stream_timeout(candidate, "stream_idle_timeout")
+                detail = router._debug_detail(
+                    candidate,
+                    requested_label,
+                    target_url,
+                    body_mode,
+                    body,
+                    payload,
+                    outbound_headers,
+                    f"cooldown_applied=true; reason=stream_idle_timeout; idle_timeout_seconds={idle_timeout}; chunks_received=0; bytes_received=0; cooldown_minutes={cooldown_seconds // 60}; fallback_next={str(auto_fallback).lower()}; final_result=timeout",
+                    lock_wait_ms=lock_wait_ms,
+                    lock_release_reason="stream_idle_timeout",
+                )
+                router.add_log(path, candidate.label, "timeout", detail, duration_ms, group=group, request_id=request_id, attempt=attempt, event="stream_timeout", usage_source="stream_incomplete", cooldown_applied=True, failure_scope="upstream")
+                if auto_fallback:
+                    router.add_log(path, candidate.label, "fallback", router._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "reason=stream_idle_timeout; fallback_next=true", lock_wait_ms=lock_wait_ms), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=True, failure_scope="upstream")
+                    continue
+                error_body = json.dumps({"error": {"message": "流式响应空闲超时，请稍后重试", "type": "timeout", "code": "stream_idle_timeout", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
+                return 504, {"Content-Type": "application/json; charset=utf-8"}, [error_body], request_id
+            except HTTPError as err:
+                if resp:
+                    resp.close()
+                router._release_lock(upstream_lock)
+                duration_ms = int((time.perf_counter() - started_at) * 1000)
+                raw = err.read().decode("utf-8", "ignore") if hasattr(err, "read") else str(err)
+                last_error = err
+                classification = router._classify_candidate_error(err.code, raw, "http")
+                cooldown_applied = classification["should_cooldown"]
+                is_request_level = classification["is_request_level"]
+                if cooldown_applied:
+                    saw_cooldown = True
+                if is_request_level:
+                    saw_request_level = True
+
+                # 聚合成员 HTTP 失败：仅冷却类错误才写入 cooldown
+                if is_aggregate_candidate and aggregate_model and candidate.aggregate_member_id:
+                    if cooldown_applied:
+                        cooldown_seconds = router._aggregate_cooldown_seconds(aggregate_model)
+                        router._set_aggregate_member_cooldown(candidate.aggregate_member_id, raw or str(err), cooldown_seconds, classification["log_reason"])
+                    failure_scope = classification["failure_scope"]
+                    fallback_chain.append({
+                        "member_id": candidate.aggregate_member_id,
+                        "group": group.name,
+                        "model": candidate.model.name if candidate.model else candidate.label,
+                        "manual_price": candidate.manual_price,
+                        "status": err.code,
+                        "reason": router._short_error(raw),
+                        "cooldown_applied": cooldown_applied,
+                        "failure_scope": failure_scope,
+                        "category": classification["category"],
+                        "waf_compatible": group.waf_compatible,
+                    })
+                    fallback_index += 1
+                    detail = f"cooldown_applied={str(cooldown_applied).lower()}; failure_scope={failure_scope}; {classification['log_reason']}; try next; error={router._short_error(raw)}{router._waf_blocked_suffix(classification, group)}"
+                    router.add_log(path, candidate.label, str(err.code), router._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="http_error", aggregate_suffix=aggregate_suffix), duration_ms, group=group, request_id=request_id, attempt=attempt, event="cooldown" if cooldown_applied else "fallback", cooldown_applied=cooldown_applied, failure_scope=failure_scope)
+                    continue
+
+                # 自动 fallback（组级 auto 或聚合模型）
+                if auto_fallback:
+                    if cooldown_applied:
+                        if candidate.group.provider_type == PROVIDER_RELAY and candidate.idx is not None:
+                            router._set_cooldown(candidate.idx, raw or str(err), router._auto_cooldown_seconds(group), classification["log_reason"])
+                        elif candidate.idx is not None:
+                            router._set_unusable(candidate.idx, raw or str(err))
+                        saw_cooldown = True
+                    failure_scope = classification["failure_scope"]
+                    if not is_aggregate_candidate:
+                        fallback_chain.append({
+                            "member_id": "",
+                            "group": group.name,
+                            "model": candidate.model.name if candidate.model else candidate.label,
+                            "manual_price": candidate.manual_price,
+                            "status": err.code,
+                            "reason": router._short_error(raw),
+                            "cooldown_applied": cooldown_applied,
+                            "failure_scope": failure_scope,
+                            "category": classification["category"],
+                            "waf_compatible": group.waf_compatible,
+                        })
+                        fallback_index += 1
+                    detail = f"cooldown_applied={str(cooldown_applied).lower()}; failure_scope={failure_scope}; {classification['log_reason']}; try next; error={router._short_error(raw)}{router._waf_blocked_suffix(classification, group)}"
+                    router.add_log(path, candidate.label, str(err.code), router._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="cooldown" if cooldown_applied else "fallback", cooldown_applied=cooldown_applied, failure_scope=failure_scope)
+                    continue
+
+                # 非自动 fallback：保留原有显式模型处理逻辑
+                if router._is_quota_exhausted(err.code, raw):
+                    router._mark_unusable(candidate, raw)
+                    router.add_log(path, candidate.label, str(err.code), router._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "quota exhausted, try next", lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=False, failure_scope="upstream")
+                    continue
+                if router._is_server_error(err.code):
+                    router.add_log(path, candidate.label, str(err.code), router._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "server error, try next", lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=False, failure_scope="upstream")
+                    continue
+                headers = dict(getattr(err, "headers", {}) or {})
+                detail = f"error={router._short_error(raw)}"
+                router.add_log(path, candidate.label, str(err.code), router._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="error", cooldown_applied=False)
+                return err.code, headers, [raw.encode("utf-8")], request_id
+            except (URLError, TimeoutError, OSError) as err:
+                if resp:
+                    resp.close()
+                router._release_lock(upstream_lock)
+                duration_ms = int((time.perf_counter() - started_at) * 1000)
+                last_error = err
+                classification = router._classify_candidate_error(None, str(err), "network")
+                saw_cooldown = True
+
+                # 聚合成员网络失败：cooldown 聚合成员本身并记录 fallback 链路
+                if is_aggregate_candidate and aggregate_model and candidate.aggregate_member_id:
+                    cooldown_seconds = router._aggregate_cooldown_seconds(aggregate_model)
+                    router._set_aggregate_member_cooldown(candidate.aggregate_member_id, str(err), cooldown_seconds, classification["log_reason"])
+                    failure_scope = classification["failure_scope"]
+                    fallback_chain.append({
+                        "member_id": candidate.aggregate_member_id,
+                        "group": group.name,
+                        "model": candidate.model.name if candidate.model else candidate.label,
+                        "manual_price": candidate.manual_price,
+                        "status": "network",
+                        "reason": router._short_error(str(err)),
+                        "cooldown_applied": True,
+                        "failure_scope": failure_scope,
+                        "category": classification["category"],
+                        "waf_compatible": group.waf_compatible,
+                    })
+                    fallback_index += 1
+                    detail = f"cooldown_applied=true; failure_scope={failure_scope}; {classification['log_reason']}; try next; error={router._short_error(str(err))}"
+                    router.add_log(path, candidate.label, "network", router._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="network_error", aggregate_suffix=aggregate_suffix), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network", cooldown_applied=True, failure_scope=failure_scope)
+                    continue
+                if auto_fallback:
+                    if candidate.group.provider_type == PROVIDER_RELAY and candidate.idx is not None:
+                        router._set_cooldown(candidate.idx, str(err), router._auto_cooldown_seconds(group), classification["log_reason"])
+                    elif candidate.idx is not None:
+                        router._set_unusable(candidate.idx, str(err))
+                    failure_scope = classification["failure_scope"]
+                    if not is_aggregate_candidate:
+                        fallback_chain.append({
+                            "member_id": "",
+                            "group": group.name,
+                            "model": candidate.model.name if candidate.model else candidate.label,
+                            "manual_price": candidate.manual_price,
+                            "status": "network",
+                            "reason": router._short_error(str(err)),
+                            "cooldown_applied": True,
+                            "failure_scope": failure_scope,
+                            "category": classification["category"],
+                            "waf_compatible": group.waf_compatible,
+                        })
+                        fallback_index += 1
+                    detail = f"cooldown_applied=true; failure_scope={failure_scope}; {classification['log_reason']}; try next; error={router._short_error(str(err))}"
+                    router.add_log(path, candidate.label, "network", router._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="network_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network", cooldown_applied=True, failure_scope=failure_scope)
+                    continue
+                failure_scope = classification["failure_scope"]
+                detail = f"cooldown_applied=false; failure_scope={failure_scope}; {classification['log_reason']}; error={router._short_error(str(err))}"
+                router.add_log(path, candidate.label, "network", router._debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="network_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network", cooldown_applied=False, failure_scope=failure_scope)
+                continue
+
+        if aggregate_model:
+            router._live_request_finish(request_id, "error")
+            if not saw_cooldown and saw_request_level:
+                raise router._all_models_failed_error_type(
+                    f"聚合模型 {aggregate_model.name} 的所有成员均因请求级错误被拒绝{router._waf_blocked_hint(fallback_chain)}",
+                    attempted=attempt,
+                    stream_timeout=saw_stream_timeout,
+                    error_code="upstream_request_rejected",
+                    fallback_chain=fallback_chain,
+                    aggregate_name=aggregate_model.name,
+                )
+            raise router._all_models_failed_error_type(
+                f"聚合模型 {aggregate_model.name} 的所有成员均不可用",
+                attempted=attempt,
+                stream_timeout=saw_stream_timeout,
+                error_code="aggregate_members_unavailable",
+                fallback_chain=fallback_chain,
+                aggregate_name=aggregate_model.name,
+            )
+        router._live_request_finish(request_id, "error")
+        if last_error is None:
+            raise router._all_models_failed_error_type(
+                "没有可用模型",
+                attempted=attempt,
+                stream_timeout=saw_stream_timeout,
+                error_code="no_usable_models",
+            )
+        if not saw_cooldown and saw_request_level:
+            raise router._all_models_failed_error_type(
+                f"所有候选均因请求级错误被拒绝{router._waf_blocked_hint(fallback_chain)}",
+                attempted=attempt,
+                stream_timeout=saw_stream_timeout,
+                error_code="upstream_request_rejected",
+            )
+        raise router._all_models_failed_error_type(
+            f"所有可用模型均请求失败，共尝试 {attempt} 个上游",
+            attempted=attempt,
+            stream_timeout=saw_stream_timeout,
+            error_code="all_models_failed",
+        ) from last_error
