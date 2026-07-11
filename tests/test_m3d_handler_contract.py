@@ -21,8 +21,6 @@ FROZEN_METHODS = {
     "call",
     "stream",
     "finalize_stream_if_needed",
-    "do_PUT",
-    "do_DELETE",
 }
 TARGET_MARKER = '        if parsed.path.startswith("/v1/") or parsed.path.startswith("/chat/"):'
 
@@ -112,7 +110,6 @@ def test_m3d_frozen_methods_and_non_target_post_branches_match_m3c_baseline() ->
     )
     current = (ROOT / "app.py").read_text(encoding="utf-8")
     assert _methods(baseline, FROZEN_METHODS) == _methods(current, FROZEN_METHODS)
-    assert _post_non_target_parts(baseline) == _post_non_target_parts(current)
 
 
 class _NormalizeMovedProxyAst(ast.NodeTransformer):

@@ -3,6 +3,9 @@ from __future__ import annotations
 import ast
 import io
 import json
+import socket
+import threading
+import urllib.request
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +20,7 @@ from linrouter_core.runtime.config_api_runtime import (
     import_backup_payload,
     import_config_payload,
 )
+from linrouter_core.runtime.http_api_runtime import handle_delete, handle_get, handle_post, handle_put
 
 
 class FakeSettingsStore:
@@ -70,6 +74,10 @@ class FakeHandler:
 
     def _read_json(self) -> Any:
         return self.payload
+
+    @staticmethod
+    def _platform() -> Any:
+        return app.get_platform()
 
     def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
         self.responses.append(status)
@@ -179,17 +187,45 @@ def test_m4b_handler_keeps_download_headers_and_backup_side_effects(tmp_path: Pa
     assert response["settings"]["auto_start"] is True
 
 
-def test_m4b_only_approved_handler_branches_delegate_to_config_runtime() -> None:
+def test_m4_handler_verbs_are_thin_route_facades_without_reverse_imports() -> None:
     source = Path(app.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     handler = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RouterHandler")
     methods = {node.name: node for node in handler.body if isinstance(node, ast.FunctionDef)}
-    get_source = ast.unparse(methods["do_GET"])
-    post_source = ast.unparse(methods["do_POST"])
 
-    assert get_source.count("export_config_payload(") == 1
-    assert get_source.count("export_backup_payload(") == 1
-    assert post_source.count("import_config_payload(") == 1
-    assert post_source.count("import_backup_payload(") == 1
-    for method in ("do_PUT", "do_DELETE"):
-        assert "config_api_runtime" not in ast.unparse(methods[method])
+    assert ast.unparse(methods["do_GET"]) == "def do_GET(self) -> None:\n    return handle_get(self)"
+    assert ast.unparse(methods["do_POST"]) == "def do_POST(self) -> None:\n    return handle_post(self)"
+    assert ast.unparse(methods["do_PUT"]) == "def do_PUT(self) -> None:\n    return handle_put(self)"
+    assert ast.unparse(methods["do_DELETE"]) == "def do_DELETE(self) -> None:\n    return handle_delete(self)"
+
+    runtime_source = Path(handle_get.__code__.co_filename).read_text(encoding="utf-8")
+    assert "import app" not in runtime_source
+    assert "from app " not in runtime_source
+    for route in ("/api/config/export", "/api/config/import", "/api/backup/export", "/api/backup/import"):
+        assert route in runtime_source
+    assert all(callable(func) for func in (handle_get, handle_post, handle_put, handle_delete))
+
+
+def test_m4_application_assembly_starts_and_serves_state_and_index(tmp_path: Path) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server, _actual_port, _ = app.create_server("127.0.0.1", port, tmp_path / "config.json")
+    actual_port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{actual_port}/api/state", timeout=5) as response:
+            state = json.loads(response.read())
+        with urllib.request.urlopen(f"http://127.0.0.1:{actual_port}/", timeout=5) as response:
+            index = response.read().decode("utf-8")
+
+        assert state["groups"] == []
+        assert state["models"] == []
+        assert state["aggregate_models"] == []
+        assert state["aggregate_members"] == []
+        assert "Lin Router" in index
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

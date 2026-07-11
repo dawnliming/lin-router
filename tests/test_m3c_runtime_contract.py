@@ -22,9 +22,9 @@ from test_stream_no_fallback import (
 
 
 ROOT = Path(__file__).resolve().parent.parent
-# M4b-1 owns the two configuration-export do_GET branches; its contract freezes the
-# remaining GET branches against the M3d rollback baseline.
-FROZEN_METHODS = {"call", "do_PUT", "do_DELETE"}
+# M4 owns all HTTP verb dispatch; this M3c contract now freezes only the
+# non-stream facade that remains outside the M4 route grouping.
+FROZEN_METHODS = {"call"}
 
 
 class AttributeBearingGroupId(str):
