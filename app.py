@@ -55,6 +55,7 @@ from linrouter_core.config.constants import (
 from linrouter_core.config.models import AggregateMember, AggregateModel, ConnectionGroup, ModelConfig
 from linrouter_core.config.store import ConfigStore
 from linrouter_core.observability import ObservabilityService, RequestLog
+from linrouter_core.runtime import CandidateErrorClassifier, CandidateRuntime, WafLockState
 from linrouter_core.upstream import UpstreamAdapter
 from linrouter_core.upstream import request as upstream_request
 
@@ -247,9 +248,13 @@ class ArkProxyRouter:
             sanitize_detail=self._sanitize_detail,
         )
         self.log_write_error = self.observability.log_write_error
-        self.upstream_locks: Dict[str, threading.Lock] = {}
-        self.upstream_active_streams: Dict[str, int] = {}
-        self.upstream_locks_guard = threading.Lock()
+        self._runtime_locks = WafLockState()
+        # 旧属性 facade：保留给运行时诊断和外部调用者。
+        self.upstream_locks = self._runtime_locks.locks
+        self.upstream_active_streams = self._runtime_locks.active_streams
+        self.upstream_locks_guard = self._runtime_locks.guard
+        self._upstream_candidate_type = UpstreamCandidate
+        self.runtime = CandidateRuntime(self)
         self.upstream_adapter = upstream_adapter or UpstreamAdapter(_ssl_context)
         self._upstream_client = self._create_upstream_client()
         # 供 DebugCapture 的旧两参数构造路径读取；避免 debug_capture.py 反向 import app。
@@ -576,25 +581,7 @@ class ArkProxyRouter:
             failure_scope: str,  # request | candidate | upstream
         }
         """
-        if error_kind in ("network", "stream_timeout"):
-            return {"should_cooldown": True, "is_request_level": False, "category": error_kind, "log_reason": error_kind, "failure_scope": "upstream"}
-        if status_code is None:
-            return {"should_cooldown": True, "is_request_level": False, "category": "network", "log_reason": "network", "failure_scope": "upstream"}
-        if status_code >= 500:
-            return {"should_cooldown": True, "is_request_level": False, "category": "server_error", "log_reason": f"server_error_{status_code}", "failure_scope": "upstream"}
-        if status_code == 429:
-            if cls._is_rate_limited(status_code, raw):
-                return {"should_cooldown": True, "is_request_level": False, "category": "rate_limit", "log_reason": "rate_limit", "failure_scope": "upstream"}
-            if cls._is_quota_exhausted(status_code, raw):
-                return {"should_cooldown": True, "is_request_level": False, "category": "quota_exhausted", "log_reason": "quota_exhausted", "failure_scope": "upstream"}
-            return {"should_cooldown": True, "is_request_level": False, "category": "rate_limit", "log_reason": "rate_limit_429", "failure_scope": "upstream"}
-        if cls._is_waf_blocked_error(status_code, raw):
-            return {"should_cooldown": False, "is_request_level": True, "category": "waf_blocked", "log_reason": "waf_blocked", "failure_scope": "candidate"}
-        if cls._is_request_level_error(status_code, raw):
-            if status_code in (401, 403):
-                return {"should_cooldown": False, "is_request_level": True, "category": "auth_error", "log_reason": "auth_error", "failure_scope": "candidate"}
-            return {"should_cooldown": False, "is_request_level": True, "category": "request_level", "log_reason": "request_level", "failure_scope": "request"}
-        return {"should_cooldown": False, "is_request_level": False, "category": "unknown", "log_reason": f"http_{status_code}", "failure_scope": "upstream"}
+        return CandidateErrorClassifier.classify(cls, status_code, raw, error_kind)
 
     @staticmethod
     def _waf_blocked_suffix(classification: Dict[str, Any], group: ConnectionGroup) -> str:
@@ -696,25 +683,7 @@ class ArkProxyRouter:
         return False
 
     def _iter_candidates(self, requested_model: str | None, group_id: str | None = None) -> Iterator[Tuple[int, ModelConfig]]:
-        group = self.store.find_group(group_id) if group_id else None
-        if self._is_auto_model(requested_model, group):
-            requested_model = None
-        for idx, model in enumerate(self.store.models):
-            if model.cooldown_until and model.cooldown_until <= int(time.time()):
-                model.cooldown_until = 0
-                model.cooldown_reason = ""
-                if not model.disabled_by_user:
-                    model.usable = True
-                model.last_error = ""
-                model.last_checked_at = self._now()
-                self.store.save()
-            if model.disabled_by_user or not model.usable:
-                continue
-            if group_id and model.group_id != group_id:
-                continue
-            if requested_model and requested_model not in {model.id, model.name, model.ep_id}:
-                continue
-            yield idx, model
+        yield from self.runtime.iter_candidates(requested_model, group_id)
 
     def _group_for(self, model: ModelConfig) -> Optional[ConnectionGroup]:
         return self.store.find_group(model.group_id)
@@ -1212,58 +1181,22 @@ class ArkProxyRouter:
         )
 
     def _candidate_from_model(self, idx: int, model: ModelConfig, group: ConnectionGroup) -> UpstreamCandidate:
-        mode = self._mode_for(group)
-        channel = ""
-        if mode == PROVIDER_RELAY and model.price_group:
-            channel = model.price_group
-        elif mode == PROVIDER_PROXY:
-            channel = "proxy"
-        return UpstreamCandidate(
-            idx=idx,
-            group=group,
-            model=model,
-            label=model.name,
-            target_model=model.ep_id,
-            auth_key=self._auth_for(group, model),
-            channel=channel,
-        )
+        return self.runtime.candidate_from_model(idx, model, group)
 
     def _candidate_lock(self, candidate: UpstreamCandidate, incoming_headers: Optional[Dict[str, str]] = None) -> Optional[threading.Lock]:
-        if not self._candidate_lock_enabled(candidate, incoming_headers):
-            return None
-        key = f"{candidate.group.id}:{candidate.target_model}:{candidate.channel}"
-        with self.upstream_locks_guard:
-            lock = self.upstream_locks.get(key)
-            if lock is None:
-                lock = threading.Lock()
-                self.upstream_locks[key] = lock
-            return lock
+        return self._runtime_locks.lock_for(candidate, self._candidate_lock_enabled(candidate, incoming_headers))
 
     def _candidate_lock_key(self, candidate: UpstreamCandidate) -> str:
-        return f"{candidate.group.id}:{candidate.target_model}:{candidate.channel}"
+        return self._runtime_locks.key(candidate)
 
     def _active_stream_count(self, candidate: UpstreamCandidate) -> int:
-        key = self._candidate_lock_key(candidate)
-        with self.upstream_locks_guard:
-            return int(self.upstream_active_streams.get(key, 0))
+        return self._runtime_locks.active_count(candidate)
 
     def _mark_stream_active(self, candidate: UpstreamCandidate, delta: int) -> None:
-        key = self._candidate_lock_key(candidate)
-        with self.upstream_locks_guard:
-            next_value = max(0, int(self.upstream_active_streams.get(key, 0)) + delta)
-            if next_value:
-                self.upstream_active_streams[key] = next_value
-            else:
-                self.upstream_active_streams.pop(key, None)
+        self._runtime_locks.mark_stream_active(candidate, delta)
 
     def _waf_lock_busy_detail(self, candidate: UpstreamCandidate, body: bytes, lock_wait_ms: int) -> str:
-        active_streams = self._active_stream_count(candidate)
-        fallback_reason = "large_task_in_progress" if active_streams or len(body) > 131072 else "candidate_busy"
-        return (
-            f"waf_lock_wait_timeout; fallback_reason={fallback_reason}; "
-            f"failure_scope=busy; cooldown_applied=false; active_streams={active_streams}; "
-            f"lock_wait_ms={lock_wait_ms}; busy_hint=candidate_busy"
-        )
+        return self._runtime_locks.busy_detail(candidate, body, lock_wait_ms)
 
     def _candidate_lock_enabled(self, candidate: UpstreamCandidate, incoming_headers: Optional[Dict[str, str]] = None) -> bool:
         return self._waf_decision(candidate.group, incoming_headers or {}) == "waf_compatible"
@@ -1425,34 +1358,7 @@ class ArkProxyRouter:
         self.add_log("/api/aggregate-members/recover", model.name, "probe_ok", f"manual_probe=true; aggregate_member_id={member.id}; probe_result=success; summary=最小探测成功，成员已恢复参与调度。; cooldown_applied=false; failure_scope=manual", group=group, request_id=f"manual-probe-{uuid.uuid4().hex}", event="manual_probe", usage_source="manual_probe", failure_scope="manual")
         return {"ok": True, "message": "最小探测成功，已恢复该聚合成员参与调度。", "member": asdict(member), "before": before}
     def _iter_upstream_candidates(self, requested_model: str | None, group_id: str | None = None) -> Iterator[UpstreamCandidate]:
-        # 旧全局 Key 已退役，不再跨组调度真实模型
-        if group_id == GLOBAL_ROUTE_GROUP_ID:
-            return
-        if group_id:
-            group = self.store.find_group(group_id)
-            if not group:
-                return
-            matched = False
-            candidates = list(self._iter_candidates(requested_model, group.id))
-            for idx, model in candidates:
-                matched = True
-                yield self._candidate_from_model(idx, model, group)
-            if self._mode_for(group) == PROVIDER_PROXY and not matched and requested_model and not self._is_auto_model(requested_model, group):
-                yield UpstreamCandidate(
-                    idx=None,
-                    group=group,
-                    model=None,
-                    label=requested_model,
-                    target_model=requested_model,
-                    auth_key=self._auth_for(group, None),
-                    channel="pass-through",
-                )
-            return
-
-        for idx, model in self._iter_candidates(requested_model, None):
-            group = self._group_for(model)
-            if group:
-                yield self._candidate_from_model(idx, model, group)
+        yield from self.runtime.iter_upstream_candidates(requested_model, group_id)
 
     def _resolve_aggregate(
         self,
@@ -1496,22 +1402,7 @@ class ArkProxyRouter:
 
     def _aggregate_member_skip_reason(self, member: AggregateMember) -> Tuple[str, str, Optional[ConnectionGroup], Optional[ModelConfig]]:
         """返回聚合成员跳过原因；空 reason 表示可参与调度。"""
-        group = self.store.find_group(member.group_id)
-        model = self.store.find_model(member.model_id)
-        now_ts = int(time.time())
-        if not member.enabled:
-            return "member_disabled", "该聚合成员已手动停用，不参与本次调度。", group, model
-        if member.cooldown_until and member.cooldown_until > now_ts:
-            return "member_cooling", "该聚合成员正在冷却中，本次直接跳过。", group, model
-        if not group:
-            return "underlying_group_missing", "底层连接组不存在，请检查聚合成员配置。", group, model
-        if not model:
-            return "underlying_model_missing", "底层真实模型不存在，请检查聚合成员配置。", group, model
-        if not model.usable or getattr(model, "disabled_by_user", False):
-            return "underlying_model_disabled", "底层真实模型已停用，请先启用真实模型。", group, model
-        if model.cooldown_until and model.cooldown_until > now_ts:
-            return "underlying_model_cooling", "底层真实模型冷却中，本次直接跳过。", group, model
-        return "", "", group, model
+        return self.runtime.aggregate_member_skip_reason(member)
 
     def _aggregate_member_usable(self, member: AggregateMember) -> bool:
         """检查聚合成员是否可用（存在、启用、未 cooldown、真实模型未被用户手动禁用）。"""
@@ -1564,35 +1455,15 @@ class ArkProxyRouter:
         request_id: str = "",
         resolved_as: str = "",
     ) -> Iterator[UpstreamCandidate]:
-        """按聚合模型策略产出候选成员。"""
-        self.store.refresh_expired_cooldowns()
-        members = self.store.get_aggregate_members(aggregate.id)
-        strategy = aggregate.strategy or "priority"
-        if strategy == "price_first":
-            members = sorted(
-                members,
-                key=lambda m: (
-                    m.manual_price is None,
-                    m.manual_price if m.manual_price is not None else 0,
-                    m.priority,
-                ),
-            )
-        else:
-            members = sorted(members, key=lambda m: m.priority)
-        for member in members:
-            reason, message, group, model = self._aggregate_member_skip_reason(member)
-            if reason:
-                if log_skips:
-                    self._log_aggregate_member_skip(path, aggregate, member, reason, message, group, model, requested_label, request_id, resolved_as)
-                continue
-            if not group or not model:
-                continue
-            candidate = self._candidate_from_model(self.store.models.index(model), model, group)
-            candidate.aggregate_id = aggregate.id
-            candidate.aggregate_name = aggregate.name
-            candidate.aggregate_member_id = member.id
-            candidate.manual_price = member.manual_price
-            yield candidate
+        """兼容 facade：由 M3a runtime 保持成员排序、跳过与日志时机。"""
+        yield from self.runtime.iter_aggregate_candidates(
+            aggregate,
+            log_skips=log_skips,
+            path=path,
+            requested_label=requested_label,
+            request_id=request_id,
+            resolved_as=resolved_as,
+        )
 
     def _aggregate_cooldown_seconds(self, aggregate: AggregateModel) -> int:
         try:
@@ -1631,21 +1502,10 @@ class ArkProxyRouter:
         self.store.save()
 
     def _set_cooldown(self, idx: int, error: str, cooldown_seconds: int, reason: str) -> None:
-        model = self.store.models[idx]
-        now_ts = int(time.time())
-        model.usable = False
-        model.last_error = error[:500]
-        model.last_checked_at = self._now()
-        model.cooldown_until = now_ts + max(0, cooldown_seconds)
-        model.cooldown_reason = reason[:120]
-        self.store.save()
+        self.runtime.set_cooldown(idx, error, cooldown_seconds, reason)
 
     def _set_success(self, idx: int) -> None:
-        model = self.store.models[idx]
-        model.last_error = ""
-        model.last_success_at = self._now()
-        model.last_checked_at = model.last_success_at
-        self.store.save()
+        self.runtime.set_success(idx)
 
     def _mark_unusable(self, candidate: UpstreamCandidate, error: str) -> None:
         if candidate.idx is not None:
