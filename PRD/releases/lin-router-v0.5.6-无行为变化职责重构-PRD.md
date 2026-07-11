@@ -1,7 +1,7 @@
 # Lin Router v0.5.6 无行为变化职责重构 PRD
 
 > 版本：v0.5.6  
-> 状态：In Progress（M0、M1、M2a、M2b 已完成并通过 Gate；M2b 正在归档为 M3 回滚基线）  
+> 状态：In Progress（M0、M1、M2a、M2b、M3a、M3b 已完成并通过 Gate；M3b 待提交，M3c 未启动）
 > 产品负责人：小林  
 > PM：pm-小帅  
 > 创建日期：2026-07-11  
@@ -205,22 +205,25 @@ HTTP 适配层
 | M1：配置领域 | 新增 `linrouter_core/config/{constants,models,store}.py`；`app.py` 保持兼容 facade；`debug_capture.py` 改为依赖注入、无运行时反向 import | AST 对照：配置对象、`ConfigStore`、常量/key 生成函数与 `HEAD` 一致；`compileall`、`git diff --check` 通过；全量 pytest `41 passed`；Codex read-only 复审退出码 `0`、结论 `PASS` | 通过，可回滚 |
 | M2a：观测诊断 | 新增 `linrouter_core/observability/`，抽取 JSONL 读写、CSV 导出、诊断和 live requests 投影；`app.py`、`ArkProxyRouter` 保持 facade | 专项 `7 passed`；全量 pytest `45 passed`（27.22s）；`compileall`、`git diff --check` 通过；ad-hoc `M2A_OBSERVABILITY_AD_HOC_OK`、退出码 0；Codex read-only 复审退出码 `0`、结论 `PASS` | 通过，待与 M1 合并形成 Git 回滚基线 |
 | M2b：上游适配 | 新增 `linrouter_core/upstream/`，抽取 URL、请求/header 构建、模型获取与 Adapter facade；`ArkProxyRouter` 显式注入 Adapter，Handler 保留日志与外部错误语义 | 专项及相关回归 `12 passed`；本次归档复跑契约 `3 passed`、全量 pytest `48 passed`（28.20s）；`compileall`、`git diff --check` 通过；ad-hoc `M2B_UPSTREAM_AD_HOC_OK`；Codex read-only 复审 `PASS` | 通过，待独立归档为 M3 回滚基线 |
+| M3a：候选与健康状态 | 新增 `linrouter_core/runtime/`，抽取候选枚举/聚合跳过、错误分类、冷却状态与 WAF 锁；`ArkProxyRouter` 保留兼容 facade | 专项 `3 passed`；全量 pytest `51 passed`（26.72s）；`compileall`、`git diff --check` 通过；`call()`、`stream()` 与 HTTP Handler 源码冻结对照通过 | 已归档：`03f07d8`，可回滚 |
+| M3b：非流式执行链 | `ArkProxyRouter.call()` 收敛为 facade；非流式候选循环、上游 POST、429 重试、HTTP/网络失败、fallback、日志与既有中文错误转入 `CandidateRuntime.execute_non_stream()` | M3b 专项 `4 passed`；全量 pytest `55 passed`（39.44s）；`compileall`、`git diff --check` 通过；`stream()` 与 `do_GET/do_POST/do_PUT/do_DELETE` 对照 M3a 源码一致；PM 一次性独立脚本验证 `M3B_INDEPENDENT_VERIFY_OK` 并已清理 | PM Gate 通过，待提交 |
 
 > M1 复审中发现过 `DebugCapture` 旧两参数构造会使 UA/SSL/SSE usage 解析降级的问题；已在当批修回，并以旧构造专项验证及全量回归确认。该修复属于重构直接造成的 P0 回归修复，不构成范围扩张。
 
 > M2a 首轮审查发现加载错误处理、日志 trim 上限、流式回写错误同步 3 项兼容问题；均已在 M2a 内修复并补测试。该修复只恢复迁移前行为，不新增诊断能力或改变请求主链。
 
-### 4.1.2 归档与提交基线（2026-07-11）
+### 4.1.2 已归档回滚基线（2026-07-11）
 
-本次归档仅固化已通过的 M1 + M2a 工作区变更，**不代表 v0.5.6 发布**。因两批当前处于同一未提交变更集，必须以一个提交点共同形成可回退基线；不拆分为两个提交，避免产生无法独立复现的中间状态。
+以下提交均仅固化已通过的职责迁移，**不代表 v0.5.6 发布**。后续批次必须从最近的干净提交启动；不得把未通过 Gate 的后续批次混入前一基线。
 
 | 项目 | 归档口径 |
 |---|---|
-| 归档范围 | M1 配置领域与 M2a 观测诊断；包含相关契约/回归测试与本 PRD 实施记录 |
-| 不包含 | M2b 上游适配、候选选择、冷却、WAF、认证、请求头、普通/流式转发、HTTP API、前端重构 |
-| 提交前证据 | 复跑 `git status --short`、`git diff --check`、全量 pytest；确认无日志、配置、临时脚本、真实 Key 或其他运行产物混入 |
-| 回滚基线 | 本次 M1 + M2a 合并提交产生的 commit；后续 M2b 从干净工作区启动 |
-| 发布口径 | `v0.5.6 / M0 + M1 + M2a 已归档，未发布` |
+| 已归档范围 | M1 配置领域 + M2a 观测诊断：`e5f41ce`；M2b 上游适配：`9d75400`；M3a 运行时候选/健康状态：`03f07d8` |
+| M3a 提交范围 | 仅 `app.py`、`linrouter_core/runtime/__init__.py`、`linrouter_core/runtime/router_runtime.py`、`tests/test_m3a_runtime_contract.py` |
+| 当前待归档 | M3b 仅 `app.py`、`linrouter_core/runtime/router_runtime.py`、`tests/test_m3b_runtime_contract.py`；不得混入临时 `hermes-verify-*`、日志、配置、真实 Key 或其他运行产物 |
+| M3b 提交前证据 | `git status --short`、`git diff --check`、M3b 专项、全量 pytest、`compileall`均通过；PM 独立脚本验证后清理临时文件 |
+| 当前回滚基线 | `03f07d8 refactor: extract M3a routing runtime`；M3b 提交成功后更新为下一基线 |
+| 发布口径 | `v0.5.6 / M0-M3b 已归档或待归档，未发布` |
 
 ### 4.1.3 M2b 启动前置条件
 
