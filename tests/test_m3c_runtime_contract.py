@@ -22,9 +22,9 @@ from test_stream_no_fallback import (
 
 
 ROOT = Path(__file__).resolve().parent.parent
-# M3d owns the narrowly delegated /v1|/chat do_POST branch; its contract freezes
-# the remaining do_POST branches against the M3c rollback baseline.
-FROZEN_METHODS = {"call", "do_GET", "do_PUT", "do_DELETE"}
+# M4b-1 owns the two configuration-export do_GET branches; its contract freezes the
+# remaining GET branches against the M3d rollback baseline.
+FROZEN_METHODS = {"call", "do_PUT", "do_DELETE"}
 
 
 class AttributeBearingGroupId(str):

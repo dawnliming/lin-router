@@ -56,6 +56,13 @@ from linrouter_core.config.models import AggregateMember, AggregateModel, Connec
 from linrouter_core.config.store import ConfigStore
 from linrouter_core.observability import ObservabilityService, RequestLog
 from linrouter_core.runtime import CandidateErrorClassifier, CandidateRuntime, WafLockState
+from linrouter_core.runtime.config_api_runtime import (
+    ConfigApiError,
+    export_backup_payload,
+    export_config_payload,
+    import_backup_payload,
+    import_config_payload,
+)
 from linrouter_core.runtime.handler_runtime import handle_proxy_request
 from linrouter_core.upstream import UpstreamAdapter
 from linrouter_core.upstream import request as upstream_request
@@ -2671,13 +2678,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._send_json([asdict(item) for item in self.router.all_logs()])
             return
         if parsed.path == "/api/config/export":
-            # 导出当前配置（groups + models + aggregates），用于备份和迁移
-            payload = {
-                "groups": [asdict(g) for g in self.store.groups],
-                "models": [asdict(m) for m in self.store.models],
-                "aggregate_models": [asdict(m) for m in self.store.aggregate_models],
-                "aggregate_members": [asdict(m) for m in self.store.aggregate_members],
-            }
+            payload = export_config_payload(self.store)
             body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -2688,15 +2689,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if parsed.path == "/api/backup/export":
-            # 导出全部数据：配置 + 设置
-            settings_store = self.server.settings_store  # type: ignore[attr-defined]
-            payload = {
-                "groups": [asdict(g) for g in self.store.groups],
-                "models": [asdict(m) for m in self.store.models],
-                "aggregate_models": [asdict(m) for m in self.store.aggregate_models],
-                "aggregate_members": [asdict(m) for m in self.store.aggregate_members],
-                "settings": settings_store.to_dict(),
-            }
+            payload = export_backup_payload(self.store, self.server.settings_store)  # type: ignore[attr-defined]
             body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -2720,211 +2713,39 @@ class RouterHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/config/import":
-            # 导入配置：合并模式，按 id 覆盖同名连接组/模型，其余保留
-            # 优先尝试 multipart/form-data 文件上传，失败回退到 JSON body
             payload = self._read_multipart_json()
             if payload is None:
                 try:
                     payload = self._read_json()
                 except Exception as e:
                     self._send_json({"error": {"message": f"配置文件无效：{e}", "type": "invalid_request_error", "code": "invalid_config_file"}}, status=400)
-                return
-            if not isinstance(payload, dict):
-                self._send_json({"error": {"message": "配置文件无效：必须是一个 JSON 对象", "type": "invalid_request_error", "code": "invalid_config_file"}}, status=400)
-                return
-            groups_raw = payload.get("groups") or []
-            models_raw = payload.get("models") or []
-            aggregates_raw = payload.get("aggregate_models") or []
-            members_raw = payload.get("aggregate_members") or []
-            if not isinstance(groups_raw, list) or not isinstance(models_raw, list):
-                self._send_json({"error": {"message": "请求参数无效：groups 和 models 必须是数组", "type": "invalid_request_error", "code": "invalid_payload"}}, status=400)
-                return
-            if not isinstance(aggregates_raw, list):
-                aggregates_raw = []
-            if not isinstance(members_raw, list):
-                members_raw = []
-            with self.store._lock:
-                for item in groups_raw:
-                    if not isinstance(item, dict) or not item.get("name"):
-                        continue
-                    group = ConnectionGroup.from_dict(item)
-                    if not group.route_key:
-                        group.route_key = new_route_key()
-                    if not group.provider_type:
-                        group.provider_type = PROVIDER_ARK
-                    # 按 id 覆盖，否则追加
-                    for idx, existing in enumerate(self.store.groups):
-                        if existing.id == group.id:
-                            self.store.groups[idx] = group
-                            break
-                    else:
-                        self.store.groups.append(group)
-                for item in models_raw:
-                    if not isinstance(item, dict) or not item.get("name") or not item.get("ep_id"):
-                        continue
-                    model = ModelConfig.from_dict(item)
-                    # 缺失 group_id 时挂到第一个组，避免悬空
-                    if not model.group_id or not self.store.find_group(model.group_id):
-                        if self.store.groups:
-                            model.group_id = self.store.groups[0].id
-                        else:
-                            continue
-                    for idx, existing in enumerate(self.store.models):
-                        if existing.id == model.id:
-                            self.store.models[idx] = model
-                            break
-                    else:
-                        self.store.models.append(model)
-                # 导入聚合模型：按 id 覆盖；别名冲突跳过并返回中文原因
-                imported_aggregate_ids: set = set()
-                aggregate_skip_reasons: List[str] = []
-                for item in aggregates_raw:
-                    if not isinstance(item, dict) or not item.get("name"):
-                        aggregate_skip_reasons.append("聚合模型缺少名称")
-                        continue
-                    aggregate = AggregateModel.from_dict(item)
-                    ok, message = self.store._validate_aggregate_name(aggregate.name, aggregate.id)
-                    if ok:
-                        ok, message = self.store._validate_aggregate_client_aliases(aggregate.client_model_aliases)
-                    if not ok:
-                        aggregate_skip_reasons.append(f"聚合模型 {aggregate.name}：{message}")
-                        continue
-                    for idx, existing in enumerate(self.store.aggregate_models):
-                        if existing.id == aggregate.id:
-                            self.store.aggregate_models[idx] = aggregate
-                            break
-                    else:
-                        self.store.aggregate_models.append(aggregate)
-                    imported_aggregate_ids.add(aggregate.id)
-                # 导入聚合成员：按 id 覆盖，orphan/重复则跳过
-                imported_member_ids: set = set()
-                for item in members_raw:
-                    if not isinstance(item, dict):
-                        continue
-                    member = AggregateMember.from_dict(item)
-                    if member.aggregate_id not in imported_aggregate_ids and not self.store.find_aggregate(member.aggregate_id):
-                        continue
-                    if not self.store.find_group(member.group_id) or not self.store.find_model(member.model_id):
-                        continue
-                    duplicate = next(
-                        (m for m in self.store.aggregate_members
-                         if m.aggregate_id == member.aggregate_id
-                         and m.group_id == member.group_id
-                         and m.model_id == member.model_id
-                         and m.id != member.id),
-                        None,
-                    )
-                    if duplicate:
-                        continue
-                    for idx, existing in enumerate(self.store.aggregate_members):
-                        if existing.id == member.id:
-                            self.store.aggregate_members[idx] = member
-                            break
-                    else:
-                        self.store.aggregate_members.append(member)
-                    imported_member_ids.add(member.id)
-                self.store._cleanup_orphan_members()
-                self.store.save()
-            self._send_json({
-                "ok": True,
-                "groups": len(self.store.groups),
-                "models": len(self.store.models),
-                "aggregate_models": len(self.store.aggregate_models),
-                "aggregate_members": len(self.store.aggregate_members),
-                "skipped_aggregates": aggregate_skip_reasons,
-            })
+                    return
+            try:
+                self._send_json(import_config_payload(self.store, payload))
+            except ConfigApiError as error:
+                self._send_json(error.response(), status=400)
             return
         if parsed.path == "/api/backup/import":
-            # 恢复全部数据：配置 + 设置，完全覆盖当前数据
             payload = self._read_multipart_json()
             if payload is None:
                 try:
                     payload = self._read_json()
                 except Exception as e:
                     self._send_json({"error": {"message": f"备份文件无效：{e}", "type": "invalid_request_error", "code": "invalid_backup_file"}}, status=400)
+                    return
+            try:
+                response, new_settings = import_backup_payload(self.store, payload)
+            except ConfigApiError as error:
+                self._send_json(error.response(), status=400)
                 return
-            if not isinstance(payload, dict):
-                self._send_json({"error": {"message": "备份文件无效：必须是一个 JSON 对象", "type": "invalid_request_error", "code": "invalid_backup_file"}}, status=400)
-                return
-            groups_raw = payload.get("groups") or []
-            models_raw = payload.get("models") or []
-            aggregates_raw = payload.get("aggregate_models") or []
-            members_raw = payload.get("aggregate_members") or []
-            settings_raw = payload.get("settings") or {}
-            if not isinstance(groups_raw, list) or not isinstance(models_raw, list):
-                self._send_json({"error": {"message": "请求参数无效：groups 和 models 必须是数组", "type": "invalid_request_error", "code": "invalid_payload"}}, status=400)
-                return
-            if not isinstance(aggregates_raw, list):
-                aggregates_raw = []
-            if not isinstance(members_raw, list):
-                members_raw = []
-            new_groups: List[ConnectionGroup] = []
-            for item in groups_raw:
-                if not isinstance(item, dict) or not item.get("name"):
-                    continue
-                group = ConnectionGroup.from_dict(item)
-                if not group.route_key:
-                    group.route_key = new_route_key()
-                if not group.provider_type:
-                    group.provider_type = PROVIDER_ARK
-                new_groups.append(group)
-            new_models: List[ModelConfig] = []
-            for item in models_raw:
-                if not isinstance(item, dict) or not item.get("name") or not item.get("ep_id"):
-                    continue
-                model = ModelConfig.from_dict(item)
-                # 缺失或无效 group_id 时挂到第一个组
-                if not model.group_id or not any(g.id == model.group_id for g in new_groups):
-                    if new_groups:
-                        model.group_id = new_groups[0].id
-                    else:
-                        continue
-                new_models.append(model)
-            new_aggregates: List[AggregateModel] = []
-            new_aggregate_ids = set()
-            for item in aggregates_raw:
-                if not isinstance(item, dict) or not item.get("name"):
-                    continue
-                aggregate = AggregateModel.from_dict(item)
-                new_aggregates.append(aggregate)
-                new_aggregate_ids.add(aggregate.id)
-            new_members: List[AggregateMember] = []
-            for item in members_raw:
-                if not isinstance(item, dict):
-                    continue
-                member = AggregateMember.from_dict(item)
-                if member.aggregate_id not in new_aggregate_ids:
-                    continue
-                if not any(g.id == member.group_id for g in new_groups) or not any(m.id == member.model_id for m in new_models):
-                    continue
-                new_members.append(member)
-            with self.store._lock:
-                self.store.groups = new_groups
-                self.store.models = new_models
-                self.store.aggregate_models = new_aggregates
-                self.store.aggregate_members = new_members
-                self.store.save()
-            # 恢复设置
             settings_store = self.server.settings_store  # type: ignore[attr-defined]
-            allowed = {
-                "auto_start", "start_minimized", "theme", "auto_refresh_logs",
-                "upstream_http_client", "upstream_http2", "upstream_keepalive",
-                "debug_mode", "debug_capture_enabled", "debug_capture_last_body",
-                "normalize_tools_order",
-            }
-            new_settings = {k: v for k, v in settings_raw.items() if k in allowed}
             if "auto_start" in new_settings:
                 get_platform().set_autostart(bool(new_settings["auto_start"]))
             updated = settings_store.update(new_settings)
-            # 恢复设置后若影响上游客户端，立即刷新
-            if any(k in new_settings for k in ("upstream_http_client", "upstream_http2", "upstream_keepalive")):
+            if any(key in new_settings for key in ("upstream_http_client", "upstream_http2", "upstream_keepalive")):
                 self.router._refresh_upstream_client()
             self._send_json({
-                "ok": True,
-                "groups": len(self.store.groups),
-                "models": len(self.store.models),
-                "aggregate_models": len(self.store.aggregate_models),
-                "aggregate_members": len(self.store.aggregate_members),
+                **response,
                 "settings": {**updated, "auto_start": get_platform().is_autostart_enabled()},
             })
             return

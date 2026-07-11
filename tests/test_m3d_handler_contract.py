@@ -21,7 +21,6 @@ FROZEN_METHODS = {
     "call",
     "stream",
     "finalize_stream_if_needed",
-    "do_GET",
     "do_PUT",
     "do_DELETE",
 }
@@ -42,9 +41,12 @@ def _methods(source: str, names: set[str]) -> dict[str, str]:
 
 def _post_non_target_parts(source: str) -> tuple[str, str]:
     post = _methods(source, {"do_POST"})["do_POST"]
-    start = post.index(TARGET_MARKER)
-    end = post.index('        self._send_json({"error": {"message": "资源不存在"', start)
-    return post[:start], post[end:]
+    # M4b-1 owns the configuration and backup import branches; M3d keeps
+    # freezing the proxy branch boundary plus the later unrelated branches.
+    start = post.index('        if parsed.path == "/api/groups":')
+    target = post.index(TARGET_MARKER, start)
+    end = post.index('        self._send_json({"error": {"message": "资源不存在"', target)
+    return post[start:target], post[end:]
 
 
 class FakeIterator:
