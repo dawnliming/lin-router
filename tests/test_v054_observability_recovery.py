@@ -174,6 +174,9 @@ def test_v054_frontend_contracts():
     dashboard_js = (root / "static/js/dashboard-tab.js").read_text(encoding="utf-8")
     logs_js = (root / "static/js/logs-tab.js").read_text(encoding="utf-8")
     config_js = (root / "static/js/config-tab.js").read_text(encoding="utf-8")
+    config_actions_js = (root / "static/js/config-tab-actions.js").read_text(encoding="utf-8")
+    config_runtime_js = (root / "static/js/config-tab-runtime.js").read_text(encoding="utf-8")
+    config_sources = config_js + config_actions_js + config_runtime_js
 
     assert "getLiveRequests" in api_js
     assert "diagnoseRequest" in api_js
@@ -198,17 +201,17 @@ def test_v054_frontend_contracts():
     assert "reasoningValueStatusLabel" in logs_js
     assert "不适用（未携带字段）" in logs_js
     assert "未识别，但已记录原值" in logs_js
-    assert "group-reasoning-support" in config_js
-    assert "aggregate-client-model-aliases" in config_js
-    assert r"split(/[\n,]+/)" in config_js
-    assert "panel.querySelector('#group-waf')?.addEventListener('change'" in config_js
-    assert "API.recoverModel" in config_js
-    assert "API.recoverAggregateMember" in config_js
-    assert "reloadAfterAggregateMemberChange" in config_js
-    assert "冷却中（剩 ${mm}:${ss}）" in config_js
-    assert "底层冷却中（剩 ${mm}:${ss}）" in config_js
-    assert "data-aggregate-member-status" in config_js
-    assert "恢复/启用" not in config_js
+    assert "group-reasoning-support" in config_sources
+    assert "aggregate-client-model-aliases" in config_sources
+    assert r"split(/[\n,]+/)" in config_sources
+    assert "panel.querySelector('#group-waf')?.addEventListener('change'" in config_sources
+    assert "API.recoverModel" in config_sources
+    assert "API.recoverAggregateMember" in config_sources
+    assert "reloadAfterAggregateMemberChange" in config_sources
+    assert "冷却中（剩 ${mm}:${ss}）" in config_sources
+    assert "底层冷却中（剩 ${mm}:${ss}）" in config_sources
+    assert "data-aggregate-member-status" in config_sources
+    assert "恢复/启用" not in config_sources
     assert "_openDetailKey" in logs_js
     assert "tbody.addEventListener('click'" in logs_js
     assert "item.usage_source !== 'manual_probe'" in logs_js

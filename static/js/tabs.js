@@ -27,6 +27,7 @@ const Tabs = {
 
   switch(tabId) {
     if (this.current === tabId) return;
+    if (this.current === 'config') ConfigTab.dispose();
     this.current = tabId;
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.dataset.tab === tabId));
