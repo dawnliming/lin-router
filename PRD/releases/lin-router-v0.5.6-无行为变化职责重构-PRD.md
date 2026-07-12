@@ -1,7 +1,7 @@
 # Lin Router v0.5.6 无行为变化职责重构 PRD
 
 > 版本：v0.5.6  
-> 状态：PM 发布 Gate 通过（Codex 独立复核未形成结论，已作为发布记录保留）
+> 状态：最终 PM 发布 Gate 通过（M7 独立 Codex 只读复核已补齐 PASS）
 > 产品负责人：小林  
 > PM：pm-小帅  
 > 创建日期：2026-07-11  
@@ -212,7 +212,7 @@ HTTP 适配层
 | M4b-1：配置 API 运行时 | 导入、导出、备份相关配置 API 的业务编排收口至 `config_api_runtime.py` | 配置契约、下载 header、备份副作用与全量回归通过；已独立归档 `a30965d` | 通过，可回滚 |
 | M4：HTTP 路由分组与应用入口 | 四个 `RouterHandler` verb 收敛为 facade；全量路由分派迁至 `http_api_runtime.py`；配置初始化、端口选择、Server 装配与 CLI 启动迁至 `app_runtime.py` | 专项 `6 passed`；全量 pytest `71 passed`；真实 API/CLI 启动 smoke、`py_compile`、`git diff --check`、敏感扫描通过；Codex 定向复核 PASS；已独立归档 `b267cfe` | PM Gate 通过，可回滚 |
 | M5+M6：前端配置页职责收口 | `config-tab.js` 保留协调/结构渲染；拆出 `config-tab-form.js`（草稿、校验、事件）、`config-tab-actions.js`（既有 API 动作）、`config-tab-runtime.js`（runtime diff patch、timer）；补 `test_m56_config_tab_contract.py` | 提交 `82f8e93`；全量 pytest `75 passed`；M5+M6 专项 `6 passed`；4 个拆分 JS 均 `node --check` 通过；真实服务 `/`、`/api/runtime-state` smoke 通过；Codex 复核发现“离开 Tab 后异步保存重建隐藏面板”P0 生命周期回归，已以当前 Tab/当前对象守卫修复并二次复核 `REVIEW_FIX: PASS`；小林完成 FE-A05/A06/A08/A09 及视觉人工 Gate，确认无异常 | PM Gate 通过，可回滚 |
-| M7：最终发布 Gate | 清理无调用 `isEditingConfigForm` 薄转发链；复核 listener/timer dispose、runtime 局部 patch、异步保存回写守卫、无旧逻辑双实现 | 全量 pytest `75 passed`（41.47s）；M5+M6 关联专项 `6 passed`（1.18s）；全部 `static/js/*.js` 的 `node --check`、`compileall`、`git diff --check` 通过；无暂存/untracked；待提交范围仅 PRD 与 2 个死代码清理文件；未命中凭据、日志、配置、数据库或临时产物。Codex CLI 两次只读复核均因本机临时目录/Windows glob 异常超时，未形成结论，**不计为 PASS** | 主 Gate 通过；按本 PRD（未将 Codex 列为硬阻断）有条件发布通过 |
+| M7：最终发布 Gate | 清理无调用 `isEditingConfigForm` 薄转发链；复核 listener/timer dispose、runtime 局部 patch、异步保存回写守卫、无旧逻辑双实现 | 全量 pytest `75 passed`（41.47s）；M5+M6 关联专项 `6 passed`（1.18s）；全部 `static/js/*.js` 的 `node --check`、`compileall`、`git diff --check` 通过；无暂存/untracked；未命中凭据、日志、配置、数据库或临时产物。初次 Codex 两次超时未计 PASS；后续以精确 commit/文件路径、read-only sandbox 的独立复核返回 `REVIEW: PASS`，并验证 no-tools、native shell、PowerShell glob 探针均成功。 | 最终 PM Gate 通过，可回滚 |
 
 > M1 复审中发现过 `DebugCapture` 旧两参数构造会使 UA/SSL/SSE usage 解析降级的问题；已在当批修回，并以旧构造专项验证及全量回归确认。该修复属于重构直接造成的 P0 回归修复，不构成范围扩张。
 
@@ -226,9 +226,9 @@ HTTP 适配层
 |---|---|
 | 已归档范围 | M1+M2a：`e5f41ce`；M2b：`9d75400`；M3a：`03f07d8`；M3b：`2806a5a`；M3c：`2ca4d05`；M3d：`f482f4c`；M4b-1：`a30965d`；M4：`b267cfe` |
 | M3a 提交范围 | 仅 `app.py`、`linrouter_core/runtime/__init__.py`、`linrouter_core/runtime/router_runtime.py`、`tests/test_m3a_runtime_contract.py` |
-| 当前待归档 | 本 PRD 的 M5+M7 Gate 记录、`static/js/config-tab.js` 与 `static/js/config-tab-runtime.js` 的死代码清理；不得将临时 `hermes-verify-*`、日志、配置、真实 Key 或其他运行产物纳入提交集 |
-| 当前回滚基线 | `82f8e93 refactor: split config tab responsibilities` |
-| 发布口径 | `v0.5.6 / M0-M7 主 Gate 已通过；无新增用户功能，现有配置/API/使用方式保持兼容。Codex 独立复核未取得结论，未作为 PASS 计入。` |
+| M7 归档提交 | `c9dd5f2 chore: 清理无用的isEditingConfigForm方法`；归档时工作区干净 |
+| 当前回滚基线 | `c9dd5f2` |
+| 发布口径 | `v0.5.6 / M0-M7 最终 PM Gate 已通过；无新增用户功能，现有配置/API/使用方式保持兼容。M7 独立 Codex 只读复核已 PASS。` |
 
 ### 4.1.3 M2b 启动前置条件
 
