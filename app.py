@@ -55,7 +55,15 @@ from linrouter_core.config.constants import (
 from linrouter_core.config.models import AggregateMember, AggregateModel, ConnectionGroup, ModelConfig
 from linrouter_core.config.store import ConfigStore
 from linrouter_core.observability import ObservabilityService, RequestLog
-from linrouter_core.runtime import CandidateErrorClassifier, CandidateRuntime, WafLockState
+from linrouter_core.contracts import AllModelsFailedError, RouteContext, StreamIdleTimeoutError, UpstreamCandidate
+from linrouter_core.contracts.execution_ports import ExecutionDependencies
+from linrouter_core.runtime import (
+    CandidateErrorClassifier,
+    CandidateRuntime,
+    NonStreamExecutionService,
+    StreamExecutionService,
+    WafLockState,
+)
 from linrouter_core.runtime.http_api_runtime import handle_delete, handle_get, handle_post, handle_put
 from linrouter_core.runtime.app_runtime import (
     create_application_server,
@@ -171,51 +179,6 @@ REQUEST_LEVEL_ERROR_TYPES = {
 }
 
 
-@dataclass
-class UpstreamCandidate:
-    idx: Optional[int]
-    group: ConnectionGroup
-    model: Optional[ModelConfig]
-    label: str
-    target_model: str
-    auth_key: str
-    channel: str = ""
-    aggregate_id: str = ""
-    aggregate_name: str = ""
-    aggregate_member_id: str = ""
-    manual_price: float | None = None
-
-
-@dataclass
-class RouteContext:
-    client_key: str
-    group: Optional[ConnectionGroup]
-    group_id: str
-    provider_type: str
-    base_url: str
-    display_name: str
-    passthrough: bool = True
-    is_global: bool = False
-    aggregate: Optional[AggregateModel] = None
-    is_deprecated_global: bool = False
-
-
-class AllModelsFailedError(RuntimeError):
-    """所有候选模型均不可用时抛出，便于 HTTP 层返回 503。"""
-
-    def __init__(self, message: str, attempted: int = 0, stream_timeout: bool = False, error_code: str = "", fallback_chain: Optional[List[Dict[str, Any]]] = None, aggregate_name: str = "") -> None:
-        super().__init__(message)
-        self.attempted = attempted
-        self.stream_timeout = stream_timeout
-        self.error_code = error_code
-        self.fallback_chain = fallback_chain or []
-        self.aggregate_name = aggregate_name
-
-
-class StreamIdleTimeoutError(TimeoutError):
-    pass
-
-
 class ArkProxyRouter:
     @property
     def logs(self) -> List[RequestLog]:
@@ -265,6 +228,10 @@ class ArkProxyRouter:
         self._stream_idle_timeout_error_type = StreamIdleTimeoutError
         self._route_context_type = RouteContext
         self.runtime = CandidateRuntime(self)
+        # v0.6 composition boundary: the legacy facade owns no execution loop.
+        dependencies: ExecutionDependencies = self
+        self.non_stream_execution = NonStreamExecutionService(dependencies, self.runtime)
+        self.stream_execution = StreamExecutionService(dependencies, self.runtime)
         self.upstream_adapter = upstream_adapter or UpstreamAdapter(_ssl_context)
         self._upstream_client = self._create_upstream_client()
         # 供 DebugCapture 的旧两参数构造路径读取；避免 debug_capture.py 反向 import app。
@@ -1605,10 +1572,10 @@ class ArkProxyRouter:
         return json.dumps(outbound_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), "json-rebuild"
 
     def call(self, path: str, payload: Dict[str, Any], route: RouteContext | str | None = None, incoming_headers: Optional[Dict[str, str]] = None, raw_body: bytes | None = None) -> Tuple[int, Dict[str, str], bytes]:
-        return self.runtime.execute_non_stream(path, payload, route, incoming_headers, raw_body)
+        return self.non_stream_execution.execute(path, payload, route, incoming_headers, raw_body)
 
-    def stream(self, path: str, payload: Dict[str, Any], route: RouteContext | str | None = None, incoming_headers: Optional[Dict[str, str]] = None, raw_body: bytes | None = None) -> Tuple[int, Dict[str, str], Iterable[bytes]]:
-        return self.runtime.execute_stream(path, payload, route, incoming_headers, raw_body)
+    def stream(self, path: str, payload: Dict[str, Any], route: RouteContext | str | None = None, incoming_headers: Optional[Dict[str, str]] = None, raw_body: bytes | None = None) -> Tuple[int, Dict[str, str], Iterable[bytes], str]:
+        return self.stream_execution.execute(path, payload, route, incoming_headers, raw_body)
 
 
 

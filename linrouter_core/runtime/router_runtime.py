@@ -12,16 +12,17 @@ import time
 import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 from linrouter_core.config.constants import DEFAULT_AUTO_MODEL_NAME, GLOBAL_ROUTE_GROUP_ID, PROVIDER_PROXY, PROVIDER_RELAY
+from linrouter_core.contracts.execution_ports import ExecutionDependencies
 
 
 class CandidateErrorClassifier:
     """Pure candidate-error classification shared by the router facade."""
 
     @staticmethod
-    def classify(router: Any, status_code: Optional[int], raw: str, error_kind: str = "http") -> Dict[str, Any]:
+    def classify(dependencies: ExecutionDependencies, status_code: Optional[int], raw: str, error_kind: str = "http") -> Dict[str, Any]:
         if error_kind in ("network", "stream_timeout"):
             return {"should_cooldown": True, "is_request_level": False, "category": error_kind, "log_reason": error_kind, "failure_scope": "upstream"}
         if status_code is None:
@@ -29,14 +30,14 @@ class CandidateErrorClassifier:
         if status_code >= 500:
             return {"should_cooldown": True, "is_request_level": False, "category": "server_error", "log_reason": f"server_error_{status_code}", "failure_scope": "upstream"}
         if status_code == 429:
-            if router._is_rate_limited(status_code, raw):
+            if dependencies._is_rate_limited(status_code, raw):
                 return {"should_cooldown": True, "is_request_level": False, "category": "rate_limit", "log_reason": "rate_limit", "failure_scope": "upstream"}
-            if router._is_quota_exhausted(status_code, raw):
+            if dependencies._is_quota_exhausted(status_code, raw):
                 return {"should_cooldown": True, "is_request_level": False, "category": "quota_exhausted", "log_reason": "quota_exhausted", "failure_scope": "upstream"}
             return {"should_cooldown": True, "is_request_level": False, "category": "rate_limit", "log_reason": "rate_limit_429", "failure_scope": "upstream"}
-        if router._is_waf_blocked_error(status_code, raw):
+        if dependencies._is_waf_blocked_error(status_code, raw):
             return {"should_cooldown": False, "is_request_level": True, "category": "waf_blocked", "log_reason": "waf_blocked", "failure_scope": "candidate"}
-        if router._is_request_level_error(status_code, raw):
+        if dependencies._is_request_level_error(status_code, raw):
             if status_code in (401, 403):
                 return {"should_cooldown": False, "is_request_level": True, "category": "auth_error", "log_reason": "auth_error", "failure_scope": "candidate"}
             return {"should_cooldown": False, "is_request_level": True, "category": "request_level", "log_reason": "request_level", "failure_scope": "request"}
@@ -89,14 +90,44 @@ class WafLockState:
         )
 
 
-class CandidateRuntime:
-    """Candidate enumeration and health/cooldown mutations used through router facades."""
+class ManagedStreamIterator:
+    """Ensures stream resources are released even when no chunk is consumed."""
 
-    def __init__(self, router: Any) -> None:
-        self.router = router
+    def __init__(self, iterator: Iterator[bytes], finalize: Callable[[], None]) -> None:
+        self._iterator = iterator
+        self._finalize = finalize
+        self._closed = False
+
+    def __iter__(self) -> "ManagedStreamIterator":
+        return self
+
+    def __next__(self) -> bytes:
+        return next(self._iterator)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            close = getattr(self._iterator, "close", None)
+            if callable(close):
+                close()
+        finally:
+            self._finalize()
+
+
+class CandidateRuntime:
+    """Candidate enumeration and execution coordination through injected dependencies.
+
+    The class deliberately has no import dependency on the legacy application
+    facade or HTTP transport; composition supplies its frozen policy surface.
+    """
+
+    def __init__(self, dependencies: ExecutionDependencies) -> None:
+        self.dependencies = dependencies
 
     def iter_candidates(self, requested_model: str | None, group_id: str | None = None) -> Iterator[Tuple[int, Any]]:
-        router = self.router
+        router = self.dependencies
         group = router.store.find_group(group_id) if group_id else None
         if router._is_auto_model(requested_model, group):
             requested_model = None
@@ -118,12 +149,12 @@ class CandidateRuntime:
             yield idx, model
 
     def candidate_from_model(self, idx: int, model: Any, group: Any) -> Any:
-        mode = self.router._mode_for(group)
+        mode = self.dependencies._mode_for(group)
         channel = model.price_group if mode == PROVIDER_RELAY and model.price_group else ("proxy" if mode == PROVIDER_PROXY else "")
-        return self.router._upstream_candidate_type(idx=idx, group=group, model=model, label=model.name, target_model=model.ep_id, auth_key=self.router._auth_for(group, model), channel=channel)
+        return self.dependencies._upstream_candidate_type(idx=idx, group=group, model=model, label=model.name, target_model=model.ep_id, auth_key=self.dependencies._auth_for(group, model), channel=channel)
 
     def iter_upstream_candidates(self, requested_model: str | None, group_id: str | None = None) -> Iterator[Any]:
-        router = self.router
+        router = self.dependencies
         if group_id == GLOBAL_ROUTE_GROUP_ID:
             return
         if group_id:
@@ -143,7 +174,7 @@ class CandidateRuntime:
                 yield self.candidate_from_model(idx, model, group)
 
     def aggregate_member_skip_reason(self, member: Any) -> Tuple[str, str, Any, Any]:
-        router = self.router
+        router = self.dependencies
         group = router.store.find_group(member.group_id)
         model = router.store.find_model(member.model_id)
         now_ts = int(time.time())
@@ -162,7 +193,7 @@ class CandidateRuntime:
         return "", "", group, model
 
     def iter_aggregate_candidates(self, aggregate: Any, **kwargs: Any) -> Iterator[Any]:
-        router = self.router
+        router = self.dependencies
         router.store.refresh_expired_cooldowns()
         members = router.store.get_aggregate_members(aggregate.id)
         strategy = aggregate.strategy or "priority"
@@ -186,20 +217,20 @@ class CandidateRuntime:
             yield candidate
 
     def set_cooldown(self, idx: int, error: str, cooldown_seconds: int, reason: str) -> None:
-        model = self.router.store.models[idx]
+        model = self.dependencies.store.models[idx]
         model.usable = False
         model.last_error = error[:500]
-        model.last_checked_at = self.router._now()
+        model.last_checked_at = self.dependencies._now()
         model.cooldown_until = int(time.time()) + max(0, cooldown_seconds)
         model.cooldown_reason = reason[:120]
-        self.router.store.save()
+        self.dependencies.store.save()
 
     def set_success(self, idx: int) -> None:
-        model = self.router.store.models[idx]
+        model = self.dependencies.store.models[idx]
         model.last_error = ""
-        model.last_success_at = self.router._now()
+        model.last_success_at = self.dependencies._now()
         model.last_checked_at = model.last_success_at
-        self.router.store.save()
+        self.dependencies.store.save()
 
     def execute_non_stream(
         self,
@@ -210,7 +241,7 @@ class CandidateRuntime:
         raw_body: bytes | None = None,
     ) -> Tuple[int, Dict[str, str], bytes]:
         """Execute the frozen non-stream candidate/request/fallback chain via the router facade."""
-        router = self.router
+        router = self.dependencies
         router.store.refresh_expired_cooldowns()
         incoming_headers = incoming_headers or {}
         requested_model = payload.get("model")
@@ -559,7 +590,7 @@ class CandidateRuntime:
 
     def execute_stream(self, path: str, payload: Dict[str, Any], route: Any = None, incoming_headers: Optional[Dict[str, str]] = None, raw_body: bytes | None = None) -> Any:
         """Execute the frozen stream candidate/request/fallback chain via the router facade."""
-        router = self.router
+        router = self.dependencies
         router.store.refresh_expired_cooldowns()
         incoming_headers = incoming_headers or {}
         requested_model = payload.get("model")
@@ -570,7 +601,7 @@ class CandidateRuntime:
         if is_deprecated_global:
             def deprecated_iter():
                 yield json.dumps({"error": {"message": "全局 Key 已停用，请改用连接组 Key 或聚合模型 Key", "type": "global_key_deprecated", "code": "use_group_or_aggregate_key"}}, ensure_ascii=False).encode("utf-8")
-            return 403, {"Content-Type": "application/json; charset=utf-8"}, deprecated_iter()
+            return 403, {"Content-Type": "application/json; charset=utf-8"}, deprecated_iter(), ""
         route_aggregate = route.aggregate if isinstance(route, router._route_context_type) else None
         is_global = isinstance(route, router._route_context_type) and route.is_global
         auto_mode = router._is_auto_model(str(requested_model) if requested_model else None, route_group)
@@ -718,12 +749,58 @@ class CandidateRuntime:
                 except Exception:
                     pass
 
+                usage_total = latest_usage
+                chunks_received = 1
+                bytes_received = len(first_chunk)
+                stream_state = {"timeout": False, "completed_normally": False}
+                release_reason = "client_disconnect"
+                finalized = False
+
+                def finalize_stream() -> None:
+                    nonlocal finalized
+                    if finalized:
+                        return
+                    finalized = True
+                    if resp:
+                        resp.close()
+                    final_duration_ms = int((time.perf_counter() - started_at) * 1000)
+                    if stream_state["timeout"]:
+                        usage_source = "stream_incomplete"
+                        lifecycle_status = "timeout"
+                        lifecycle_result = "stream_idle_timeout"
+                        lifecycle_scope = "upstream"
+                    elif stream_state["completed_normally"]:
+                        usage_source = "stream_final" if any(usage_total) else "missing"
+                        lifecycle_status = "200"
+                        lifecycle_result = "stream_done"
+                        lifecycle_scope = ""
+                    else:
+                        usage_source = "stream_incomplete"
+                        lifecycle_status = "client_disconnected"
+                        lifecycle_result = "client_disconnected"
+                        lifecycle_scope = "request"
+                    router.patch_stream_lifecycle(
+                        request_id,
+                        attempt,
+                        candidate.label,
+                        usage_total,
+                        usage_source,
+                        final_status=lifecycle_status,
+                        lifecycle=lifecycle_result,
+                        final_result=lifecycle_result,
+                        chunks_received=chunks_received,
+                        bytes_received=bytes_received,
+                        duration_ms=final_duration_ms,
+                        lock_wait_ms=lock_wait_ms,
+                        lock_release_reason=release_reason,
+                        failure_scope=lifecycle_scope,
+                    )
+                    router._live_request_finish(request_id, "done" if stream_state["completed_normally"] else "ended")
+                    router._mark_stream_active(candidate, -1)
+                    router._release_lock(upstream_lock)
+
                 def iterator() -> Iterator[bytes]:
-                    usage_total = latest_usage
-                    chunks_received = 1
-                    bytes_received = len(first_chunk)
-                    stream_state = {"timeout": False, "completed_normally": False}
-                    release_reason = "client_disconnect"
+                    nonlocal usage_total, chunks_received, bytes_received, release_reason
                     try:
                         yield first_chunk
                         while True:
@@ -744,45 +821,9 @@ class CandidateRuntime:
                                 usage_total = usage
                             yield chunk
                     finally:
-                        if resp:
-                            resp.close()
-                        final_duration_ms = int((time.perf_counter() - started_at) * 1000)
-                        if stream_state["timeout"]:
-                            usage_source = "stream_incomplete"
-                            lifecycle_status = "timeout"
-                            lifecycle_result = "stream_idle_timeout"
-                            lifecycle_scope = "upstream"
-                        elif stream_state["completed_normally"]:
-                            usage_source = "stream_final" if any(usage_total) else "missing"
-                            lifecycle_status = "200"
-                            lifecycle_result = "stream_done"
-                            lifecycle_scope = ""
-                        else:
-                            usage_source = "stream_incomplete"
-                            lifecycle_status = "client_disconnected"
-                            lifecycle_result = "client_disconnected"
-                            lifecycle_scope = "request"
-                        router.patch_stream_lifecycle(
-                            request_id,
-                            attempt,
-                            candidate.label,
-                            usage_total,
-                            usage_source,
-                            final_status=lifecycle_status,
-                            lifecycle=lifecycle_result,
-                            final_result=lifecycle_result,
-                            chunks_received=chunks_received,
-                            bytes_received=bytes_received,
-                            duration_ms=final_duration_ms,
-                            lock_wait_ms=lock_wait_ms,
-                            lock_release_reason=release_reason,
-                            failure_scope=lifecycle_scope,
-                        )
-                        router._live_request_finish(request_id, "done" if stream_state["completed_normally"] else "ended")
-                        router._mark_stream_active(candidate, -1)
-                        router._release_lock(upstream_lock)
+                        finalize_stream()
 
-                return 200, dict(resp.headers.items()), iterator(), request_id
+                return 200, dict(resp.headers.items()), ManagedStreamIterator(iterator(), finalize_stream), request_id
             except router._stream_idle_timeout_error_type as err:
                 saw_stream_timeout = True
                 saw_cooldown = True

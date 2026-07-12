@@ -18,8 +18,6 @@ from linrouter_core.runtime.handler_runtime import handle_proxy_request
 ROOT = Path(__file__).resolve().parent.parent
 FROZEN_METHODS = {
     "_require_route_context",
-    "call",
-    "stream",
     "finalize_stream_if_needed",
 }
 TARGET_MARKER = '        if parsed.path.startswith("/v1/") or parsed.path.startswith("/chat/"):'

@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app import ArkProxyRouter, ConfigStore, RouteContext
-from linrouter_core.runtime import CandidateRuntime
+from linrouter_core.runtime import CandidateRuntime, StreamExecutionService
 from test_stream_no_fallback import (
     FirstUpstreamHandler,
     SecondUpstreamHandler,
@@ -22,9 +22,8 @@ from test_stream_no_fallback import (
 
 
 ROOT = Path(__file__).resolve().parent.parent
-# M4 owns all HTTP verb dispatch; this M3c contract now freezes only the
-# non-stream facade that remains outside the M4 route grouping.
-FROZEN_METHODS = {"call"}
+# I1 owns execution facade delegation. HTTP dispatch remains frozen separately.
+FROZEN_METHODS: set[str] = set()
 
 
 class AttributeBearingGroupId(str):
@@ -64,9 +63,11 @@ def _aggregate_context(store: ConfigStore) -> RouteContext:
 def test_m3c_stream_facade_delegates_with_original_argument_order() -> None:
     facade_source = inspect.getsource(ArkProxyRouter.stream)
     executor_source = inspect.getsource(CandidateRuntime.execute_stream)
+    service_source = inspect.getsource(StreamExecutionService.execute)
 
     assert facade_source.count("return ") == 1
-    assert "self.runtime.execute_stream(path, payload, route, incoming_headers, raw_body)" in facade_source
+    assert "self.stream_execution.execute(path, payload, route, incoming_headers, raw_body)" in facade_source
+    assert "self._candidates.execute_stream(path, payload, route, incoming_headers, raw_body)" in service_source
     assert "yield " not in facade_source
     assert "except " not in facade_source
     assert "router._upstream_client.request" in executor_source

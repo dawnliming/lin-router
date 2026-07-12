@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app import ArkProxyRouter
-from linrouter_core.runtime import CandidateRuntime
+from linrouter_core.runtime import CandidateRuntime, NonStreamExecutionService
 from test_cooldown_classification import (
     BadRequest400Handler,
     build_one_relay_group_two_models,
@@ -26,8 +26,10 @@ from test_waf_lock_busy_classification import (
 def test_m3b_call_facade_delegates_to_runtime_executor() -> None:
     call_source = inspect.getsource(ArkProxyRouter.call)
     executor_source = inspect.getsource(CandidateRuntime.execute_non_stream)
+    service_source = inspect.getsource(NonStreamExecutionService.execute)
 
-    assert "self.runtime.execute_non_stream" in call_source
+    assert "self.non_stream_execution.execute" in call_source
+    assert "self._candidates.execute_non_stream" in service_source
     assert "_upstream_client.request" in executor_source
     assert "except HTTPError" in executor_source
     assert "except (URLError, TimeoutError, OSError)" in executor_source
