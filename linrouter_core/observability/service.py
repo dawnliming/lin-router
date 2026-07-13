@@ -21,6 +21,8 @@ class ObservabilityService:
     this service intentionally exposes no candidate, cooldown, retry, or upstream APIs.
     """
 
+    LOG_RETENTION = 5000
+
     def __init__(
         self,
         log_file: Path,
@@ -97,7 +99,7 @@ class ObservabilityService:
 
     def load(self) -> None:
         try:
-            items = self._repository.load_recent(80)
+            items = self._repository.load_recent(self.LOG_RETENTION)
             for item in items:
                 if not item.time:
                     item.time = self._now()
@@ -133,7 +135,7 @@ class ObservabilityService:
             )
             self.logs.insert(0, item)
             self._append(item)
-            del self.logs[80:]
+            del self.logs[self.LOG_RETENTION:]
             self._trim()
 
     def _append(self, item: RequestLog) -> None:
@@ -143,9 +145,9 @@ class ObservabilityService:
             except Exception as exc:
                 self.log_write_error = f"日志写入失败: {exc}"
                 self.logs.insert(0, RequestLog(self._now(), "/system/log", "-", "warn", f"日志写入失败: {exc}; file={self.log_file}", group_name="系统", provider_type="system", event="system"))
-                del self.logs[80:]
+                del self.logs[self.LOG_RETENTION:]
 
-    def trim(self, max_lines: int = 1000) -> None:
+    def trim(self, max_lines: int = LOG_RETENTION) -> None:
         with self._logs_lock:
             try:
                 self._repository.trim(max_lines)

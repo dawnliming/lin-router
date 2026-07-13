@@ -736,7 +736,7 @@ class CandidateRuntime:
                 if not first_chunk:
                     raise URLError("upstream stream closed before first chunk")
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
-                latest_usage = self.stream_lifecycle.usage_from_stream_chunk(first_chunk)
+                latest_usage, usage_present = self.stream_lifecycle.usage_from_stream_chunk_with_presence(first_chunk)
                 state.mark_success(candidate)
                 if candidate.aggregate_member_id:
                     state.mark_aggregate_member_success(candidate.aggregate_member_id)
@@ -829,7 +829,7 @@ class CandidateRuntime:
                         lifecycle_result = "stream_idle_timeout"
                         lifecycle_scope = "upstream"
                     elif stream_state["lifecycle"] == "stream_done":
-                        usage_source = "stream_final" if any(usage_total) else "missing"
+                        usage_source = "stream_final" if usage_present else "missing"
                         lifecycle_status = "200"
                         lifecycle_result = "stream_done"
                         lifecycle_scope = ""
@@ -867,7 +867,7 @@ class CandidateRuntime:
                     self.concurrency.release(upstream_lock)
 
                 def iterator() -> Iterator[bytes]:
-                    nonlocal usage_total, chunks_received, bytes_received, release_reason
+                    nonlocal usage_total, usage_present, chunks_received, bytes_received, release_reason
                     try:
                         if first_completion_signal:
                             finalize_stream()
@@ -890,9 +890,10 @@ class CandidateRuntime:
                                 break
                             chunks_received += 1
                             bytes_received += len(chunk)
-                            usage = self.stream_lifecycle.usage_from_stream_chunk(chunk)
-                            if any(usage):
+                            usage, chunk_usage_present = self.stream_lifecycle.usage_from_stream_chunk_with_presence(chunk)
+                            if chunk_usage_present:
                                 usage_total = usage
+                                usage_present = True
                             completion_signal = terminal_signal_for(chunk)
                             if completion_signal:
                                 mark_stream_terminal(completion_signal)

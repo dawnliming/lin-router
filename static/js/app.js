@@ -54,10 +54,10 @@ const App = {
     try {
       const data = await API.getRuntimeState({ silent: true });
       const patch = {
-        logs: data.logs || Store.state.logs || [],
         log_write_error: data.log_write_error || '',
         live_requests: data.live_requests || [],
       };
+      if (Tabs.current !== 'logs') patch.logs = data.logs || Store.state.logs || [];
       if (data.models) {
         const runtimeById = new Map(data.models.map(item => [item.model_id, item]));
         patch.models = (Store.state.models || []).map(model => runtimeById.has(model.id) ? { ...model, ...runtimeById.get(model.id) } : model);

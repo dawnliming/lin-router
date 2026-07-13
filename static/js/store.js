@@ -72,6 +72,10 @@ const Store = {
       .sort((a, b) => (a.priority || 0) - (b.priority || 0));
   },
 
+  getAggregateMemberRevision(aggregateId) {
+    return Number(this.state.aggregate_member_revisions?.[aggregateId] || 0);
+  },
+
   update(patch) {
     this.state = { ...this.state, ...patch };
     this.emit();

@@ -648,6 +648,33 @@ input[aria-invalid="true"] { border-color: var(--danger); }
   border-bottom: none;
 }
 
+.aggregate-members-table tr.aggregate-member-dragging {
+  opacity: .5;
+}
+
+.aggregate-members-table tr.aggregate-member-drop-target td {
+  border-top: 2px solid var(--accent);
+}
+
+.aggregate-members-table tbody.aggregate-members-saving {
+  opacity: .65;
+  pointer-events: none;
+}
+
+.aggregate-drag-handle {
+  display: inline-block;
+  margin-right: 6px;
+  color: var(--text-secondary);
+  cursor: grab;
+  font-size: 16px;
+  line-height: 1;
+  vertical-align: -1px;
+}
+
+.aggregate-drag-handle:active {
+  cursor: grabbing;
+}
+
 .aggregate-members-table td.tiny {
   white-space: nowrap;
 }

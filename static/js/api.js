@@ -26,10 +26,14 @@ const API = {
       if (!res.ok) {
         const text = await res.text().catch(() => '');
         let message = text || `HTTP ${res.status}`;
-        // 后端可能返回 JSON 错误对象，优先提取其中的具体信息
+        let errorCode = '';
+        let errorRevision;
         try {
           const json = JSON.parse(text);
           if (json && typeof json === 'object') {
+            const error = json.error && typeof json.error === 'object' ? json.error : json;
+            errorCode = String(error.code || '');
+            errorRevision = error.revision;
             if (json.message) {
               message = String(json.message);
             } else if (json.error) {
@@ -43,7 +47,11 @@ const API = {
         } catch (_) {
           // 不是 JSON，保持原始文本
         }
-        throw new Error(message);
+        const error = new Error(message);
+        error.status = res.status;
+        error.code = errorCode;
+        if (errorRevision !== undefined) error.revision = errorRevision;
+        throw error;
       }
       const contentType = res.headers.get('content-type') || '';
       if (contentType.includes('application/json')) return res.json();
@@ -58,9 +66,9 @@ const API = {
   getLiveRequests(opts = {}) { return this.req('/api/live-requests', opts); },
   cancelLiveRequest(requestId) { return this.req(`/api/live-requests/${encodeURIComponent(requestId)}/cancel`, { method: 'POST' }); },
   diagnoseRequest(requestId, opts = {}) { return this.req(`/api/diagnose/${encodeURIComponent(requestId)}`, opts); },
-  getLogs(params = {}) {
+  getLogs(params = {}, opts = {}) {
     const qs = new URLSearchParams(params).toString();
-    return this.req(`/api/logs${qs ? '?' + qs : ''}`);
+    return this.req(`/api/logs${qs ? '?' + qs : ''}`, opts);
   },
   getAllLogs() { return this.req('/api/logs/all'); },
   clearLogs() { return this.req('/api/logs/clear', { method: 'POST' }); },
@@ -97,6 +105,7 @@ const API = {
   saveAggregate(id, data) { return this.req(`/api/aggregates/${id}`, { method: 'PUT', body: JSON.stringify(data) }); },
   deleteAggregate(id) { return this.req(`/api/aggregates/${id}`, { method: 'DELETE' }); },
   createAggregateMember(aggregateId, data) { return this.req(`/api/aggregates/${aggregateId}/members`, { method: 'POST', body: JSON.stringify(data) }); },
+  reorderAggregateMembers(aggregateId, memberIds, expectedRevision) { return this.req(`/api/aggregates/${aggregateId}/members/reorder`, { method: 'POST', body: JSON.stringify({ member_ids: memberIds, expected_revision: expectedRevision }) }); },
   saveAggregateMember(id, data) { return this.req(`/api/aggregate-members/${id}`, { method: 'PUT', body: JSON.stringify(data) }); },
   clearAggregateMemberCooldown(id) { return this.req(`/api/aggregate-members/${id}/clear-cooldown`, { method: 'POST' }); },
   recoverAggregateMember(id) { return this.req(`/api/aggregate-members/${id}/recover`, { method: 'POST' }); },

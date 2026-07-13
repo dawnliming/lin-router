@@ -64,3 +64,12 @@ def test_observability_compatibility_facades_forward_trim_and_rewrite_errors(tmp
     router.log_write_error = ""
     router._rewrite_log_file()
     assert router.log_write_error == "日志回写失败: disk full"
+
+
+def test_observability_loads_and_retains_more_than_legacy_eighty_rows(tmp_path: Path) -> None:
+    router = ArkProxyRouter(Store(), None, tmp_path / "logs.jsonl")
+    for index in range(120):
+        router.add_log("/v1/test", "demo", "200", request_id=f"request-{index}")
+    restored = ArkProxyRouter(Store(), None, tmp_path / "logs.jsonl")
+    assert len(restored.logs) == 120
+    assert restored.all_logs()[0].request_id == "request-0"

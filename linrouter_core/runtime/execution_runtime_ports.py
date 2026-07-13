@@ -73,12 +73,17 @@ class ConcurrencyPort:
 
 
 class StreamLifecyclePort:
-    def __init__(self, *, idle_timeout: Callable[[Any], int], readline: Callable[..., bytes], response_usage: Callable[[bytes], tuple[int, int, int, int, int]], chunk_usage: Callable[[bytes], tuple[int, int, int, int, int]], completion_signal: Callable[[bytes], str], mark_timeout: Callable[..., int]) -> None:
-        self._idle_timeout = idle_timeout; self._readline = readline; self._response_usage = response_usage; self._chunk_usage = chunk_usage; self._completion_signal = completion_signal; self._mark_timeout = mark_timeout
+    def __init__(self, *, idle_timeout: Callable[[Any], int], readline: Callable[..., bytes], response_usage: Callable[[bytes], tuple[int, int, int, int, int]], chunk_usage: Callable[[bytes], tuple[int, int, int, int, int]], completion_signal: Callable[[bytes], str], mark_timeout: Callable[..., int], chunk_usage_with_presence: Callable[[bytes], Tuple[tuple[int, int, int, int, int], bool]] | None = None) -> None:
+        self._idle_timeout = idle_timeout; self._readline = readline; self._response_usage = response_usage; self._chunk_usage = chunk_usage; self._chunk_usage_with_presence = chunk_usage_with_presence; self._completion_signal = completion_signal; self._mark_timeout = mark_timeout
     def idle_timeout_seconds(self, group: Any) -> int: return self._idle_timeout(group)
     def readline_with_idle_timeout(self, response: Any, timeout: int) -> bytes: return self._readline(response, timeout)
     def usage_from_response(self, data: bytes) -> tuple[int, int, int, int, int]: return self._response_usage(data)
     def usage_from_stream_chunk(self, chunk: bytes) -> tuple[int, int, int, int, int]: return self._chunk_usage(chunk)
+    def usage_from_stream_chunk_with_presence(self, chunk: bytes) -> Tuple[tuple[int, int, int, int, int], bool]:
+        if self._chunk_usage_with_presence is not None:
+            return self._chunk_usage_with_presence(chunk)
+        usage = self._chunk_usage(chunk)
+        return usage, any(usage)
     def completion_signal(self, chunk: bytes) -> str: return self._completion_signal(chunk)
     def mark_stream_timeout(self, candidate: Any, error: str) -> int: return self._mark_timeout(candidate, error)
 

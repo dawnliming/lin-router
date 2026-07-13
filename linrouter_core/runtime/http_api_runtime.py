@@ -110,6 +110,7 @@ def handle_get(handler: Any) -> None:
             "models": [asdict(m) for m in handler.store.models],
             "aggregate_models": [asdict(m) for m in handler.store.aggregate_models],
             "aggregate_members": [asdict(m) for m in handler.store.aggregate_members],
+            "aggregate_member_revisions": dict(handler.store.aggregate_member_revisions),
             "logs": handler._filtered_recent_logs(),
             "log_file": str(handler.router.log_file),
             "log_write_error": handler.router.log_write_error,
@@ -176,7 +177,9 @@ def handle_get(handler: Any) -> None:
         def _first(values, default=""):
             return values[0] if values else default
 
-        logs = list(reversed(handler.router.logs))
+        # The JSONL repository, not the in-memory recent window, is the
+        # canonical history source for server-side filtering and pagination.
+        logs = list(reversed(handler.router.all_logs()))
         limit = int(_first(params.get("limit"), "0") or 0)
         offset = int(_first(params.get("offset"), "0") or 0)
         group_filter = _first(params.get("group"))
@@ -802,6 +805,30 @@ def handle_post(handler: Any) -> None:
             return
         handler._send_json({"ok": True, "aggregate_model": asdict(aggregate)})
         return
+    if parsed.path.startswith("/api/aggregates/") and parsed.path.endswith("/members/reorder"):
+        parts = parsed.path.split("/")
+        if len(parts) != 6:
+            handler._send_json({"error": {"message": "请求路径无效", "type": "invalid_request_error", "code": "invalid_path"}}, status=400)
+            return
+        payload = handler._read_json()
+        member_ids = payload.get("member_ids") if isinstance(payload, dict) else None
+        expected_revision = payload.get("expected_revision") if isinstance(payload, dict) else None
+        if not isinstance(member_ids, list) or not all(isinstance(member_id, str) and member_id.strip() for member_id in member_ids):
+            handler._send_json({"error": {"message": "成员排序参数无效", "type": "invalid_request_error", "code": "invalid_member_order"}}, status=400)
+            return
+        if not isinstance(expected_revision, int) or isinstance(expected_revision, bool) or expected_revision < 0:
+            handler._send_json({"error": {"message": "成员排序版本无效", "type": "invalid_request_error", "code": "invalid_expected_revision"}}, status=400)
+            return
+        aggregate_id = parts[3]
+        ok, message, code, revision = handler.store.reorder_aggregate_members(aggregate_id, member_ids, expected_revision)
+        if not ok:
+            status = 404 if code == "aggregate_not_found" else (409 if code == "aggregate_member_revision_conflict" else 400)
+            error_type = "conflict_error" if status == 409 else "invalid_request_error"
+            handler._send_json({"error": {"message": message, "type": error_type, "code": code, "revision": revision}}, status=status)
+            return
+        members = sorted(handler.store.get_aggregate_members(aggregate_id), key=lambda member: member.priority)
+        handler._send_json({"ok": True, "revision": revision, "members": [asdict(member) for member in members]})
+        return
     if parsed.path.startswith("/api/aggregates/") and parsed.path.endswith("/members"):
         parts = parsed.path.split("/")
         if len(parts) < 5:
@@ -901,34 +928,39 @@ def handle_post(handler: Any) -> None:
     handler._send_json({"error": {"message": "资源不存在", "type": "invalid_request_error", "code": "not_found"}}, status=404)
 
 
+def _forward_put_as_post(handler: Any, path: str, body: bytes) -> None:
+    """Reuse POST handlers without leaking a PUT body into the next request."""
+    original_path = handler.path
+    handler.path = path
+    handler._put_body = body
+    try:
+        handler.do_POST()
+    finally:
+        handler.path = original_path
+        delattr(handler, "_put_body")
+
+
 def handle_put(handler: Any) -> None:
     """把 PUT /api/groups/{id}、PUT /api/models/{id} 和 PUT /api/settings 转发到对应的 POST 处理逻辑。"""
     parsed = urlparse(handler.path)
     if parsed.path == "/api/settings":
         # 前端设置面板使用 PUT 保存设置，复用 do_POST 的处理逻辑
-        handler._put_body = handler._read_raw_body()
-        return handler.do_POST()
+        return _forward_put_as_post(handler, handler.path, handler._read_raw_body())
     if parsed.path.startswith("/api/groups/"):
         group_id = parsed.path.split("/")[3]
         payload = handler._read_json()
         payload["id"] = group_id
-        handler.path = "/api/groups"
-        handler._put_body = json.dumps(payload).encode("utf-8")
-        return handler.do_POST()
+        return _forward_put_as_post(handler, "/api/groups", json.dumps(payload).encode("utf-8"))
     if parsed.path.startswith("/api/models/"):
         model_id = parsed.path.split("/")[3]
         payload = handler._read_json()
         payload["id"] = model_id
-        handler.path = "/api/models"
-        handler._put_body = json.dumps(payload).encode("utf-8")
-        return handler.do_POST()
+        return _forward_put_as_post(handler, "/api/models", json.dumps(payload).encode("utf-8"))
     if parsed.path.startswith("/api/aggregates/"):
         aggregate_id = parsed.path.split("/")[3]
         payload = handler._read_json()
         payload["id"] = aggregate_id
-        handler.path = "/api/aggregates"
-        handler._put_body = json.dumps(payload).encode("utf-8")
-        return handler.do_POST()
+        return _forward_put_as_post(handler, "/api/aggregates", json.dumps(payload).encode("utf-8"))
     if parsed.path.startswith("/api/aggregate-members/"):
         member_id = parsed.path.split("/")[3]
         payload = handler._read_json()
@@ -937,9 +969,8 @@ def handle_put(handler: Any) -> None:
         existing = handler.store.find_aggregate_member(member_id)
         if existing and not payload.get("aggregate_id"):
             payload["aggregate_id"] = existing.aggregate_id
-        handler.path = f"/api/aggregates/{payload.get('aggregate_id')}/members"
-        handler._put_body = json.dumps(payload).encode("utf-8")
-        return handler.do_POST()
+        path = f"/api/aggregates/{payload.get('aggregate_id')}/members"
+        return _forward_put_as_post(handler, path, json.dumps(payload).encode("utf-8"))
     handler._send_json({"error": {"message": "资源不存在", "type": "invalid_request_error", "code": "not_found"}}, status=404)
 
 

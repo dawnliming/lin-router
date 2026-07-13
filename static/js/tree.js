@@ -116,20 +116,23 @@ const Tree = {
   buildGroupHtml(g, models) {
     const groupModels = models.filter(m => m.group_id === g.id);
     const expanded = this.expanded.has(g.id);
-    const summary = ConnectionStatus.group(g);
     const status = this.groupStatus(g, groupModels);
     const modeLabel = { ark: '方舟', relay: '中转', proxy: '代理' }[g.provider_type] || g.provider_type;
+    const availableCount = groupModels.filter(model => model.usable !== false && !(model.cooldown_until && model.cooldown_until * 1000 > Date.now())).length;
+    const summaryText = groupModels.length
+      ? `模型 ${groupModels.length} · 可用 ${availableCount}`
+      : '模型 0 · 无可用模型';
     const active = Store.selected.type === 'group' && Store.selected.id === g.id ? 'active' : '';
     const filtered = this.search && !this.matchesGroup(g, groupModels) ? 'hidden' : '';
 
     return `
       <div class="tree-node ${filtered}" data-type="group" data-id="${g.id}">
-        <div class="tree-group ${active}" data-type="group" data-id="${g.id}" data-context="group" title="${Utils.escapeHtml(`${summary.label}：${summary.reason}`)}">
+        <div class="tree-group ${active}" data-type="group" data-id="${g.id}" data-context="group" title="${Utils.escapeHtml(summaryText)}">
           <span class="tree-toggle" data-action="toggle">${expanded ? '▼' : '▶'}</span>
           <span class="tree-status ${status}"></span>
           <span class="tree-label">${this.highlight(Utils.escapeHtml(g.name))}</span>
           <span class="tree-badge">${modeLabel}</span>
-          <span class="tree-meta">${groupModels.length}模型 · ${Utils.escapeHtml(summary.label)}</span>
+          <span class="tree-meta">${Utils.escapeHtml(summaryText)}</span>
         </div>
         <div class="tree-children ${expanded ? '' : 'hidden'}">
           ${groupModels.map(m => this.buildModelHtml(m)).join('')}

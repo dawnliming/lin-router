@@ -28,6 +28,7 @@ class ConfigStore:
         self.models: List[ModelConfig] = []
         self.aggregate_models: List[AggregateModel] = []
         self.aggregate_members: List[AggregateMember] = []
+        self.aggregate_member_revisions: Dict[str, int] = {}
         self.load()
 
     def load(self) -> None:
@@ -59,6 +60,7 @@ class ConfigStore:
         models_raw = raw.get("models", [])
         aggregates_raw = raw.get("aggregate_models", [])
         members_raw = raw.get("aggregate_members", [])
+        revisions_raw = raw.get("aggregate_member_revisions", {})
         if isinstance(groups_raw, list):
             self.groups = [ConnectionGroup.from_dict(x) for x in groups_raw if isinstance(x, dict)]
         else:
@@ -115,6 +117,12 @@ class ConfigStore:
 
         self.aggregate_models = [AggregateModel.from_dict(x) for x in aggregates_raw if isinstance(x, dict)] if isinstance(aggregates_raw, list) else []
         self.aggregate_members = [AggregateMember.from_dict(x) for x in members_raw if isinstance(x, dict)] if isinstance(members_raw, list) else []
+        self.aggregate_member_revisions = {
+            str(aggregate_id): max(0, int(revision or 0))
+            for aggregate_id, revision in revisions_raw.items()
+        } if isinstance(revisions_raw, dict) else {}
+        for aggregate in self.aggregate_models:
+            self.aggregate_member_revisions.setdefault(aggregate.id, 0)
         # 旧配置升级：为没有 route_key 的聚合模型自动生成
         for agg in self.aggregate_models:
             if not str(agg.route_key or "").strip():
@@ -133,6 +141,7 @@ class ConfigStore:
                 "models": [asdict(m) for m in self.models],
                 "aggregate_models": [asdict(m) for m in self.aggregate_models],
                 "aggregate_members": [asdict(m) for m in self.aggregate_members],
+                "aggregate_member_revisions": self.aggregate_member_revisions,
             }
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
             tmp.parent.mkdir(parents=True, exist_ok=True)
@@ -165,6 +174,15 @@ class ConfigStore:
 
     def get_aggregate_members(self, aggregate_id: str) -> List[AggregateMember]:
         return [m for m in self.aggregate_members if m.aggregate_id == aggregate_id]
+
+    def aggregate_member_revision(self, aggregate_id: str) -> int:
+        with self._lock:
+            return int(self.aggregate_member_revisions.get(aggregate_id, 0))
+
+    def _touch_aggregate_member_revision(self, aggregate_id: str) -> int:
+        revision = self.aggregate_member_revision(aggregate_id) + 1
+        self.aggregate_member_revisions[aggregate_id] = revision
+        return revision
 
     def find_aggregate_member(self, member_id: str) -> Optional[AggregateMember]:
         return next((m for m in self.aggregate_members if m.id == member_id), None)
@@ -248,6 +266,7 @@ class ConfigStore:
             else:
                 aggregate.created_at = now
                 self.aggregate_models.append(aggregate)
+                self.aggregate_member_revisions.setdefault(aggregate.id, 0)
             self.save()
             return True, ""
 
@@ -260,6 +279,7 @@ class ConfigStore:
             self.aggregate_members = [m for m in self.aggregate_members if m.aggregate_id != aggregate_id]
             removed_members_count = before_members - len(self.aggregate_members)
             if removed_models or removed_members_count:
+                self.aggregate_member_revisions.pop(aggregate_id, None)
                 self.save()
             return removed_models, removed_members_count
 
@@ -306,15 +326,19 @@ class ConfigStore:
                     max_priority = max((m.priority for m in siblings), default=0)
                     member.priority = max_priority + 1
                 self.aggregate_members.append(member)
+            self._touch_aggregate_member_revision(member.aggregate_id)
             self.save()
             return True, ""
 
     def remove_aggregate_member(self, member_id: str) -> bool:
         with self._lock:
+            member = self.find_aggregate_member(member_id)
             before = len(self.aggregate_members)
             self.aggregate_members = [m for m in self.aggregate_members if m.id != member_id]
             changed = len(self.aggregate_members) != before
             if changed:
+                if member:
+                    self._touch_aggregate_member_revision(member.aggregate_id)
                 self.save()
             return changed
 
@@ -345,8 +369,30 @@ class ConfigStore:
             siblings[idx], siblings[new_idx] = siblings[new_idx], siblings[idx]
             for i, m in enumerate(siblings):
                 m.priority = i + 1
+            self._touch_aggregate_member_revision(member.aggregate_id)
             self.save()
             return True
+
+    def reorder_aggregate_members(self, aggregate_id: str, member_ids: List[str], expected_revision: Optional[int] = None) -> Tuple[bool, str, str, int]:
+        """Atomically replace one aggregate's complete member order when its revision matches."""
+        with self._lock:
+            if not self.find_aggregate(aggregate_id):
+                return False, "聚合模型不存在", "aggregate_not_found", 0
+            current_revision = self.aggregate_member_revision(aggregate_id)
+            if expected_revision is not None and expected_revision != current_revision:
+                return False, "成员顺序已被其他操作更新，请刷新后重试", "aggregate_member_revision_conflict", current_revision
+            siblings = sorted(self.get_aggregate_members(aggregate_id), key=lambda member: member.priority)
+            expected_ids = [member.id for member in siblings]
+            if len(member_ids) != len(expected_ids) or len(set(member_ids)) != len(member_ids):
+                return False, "成员排序无效，必须包含当前聚合模型的全部且不重复成员", "invalid_member_order", current_revision
+            if set(member_ids) != set(expected_ids):
+                return False, "成员排序包含缺失或不属于当前聚合模型的成员", "invalid_member_order", current_revision
+            by_id = {member.id: member for member in siblings}
+            for priority, member_id in enumerate(member_ids, start=1):
+                by_id[member_id].priority = priority
+            revision = self._touch_aggregate_member_revision(aggregate_id)
+            self.save()
+            return True, "", "", revision
 
     def clear_aggregate_member_cooldown(self, member_id: str, now_str: Optional[str] = None) -> bool:
         with self._lock:

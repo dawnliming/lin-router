@@ -306,6 +306,7 @@ class ArkProxyRouter:
             readline=self._readline_with_idle_timeout,
             response_usage=self._usage_from_response,
             chunk_usage=self._usage_from_stream_chunk,
+            chunk_usage_with_presence=self._usage_from_stream_chunk_with_presence,
             completion_signal=self._stream_completion_signal,
             mark_timeout=self._mark_stream_timeout,
         )
@@ -397,7 +398,7 @@ class ArkProxyRouter:
         self.logs = self.observability.logs
         self.log_write_error = self.observability.log_write_error
 
-    def _trim_log_file(self, max_lines: int = 1000) -> None:
+    def _trim_log_file(self, max_lines: int = 5000) -> None:
         # 兼容 facade：实际 JSONL 滚动由 observability repository 执行。
         self.observability.trim(max_lines)
         self.log_write_error = self.observability.log_write_error
@@ -692,18 +693,43 @@ class ArkProxyRouter:
         return ArkProxyRouter._usage_from_payload(payload)
 
     @staticmethod
+    def _usage_from_payload_with_presence(payload: Any) -> Tuple[Tuple[int, int, int, int, int], bool]:
+        if not isinstance(payload, dict):
+            return ArkProxyRouter._empty_usage(), False
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            response = payload.get("response")
+            usage = response.get("usage") if isinstance(response, dict) else None
+        if not isinstance(usage, dict):
+            return ArkProxyRouter._empty_usage(), False
+        return ArkProxyRouter._usage_from_payload(payload), True
+
+    @staticmethod
+    def _usage_from_stream_chunk_with_presence(chunk: bytes) -> Tuple[Tuple[int, int, int, int, int], bool]:
+        """Extract the latest explicit usage payload from an SSE frame, including all-zero usage."""
+        usage = ArkProxyRouter._empty_usage()
+        present = False
+        for line in chunk.decode("utf-8", "ignore").splitlines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                payload = json.loads(data)
+            except Exception:
+                continue
+            parsed, parsed_present = ArkProxyRouter._usage_from_payload_with_presence(payload)
+            if parsed_present:
+                usage = parsed
+                present = True
+        return usage, present
+
+    @staticmethod
     def _usage_from_stream_chunk(chunk: bytes) -> Tuple[int, int, int, int, int]:
-        text = chunk.decode("utf-8", "ignore").strip()
-        if not text.startswith("data:"):
-            return ArkProxyRouter._empty_usage()
-        data = text[5:].strip()
-        if not data or data == "[DONE]":
-            return ArkProxyRouter._empty_usage()
-        try:
-            payload = json.loads(data)
-        except Exception:
-            return ArkProxyRouter._empty_usage()
-        return ArkProxyRouter._usage_from_payload(payload)
+        """Compatibility wrapper for callers that only need usage values."""
+        usage, _ = ArkProxyRouter._usage_from_stream_chunk_with_presence(chunk)
+        return usage
 
     @staticmethod
     def _stream_completion_signal(chunk: bytes) -> str:

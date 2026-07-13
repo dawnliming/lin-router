@@ -526,8 +526,8 @@ const ConfigTab = {
       ? `<button type="button" class="btn-secondary btn-sm" data-action="enable" data-member-id="${member.id}">启用</button>`
       : `<button type="button" class="btn-secondary btn-sm" data-action="disable" data-member-id="${member.id}">停用</button>`;
     return `
-      <tr data-member-id="${member.id}">
-        <td class="tiny">${idx + 1}</td>
+      <tr data-member-id="${member.id}" draggable="true">
+        <td class="tiny"><span class="aggregate-drag-handle" title="拖拽调整顺序" aria-label="拖拽调整顺序">⠿</span>${idx + 1}</td>
         <td class="truncate-cell" title="${Utils.escapeHtml(group?.name || '-')}">${Utils.escapeHtml(group?.name || '-')}${warningBadge}</td>
         <td class="truncate-cell" title="${Utils.escapeHtml(model?.name || '-')}">${Utils.escapeHtml(model?.name || '-')}</td>
         <td class="truncate-cell" title="${Utils.escapeHtml(model?.upstream_model || model?.ep_id || '-')}">${Utils.escapeHtml(model?.upstream_model || model?.ep_id || '-')}</td>
@@ -895,6 +895,7 @@ const ConfigTab = {
       panel.querySelectorAll('.aggregate-member-actions button[data-action]').forEach(el => {
         el.addEventListener('click', () => this.onAggregateMemberAction(el.dataset.action, el.dataset.memberId));
       });
+      this.bindAggregateMemberDragAndDrop(panel);
       this.bindAutoSave(aggregateForm, () => this.autoSaveAggregate());
     }
 
@@ -976,6 +977,8 @@ const ConfigTab = {
   onAddAggregateMember(...args) { return ConfigTabActions.onAddAggregateMember(this, ...args); },
   _updateMemberPreview(...args) { return ConfigTabActions._updateMemberPreview(this, ...args); },
   onAggregateMemberAction(...args) { return ConfigTabActions.onAggregateMemberAction(this, ...args); },
+  bindAggregateMemberDragAndDrop(...args) { return ConfigTabActions.bindAggregateMemberDragAndDrop(this, ...args); },
+  onReorderAggregateMembers(...args) { return ConfigTabActions.onReorderAggregateMembers(this, ...args); },
   aggregateChainSummary(...args) { return ConfigTabActions.aggregateChainSummary(this, ...args); },
   confirmAggregateMemberPreview(...args) { return ConfigTabActions.confirmAggregateMemberPreview(this, ...args); },
   reloadAfterAggregateMemberChange(...args) { return ConfigTabActions.reloadAfterAggregateMemberChange(this, ...args); },

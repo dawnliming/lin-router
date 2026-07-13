@@ -168,6 +168,26 @@
   color: var(--accent);
 }
 
+.logs-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.logs-pagination select {
+  margin: 0 4px;
+  padding: 4px 6px;
+}
+
+.logs-pagination button:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
 .logs-empty {
   text-align: center;
   padding: 40px;

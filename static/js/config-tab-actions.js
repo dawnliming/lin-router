@@ -453,14 +453,20 @@ const ConfigTabActions = {
   },
 
   async onRecoverAggregateMember(controller, memberId) {
+    const button = document.querySelector(`[data-action="recover"][data-member-id="${CSS.escape(memberId)}"]`);
+    if (button) {
+      button.disabled = true;
+      button.textContent = '恢复中…';
+    }
     try {
-      const preview = await API.previewAggregateMemberClearCooldown(memberId);
-      const ok = await controller.confirmAggregateMemberPreview('恢复成员预览', preview, '确认恢复');
-      if (!ok) return;
       const res = await API.recoverAggregateMember(memberId);
       await controller.reloadAfterAggregateMemberChange();
       Toast.success(res.message || '成员已重试恢复');
     } catch (err) {
+      if (button) {
+        button.disabled = false;
+        button.textContent = '重试恢复';
+      }
       Toast.error('恢复失败：' + err.message);
     }
   },
@@ -471,6 +477,61 @@ const ConfigTabActions = {
       await controller.reloadAfterAggregateMemberChange();
     } catch (err) {
       Toast.error('排序失败：' + err.message);
+    }
+  },
+
+  bindAggregateMemberDragAndDrop(controller, panel) {
+    const body = panel.querySelector('.aggregate-members-table tbody');
+    if (!body) return;
+    let draggedRow = null;
+    body.querySelectorAll('tr[data-member-id]').forEach(row => {
+      row.addEventListener('dragstart', event => {
+        draggedRow = row;
+        row.classList.add('aggregate-member-dragging');
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', row.dataset.memberId || '');
+      });
+      row.addEventListener('dragend', () => {
+        draggedRow = null;
+        body.querySelectorAll('.aggregate-member-drop-target').forEach(item => item.classList.remove('aggregate-member-drop-target'));
+        row.classList.remove('aggregate-member-dragging');
+      });
+      row.addEventListener('dragover', event => {
+        if (!draggedRow || draggedRow === row) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'move';
+        body.querySelectorAll('.aggregate-member-drop-target').forEach(item => item.classList.remove('aggregate-member-drop-target'));
+        row.classList.add('aggregate-member-drop-target');
+      });
+      row.addEventListener('drop', async event => {
+        event.preventDefault();
+        if (!draggedRow || draggedRow === row) return;
+        const rows = [...body.querySelectorAll('tr[data-member-id]')];
+        const from = rows.indexOf(draggedRow);
+        const to = rows.indexOf(row);
+        if (from < 0 || to < 0) return;
+        body.insertBefore(draggedRow, from < to ? row.nextSibling : row);
+        const memberIds = [...body.querySelectorAll('tr[data-member-id]')].map(item => item.dataset.memberId).filter(Boolean);
+        await controller.onReorderAggregateMembers(memberIds, body);
+      });
+    });
+  },
+
+  async onReorderAggregateMembers(controller, memberIds, body) {
+    const aggregateId = document.getElementById('aggregate-id')?.value;
+    if (!aggregateId || !memberIds.length) return;
+    const expectedRevision = Store.getAggregateMemberRevision(aggregateId);
+    body.classList.add('aggregate-members-saving');
+    try {
+      await API.reorderAggregateMembers(aggregateId, memberIds, expectedRevision);
+      await controller.reloadAfterAggregateMemberChange();
+      Toast.success('成员顺序已保存');
+    } catch (err) {
+      const conflict = err.code === 'aggregate_member_revision_conflict';
+      Toast.error(conflict ? '排序冲突：成员顺序已被其他操作更新，已刷新最新顺序。' : '排序未保存，已刷新最新顺序：' + err.message);
+      await controller.reloadAfterAggregateMemberChange();
+    } finally {
+      body.classList.remove('aggregate-members-saving');
     }
   },
 

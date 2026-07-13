@@ -4,6 +4,9 @@ const LogsTab = {
   autoRefresh: true,
   refreshTimer: null,
   REFRESH_INTERVAL: 5000,
+  page: 0,
+  pageSize: 50,
+  total: 0,
   _lastRenderSignature: '',
   _openDetailKey: '',
   _detailEventsBound: false,
@@ -81,11 +84,22 @@ const LogsTab = {
         <div>暂无符合条件的日志</div>
         <button type="button" id="logs-reset" class="btn-secondary">重置筛选</button>
       </div>
+      <div class="logs-pagination" id="logs-pagination">
+        <label>每页
+          <select id="logs-page-size">
+            ${[50, 100, 200].map(size => `<option value="${size}" ${this.pageSize === size ? 'selected' : ''}>${size}</option>`).join('')}
+          </select>
+          条
+        </label>
+        <span id="logs-page-summary">加载中…</span>
+        <button type="button" id="logs-prev" class="btn-secondary" disabled>上一页</button>
+        <button type="button" id="logs-next" class="btn-secondary" disabled>下一页</button>
+      </div>
     `;
     this.attachEvents(panel);
     this._lastRenderSignature = '';
     this._detailEventsBound = false;
-    this.renderRows();
+    this.manualRefresh();
     this.startAutoRefresh();
   },
 
@@ -106,6 +120,13 @@ const LogsTab = {
     panel.querySelector('#logs-clear')?.addEventListener('click', () => this.clear());
     panel.querySelector('#logs-export')?.addEventListener('click', () => { location.href = '/api/logs/export'; });
     panel.querySelector('#logs-reset')?.addEventListener('click', () => this.resetFilters());
+    panel.querySelector('#logs-page-size')?.addEventListener('change', event => {
+      this.pageSize = Number(event.target.value) || 50;
+      this.page = 0;
+      this.manualRefresh();
+    });
+    panel.querySelector('#logs-prev')?.addEventListener('click', () => this.changePage(-1));
+    panel.querySelector('#logs-next')?.addEventListener('click', () => this.changePage(1));
   },
 
   setAutoRefresh(enabled) {
@@ -136,16 +157,44 @@ const LogsTab = {
   },
 
   async manualRefresh(silent = false) {
+    if (silent && this.page !== 0) return;
     try {
-      const data = await API.req('/api/state', { silent });
-      // 同步最新的模型状态，确保配置页能正确显示冷却截止时间等信息
-      Store.update({ logs: data.logs, models: data.models, groups: data.groups });
+      const params = {
+        offset: this.page * this.pageSize,
+        limit: this.pageSize,
+        group: this.filters.group,
+        status: this.filters.status,
+        start: this.filters.start,
+        end: this.filters.end,
+      };
+      const data = await API.getLogs(params, { silent });
+      this.total = Number(data.total || 0);
+      Store.update({ logs: data.logs || [] });
       this.renderRows(true);
+      this.renderPagination();
     } catch (err) {
-      // 自动刷新失败不弹 Toast，避免打扰
       if (!silent) Toast.error('刷新失败：' + err.message);
       console.error('日志刷新失败', err);
     }
+  },
+
+  changePage(delta) {
+    const next = this.page + delta;
+    if (next < 0 || next * this.pageSize >= this.total) return;
+    this.page = next;
+    this._openDetailKey = '';
+    this.manualRefresh();
+  },
+
+  renderPagination() {
+    const start = this.total ? this.page * this.pageSize + 1 : 0;
+    const end = Math.min(this.total, (this.page + 1) * this.pageSize);
+    const summary = document.getElementById('logs-page-summary');
+    if (summary) summary.textContent = `第 ${start}–${end} 条 / 共 ${this.total} 条`;
+    const prev = document.getElementById('logs-prev');
+    const next = document.getElementById('logs-next');
+    if (prev) prev.disabled = this.page === 0;
+    if (next) next.disabled = end >= this.total;
   },
 
   readFilters() {
@@ -153,7 +202,8 @@ const LogsTab = {
     this.filters.end = document.getElementById('log-end')?.value || '';
     this.filters.group = document.getElementById('log-group')?.value || '';
     this.filters.status = document.getElementById('log-status')?.value || '';
-    this.renderRows();
+    this.page = 0;
+    this.manualRefresh();
   },
 
   filterLogs() {
@@ -174,6 +224,7 @@ const LogsTab = {
 
   resetFilters() {
     this.filters = { start: '', end: '', group: '', status: '' };
+    this.page = 0;
     this.render();
   },
 

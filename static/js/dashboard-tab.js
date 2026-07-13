@@ -159,8 +159,8 @@ const DashboardTab = {
           <div>${Utils.escapeHtml(item.group || item.candidate || '-')}</div>
           <div><span class="pill ${item.slow ? 'warning' : 'info'}">${Utils.escapeHtml(stageLabel)}</span></div>
           <div>${Utils.escapeHtml(elapsed)}</div>
-          <small>${Utils.escapeHtml(hint)}</small>
-          ${item.cancellable === false ? '<span class="pill warning">终止中</span>' : `<button type="button" class="btn-secondary btn-sm" data-dashboard-action="cancel-request" data-request-id="${Utils.escapeHtml(item.request_id || '')}">终止</button>`}
+          <small title="${Utils.escapeHtml(hint)}">${Utils.escapeHtml(hint)}</small>
+          <div class="live-request-action">${item.cancellable === false ? '<span class="pill warning">终止中…</span>' : `<button type="button" class="btn-secondary btn-sm" data-dashboard-action="cancel-request" data-request-id="${Utils.escapeHtml(item.request_id || '')}" data-request-short="${Utils.escapeHtml(item.request_id_short || String(item.request_id || '').slice(0, 8))}" data-request-model="${Utils.escapeHtml(item.requested_model || item.model || '-')}" data-request-group="${Utils.escapeHtml(item.group || item.candidate || '-')}" data-request-stage="${Utils.escapeHtml(stageLabel)}" data-request-elapsed="${Utils.escapeHtml(elapsed)}">终止请求</button>`}</div>
         </div>`;
     }).join('');
     return `
@@ -317,7 +317,7 @@ const DashboardTab = {
       });
     });
     panel.querySelectorAll('[data-dashboard-action]').forEach(btn => {
-      btn.addEventListener('click', () => {
+      btn.addEventListener('click', async () => {
         const action = btn.dataset.dashboardAction;
         if (action === 'new-group') return App.createGroup();
         if (action === 'new-aggregate') return App.createAggregate();
@@ -336,11 +336,26 @@ const DashboardTab = {
             .then(ok => ok ? Toast.success('客户端配置已复制') : Toast.error('复制失败'));
         }
         if (action === 'cancel-request') {
-          if (!window.confirm('确认终止该请求？这是尽力而为操作，上游可能已经产生费用。')) return;
+          const ok = await Modal.confirm({
+            title: '终止当前请求？',
+            message: `请求：${Utils.escapeHtml(btn.dataset.requestShort || '-')} · ${Utils.escapeHtml(btn.dataset.requestModel || '-')}<br>当前：${Utils.escapeHtml(btn.dataset.requestGroup || '-')} · ${Utils.escapeHtml(btn.dataset.requestStage || '-')} · 已运行 ${Utils.escapeHtml(btn.dataset.requestElapsed || '-')}<br><br>将停止本工具对该请求的处理并尝试关闭上游连接。上游是否已经停止生成或继续计费，取决于上游服务，无法保证。`,
+            confirmText: '终止请求',
+            confirmClass: 'btn-danger',
+            allowHtml: true,
+          });
+          if (!ok) return;
           btn.disabled = true;
-          return API.cancelLiveRequest(btn.dataset.requestId)
-            .then(result => { Toast.success(result.message || '已发送终止指令'); return Store.load(true); })
-            .catch(err => { btn.disabled = false; Toast.error(err.message || '终止请求失败'); });
+          btn.textContent = '终止中…';
+          try {
+            const result = await API.cancelLiveRequest(btn.dataset.requestId);
+            Toast.success(result.message || '已发送终止指令，正在释放本地请求资源…');
+            await API.getRuntimeState({ silent: true }).then(data => Store.update({ live_requests: data.live_requests || [] }));
+          } catch (err) {
+            btn.disabled = false;
+            btn.textContent = '终止请求';
+            Toast.error(err.message || '终止指令未能确认，请刷新实时列表；如仍卡住可查看日志。');
+          }
+          return;
         }
         if (action === 'aggregate') { Store.select('aggregate', btn.dataset.aggregateId); return Tabs.switch('config'); }
       });
