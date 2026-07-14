@@ -184,9 +184,10 @@ def test_m3d_stream_success_flushes_in_order_closes_and_finalizes() -> None:
     assert iterator.closed is True
     assert router.finalized == ["request-1"]
     assert ("Content-Type", "text/event-stream; charset=utf-8") in handler.sent_headers
+    assert router.transport_events == [("request-1", "downstream_first_flush")]
 
 
-def test_m3d_stream_normalizes_json_upstream_headers_to_sse() -> None:
+def test_m3d_json_compat_stream_keeps_json_media_type() -> None:
     router = FakeRouter()
     router.stream_result = (200, {
         "Content-Type": "application/json; charset=utf-8",
@@ -198,18 +199,29 @@ def test_m3d_stream_normalizes_json_upstream_headers_to_sse() -> None:
 
     handle_proxy_request(handler, "/v1/chat/completions", {"stream": True}, object(), b"{}")
 
-    assert ("Content-Type", "text/event-stream; charset=utf-8") in handler.sent_headers
+    assert ("Content-Type", "application/json; charset=utf-8") in handler.sent_headers
     assert ("Cache-Control", "no-cache") in handler.sent_headers
     assert ("X-Accel-Buffering", "no") in handler.sent_headers
     assert not any(
         (key.lower(), value.lower()) in {
-            ("content-type", "application/json; charset=utf-8"),
             ("cache-control", "public, max-age=60"),
             ("x-accel-buffering", "yes"),
         }
         for key, value in handler.sent_headers
     )
     assert ("X-Upstream", "ok") in handler.sent_headers
+
+
+def test_m3d_pre_first_stream_error_iterable_does_not_require_close() -> None:
+    router = FakeRouter()
+    router.stream_result = (502, {"Content-Type": "application/json; charset=utf-8"}, [b'{"error":"stream_protocol_error"}'], "request-error")
+    handler = FakeHandler(router)
+
+    handle_proxy_request(handler, "/v1/chat/completions", {"stream": True}, object(), b"{}")
+
+    assert handler.responses == [502]
+    assert handler.wfile.getvalue() == b'{"error":"stream_protocol_error"}'
+    assert router.finalized == ["request-error"]
 
 
 def test_m3d_stream_filters_hop_by_hop_headers_and_records_terminal() -> None:
@@ -225,7 +237,10 @@ def test_m3d_stream_filters_hop_by_hop_headers_and_records_terminal() -> None:
 
     assert ("Content-Type", "text/event-stream; charset=utf-8") in handler.sent_headers
     assert not any(key.lower() in {"connection", "keep-alive", "te", "trailer", "upgrade", "x-remove"} for key, _ in handler.sent_headers)
-    assert router.transport_events == [("request-2", "downstream_terminal_forwarded")]
+    assert router.transport_events == [
+        ("request-2", "downstream_first_flush"),
+        ("request-2", "downstream_terminal_forwarded"),
+    ]
 
 
 def test_m3d_write_failure_after_stream_headers_never_emits_json_error() -> None:

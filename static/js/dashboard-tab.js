@@ -186,7 +186,7 @@ const DashboardTab = {
       preparing_upstream: '准备上游请求',
       waiting_serial_protection: '等待串行保护',
       connecting_upstream: '连接上游',
-      waiting_first_byte: '等待首包',
+      waiting_first_byte: '等待首完整帧',
       streaming: '接收流式响应',
       receiving_response: '接收响应',
       candidate_busy: '候选忙/串行保护等待超时'

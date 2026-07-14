@@ -143,6 +143,7 @@ const ConfigTab = {
           </div>
         </section>
         ${g ? this.renderGroupWorkflow(g, { isDraft }) : ''}
+        ${g && !isDraft ? this.renderSpeedTestCard('group', g.id, '连接组测速', '测速连接组') : ''}
         <details class="form-card advanced-config" id="group-advanced-card">
           <summary>高级配置</summary>
           <div class="advanced-config-body">
@@ -412,9 +413,87 @@ const ConfigTab = {
           </div>
         </section>
         ${a ? this.renderAggregateMembers(a) : ''}
+        ${a ? this.renderSpeedTestCard('aggregate', a.id, '聚合测速', '测速聚合') : ''}
         ${a ? this.renderAggregateGainBoard(a) : ''}
       </form>
     `;
+  },
+
+  renderSpeedTestCard(type, id, title, buttonText) {
+    return `
+      <section class="form-card speed-test-card" data-speed-test-type="${type}" data-speed-test-id="${Utils.escapeHtml(id)}">
+        <div class="speed-test-header">
+          <div>
+            <h3>${title}</h3>
+            <div class="form-hint">健康检查测速不写入正式日志、统计或模型健康状态。</div>
+          </div>
+          <button type="button" class="btn-secondary" id="speed-test-${type}-button" data-speed-test-type="${type}" data-speed-test-id="${Utils.escapeHtml(id)}">${buttonText}</button>
+        </div>
+        <div id="speed-test-${type}-result" class="speed-test-result" aria-live="polite">
+          <div class="form-hint">尚未测速。</div>
+        </div>
+      </section>
+    `;
+  },
+
+  async runSpeedTest(type, id) {
+    const button = document.getElementById(`speed-test-${type}-button`);
+    const result = document.getElementById(`speed-test-${type}-result`);
+    if (!id || !button || !result || button.disabled) return;
+    button.disabled = true;
+    button.textContent = '测速中…';
+    result.innerHTML = '<div class="speed-test-running"><span class="speed-test-spinner"></span>正在执行健康检查测速，请稍候…</div>';
+    try {
+      const payload = type === 'group' ? await API.speedTestGroup(id) : await API.speedTestAggregate(id);
+      result.innerHTML = this.renderSpeedTestResult(payload);
+    } catch (err) {
+      result.innerHTML = this.renderSpeedTestResult({
+        ok: false,
+        code: err.code || (err.status === 429 ? 'speed_test_rate_limited' : 'speed_test_error'),
+        status: err.status,
+        message: err.message || '测速请求失败',
+      });
+    } finally {
+      button.disabled = false;
+      button.textContent = type === 'group' ? '再次测速连接组' : '再次测速聚合';
+    }
+  },
+
+  renderSpeedTestResult(payload) {
+    const escape = value => Utils.escapeHtml(value == null ? '' : String(value));
+    const reasonText = {
+      speed_test_running: '该对象正在测速，请等待本次完成。',
+      speed_test_rate_limited: '刚完成测速，请稍后再试。',
+      missing_upstream_api_key: '缺少上游 API Key。',
+      serial_protection_wait_timeout: '串行保护候选正忙，未判定为上游故障。',
+      network: '连接或等待上游响应超时，请稍后重试。',
+    };
+    if (!payload || payload.code === 'speed_test_running') {
+      return '<div class="speed-test-running">正在测速，请稍候…</div>';
+    }
+    if (payload.code && !payload.results) {
+      const message = reasonText[payload.code] || payload.message || '测速请求失败，请稍后重试。';
+      return `<div class="speed-test-error"><strong>测速失败</strong><span>${escape(message)}</span><small>${escape(payload.code)}${payload.status ? ` · HTTP ${escape(payload.status)}` : ''}</small></div>`;
+    }
+    const results = Array.isArray(payload.results) ? payload.results : [];
+    const statusText = payload.ok ? 'ok' : 'failure';
+    const summary = payload.aggregate
+      ? `命中聚合：${escape(payload.aggregate)} · attempts ${escape(payload.attempts || 0)} · fallback ${payload.fallback ? '是' : '否'}`
+      : `完成 ${escape(payload.completed || results.length)} · ok ${escape(payload.success || 0)} · failure ${escape(payload.failure || 0)}`;
+    const resultRows = results.length ? results.map(item => {
+      const ok = Boolean(item.ok);
+      const message = reasonText[item.reason] || item.message || (ok ? '最小探测成功。' : '最小探测未通过，请检查上游服务状态。');
+      return `<div class="speed-test-row ${ok ? 'is-ok' : 'is-failure'}">
+        <span class="speed-test-state">${ok ? 'ok' : 'failure'}</span>
+        <span class="speed-test-target">模型：${escape(item.model || '-')} · 连接组：${escape(item.group || '-')}</span>
+        <span class="speed-test-time">${escape(item.total_ms == null ? '-' : item.total_ms)} ms</span>
+        <span class="speed-test-message">${escape(message)}</span>
+      </div>`;
+    }).join('') : '<div class="form-hint">没有可测速的候选。</div>';
+    return `<div class="speed-test-summary ${payload.ok ? 'is-ok' : 'is-failure'}">
+      <div><strong>${statusText}</strong><span>${escape(payload.message || '')}</span></div>
+      <div class="speed-test-meta">${summary} · total_ms ${escape(payload.total_ms == null ? '-' : payload.total_ms)}</div>
+    </div>${resultRows}`;
   },
 
   renderAggregateGainBoard(a) {
@@ -466,7 +545,8 @@ const ConfigTab = {
       ['cooldown 跳过', num(stats.cooldown_skip_count), '避免等待不健康成员'],
       ['候选忙切换', num(stats.busy_switch_count), '大上下文并发占用'],
       ['cache 命中率', pct(stats.cache_hit_rate), `${stats.cached_tokens || 0} / ${stats.prompt_tokens || 0}`],
-      ['平均首包', ms(stats.avg_first_chunk_ms), 'stream_ok 平均耗时'],
+      ['平均首文本', ms(stats.avg_first_content_delta_ms), '首个真实文本 delta'],
+      ['平均首完整帧', ms(stats.avg_first_complete_frame_ms), '完整 SSE frame 到达'],
     ];
     const risk = (stats.high_risk_members || []).length
       ? `<div class="aggregate-risk-list"><strong>高风险成员</strong>${stats.high_risk_members.map(item => `<div>${Utils.escapeHtml(item.model || item.member_id)}：timeout ${item.timeout_count || 0} / WAF ${item.waf_blocked_count || 0} / 失败 ${item.failure_count || 0}</div>`).join('')}</div>`
@@ -832,6 +912,7 @@ const ConfigTab = {
     const groupForm = panel.querySelector('#group-form');
     if (groupForm) {
       groupForm.addEventListener('submit', e => this.onGroupSubmit(e));
+      panel.querySelector('#speed-test-group-button')?.addEventListener('click', e => this.runSpeedTest(e.currentTarget.dataset.speedTestType, e.currentTarget.dataset.speedTestId));
       panel.querySelector('#group-provider')?.addEventListener('change', () => this.onGroupProviderChange());
       panel.querySelector('#group-waf')?.addEventListener('change', () => { this.syncGroupModeUI(); this.autoSaveGroup(); });
       panel.querySelector('#group-key-toggle')?.addEventListener('click', e => {
@@ -882,6 +963,7 @@ const ConfigTab = {
     const aggregateForm = panel.querySelector('#aggregate-form');
     if (aggregateForm) {
       aggregateForm.addEventListener('submit', e => this.onAggregateSubmit(e));
+      panel.querySelector('#speed-test-aggregate-button')?.addEventListener('click', e => this.runSpeedTest(e.currentTarget.dataset.speedTestType, e.currentTarget.dataset.speedTestId));
       panel.querySelector('#aggregate-delete')?.addEventListener('click', () => this.onAggregateDelete());
       panel.querySelector('#aggregate-copy-route-key')?.addEventListener('click', () => this.onCopyAggregateRouteKey());
       panel.querySelector('#aggregate-add-member')?.addEventListener('click', () => this.onAddAggregateMember());

@@ -9,12 +9,14 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import ArkProxyRouter, ConfigStore, RouteContext
 from linrouter_core.observability import ObservabilityService
 from linrouter_core.runtime.router_runtime import _read_sse_frame
+from settings_store import SettingsStore
 
 
 def get_free_port() -> int:
@@ -48,11 +50,15 @@ def build_config(port: int, *, serial_protection: bool = False, stream_idle_time
     }
 
 
-def make_router(tmp_path: str, port: int, **kwargs: object) -> tuple[ArkProxyRouter, RouteContext]:
+def make_router(tmp_path: str, port: int, *, breaker: bool = False, **kwargs: object) -> tuple[ArkProxyRouter, RouteContext]:
     config_path = Path(tmp_path) / "config.json"
     config_path.write_text(json.dumps(build_config(port, **kwargs), ensure_ascii=False), encoding="utf-8")
     store = ConfigStore(config_path)
-    router = ArkProxyRouter(store, settings_store=None, log_file=Path(tmp_path) / "logs.jsonl")
+    settings = None
+    if breaker:
+        settings = SettingsStore(config_path)
+        settings.update({"smart_breaker_enabled": True})
+    router = ArkProxyRouter(store, settings_store=settings, log_file=Path(tmp_path) / "logs.jsonl")
     group = store.groups[0]
     return router, RouteContext(
         client_key=group.route_key,
@@ -313,8 +319,8 @@ def test_response_failed_and_incomplete_have_distinct_stream_lifecycles() -> Non
     upstream = start_server(ImmediateTerminalHandler)
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            router, context = make_router(tmp, upstream.server_address[1])
-            for signal, lifecycle in (("response.failed", "stream_failed"), ("response.incomplete", "stream_incomplete")):
+            router, context = make_router(tmp, upstream.server_address[1], breaker=True)
+            for expected_failures, (signal, lifecycle) in enumerate((("response.failed", "stream_failed"), ("response.incomplete", "stream_incomplete")), start=1):
                 status, _headers, stream, request_id = router.stream("/v1/responses", stream_payload(signal), context)
                 assert status == 200
                 assert signal.encode("utf-8") in b"".join(stream)
@@ -322,7 +328,17 @@ def test_response_failed_and_incomplete_have_distinct_stream_lifecycles() -> Non
                 assert f"completion_signal={signal}" in log.detail
                 assert f"lifecycle={lifecycle}" in log.detail
                 assert log.failure_scope == "upstream"
+                assert log.cooldown_applied is True
+                assert router.store.models[0].health_state == "cooling"
+                assert router.store.models[0].consecutive_failures == expected_failures
                 assert router.live_requests_payload()["count"] == 0
+
+            status, _headers, stream, _request_id = router.stream("/v1/responses", stream_payload("response.completed"), context)
+            assert status == 200
+            assert b"response.completed" in b"".join(stream)
+            assert router.store.models[0].health_state == "normal"
+            assert router.store.models[0].consecutive_failures == 0
+            assert router.store.models[0].usable is True
     finally:
         upstream.shutdown()
         upstream.server_close()
@@ -357,7 +373,7 @@ def test_post_first_byte_idle_timeout_is_not_recorded_as_client_disconnect() -> 
     upstream = start_server(IdleAfterFirstChunkHandler)
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            router, context = make_router(tmp, upstream.server_address[1], stream_idle_timeout=1)
+            router, context = make_router(tmp, upstream.server_address[1], breaker=True, stream_idle_timeout=1)
             status, _headers, stream, request_id = router.stream("/v1/chat/completions", stream_payload("idle"), context)
             assert status == 200
             assert b"working" in next(stream)
@@ -366,10 +382,59 @@ def test_post_first_byte_idle_timeout_is_not_recorded_as_client_disconnect() -> 
             assert log.status == "timeout"
             assert "lifecycle=stream_idle_timeout" in log.detail
             assert "lifecycle=client_disconnected" not in log.detail
+            assert log.cooldown_applied is True
+            assert router.store.models[0].health_state == "cooling"
+            assert router.store.models[0].consecutive_failures == 1
     finally:
         IdleAfterFirstChunkHandler.release.set()
         upstream.shutdown()
         upstream.server_close()
+
+
+def test_post_first_byte_network_error_counts_as_upstream_failure() -> None:
+    class BrokenStreamResponse:
+        status = 200
+        headers = {}
+
+        def __init__(self) -> None:
+            self._lines = [
+                b'data: {"type":"response.output_text.delta","delta":"working"}\n',
+                b"\n",
+            ]
+
+        def readline(self, _timeout: int = 0) -> bytes:
+            if self._lines:
+                return self._lines.pop(0)
+            raise URLError("upstream connection reset after first chunk")
+
+        def close(self) -> None:
+            return None
+
+    class BrokenStreamClient:
+        def request(self, _method, _url, _headers, _body, **kwargs):
+            assert kwargs.get("stream") is True
+            return BrokenStreamResponse()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        router, context = make_router(tmp, get_free_port(), breaker=True)
+        client = BrokenStreamClient()
+        router.runtime.upstream = client
+        router.stream_execution._candidates.upstream = client
+
+        status, _headers, stream, request_id = router.stream("/v1/chat/completions", stream_payload("network"), context)
+        assert status == 200
+        assert b"working" in next(stream)
+        assert list(stream) == []
+
+        log = next(item for item in router.logs if item.request_id == request_id)
+        assert log.status == "network"
+        assert "lifecycle=stream_incomplete" in log.detail
+        assert "completion_signal=network_error" in log.detail
+        assert log.failure_scope == "upstream"
+        assert log.cooldown_applied is True
+        assert router.store.models[0].health_state == "cooling"
+        assert router.store.models[0].consecutive_failures == 1
+        assert router.live_requests_payload()["count"] == 0
 
 
 def test_dashboard_cancel_while_waiting_first_byte_isolated_from_health_and_fallback() -> None:

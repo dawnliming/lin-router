@@ -179,6 +179,36 @@ Windows 安装包默认通过 `scripts/installer/build_self_installer.py` 生成
 
 v0.6.0 发布前检查清单见 `scripts/release-checklist-v0.6.0.md`；构建脚本会自动对 zip / setup 产物执行脱敏扫描。
 
+### Windows 可选代码签名（发布机前置条件）
+
+默认构建**不签名**，因此不会改变没有签名工具或证书时的既有构建行为。需要签名时必须显式增加 `--sign`；该模式会在生成任何 Windows 发布产物前校验以下条件，缺一项就明确失败，不会继续产出“看似已签名”的包：
+
+- Windows SDK 中可用的 `signtool.exe`；也可通过 `LINROUTER_SIGNTOOL` 指定完整路径。
+- 包含私钥的代码签名证书文件（通常为 `.pfx`/`.p12`），通过 `LINROUTER_SIGN_CERT_PATH` 指定。
+- RFC 3161 时间戳服务 URL，通过 `LINROUTER_SIGN_TIMESTAMP_URL` 指定；项目不硬编码供应商或 URL。
+- PFX 密码通过 `LINROUTER_SIGN_CERT_PASSWORD` 注入当前构建进程。不要把密码写入源码、命令行、`setx` 持久环境变量或日志；建议由 CI secret / Windows Credential Manager 等安全机制在启动构建进程时注入。
+
+签名构建示例（以下命令本身不包含密码）：
+
+```powershell
+$env:LINROUTER_SIGNTOOL = 'C:\\Program Files (x86)\\Windows Kits\\10\\bin\\<sdk-version>\\x64\\signtool.exe'
+$env:LINROUTER_SIGN_CERT_PATH = 'D:\\secure\\linrouter-release.pfx'
+$env:LINROUTER_SIGN_TIMESTAMP_URL = 'https://<approved-timestamp-service>/timestamp'
+# LINROUTER_SIGN_CERT_PASSWORD 由 CI secret / Credential Manager 注入，不要粘贴到 shell 历史
+bash scripts/build.sh --target win32 --installer --sign --version 0.6.0
+```
+
+签名顺序是固定的：PyInstaller 生成 `dist\\LinRouter_windows.exe` 后先签 payload；再用已签名 payload 生成 ZIP 和安装包；最后再签 `LinRouter-Setup-...exe` 安装包本身。自举安装器因此嵌入已签名 payload；Inno Setup 也从同一个已签名 payload 生成外层安装包。ZIP 本身不是 PE 文件，不执行 Authenticode 签名。
+
+签名后在 Windows PowerShell 验证签名者、状态和时间戳：
+
+```powershell
+Get-AuthenticodeSignature .\\dist\\LinRouter_windows.exe | Format-List Status,SignerCertificate,TimeStamperCertificate,Path
+Get-AuthenticodeSignature .\\dist\\LinRouter-Setup-v0.6.0-win-x64.exe | Format-List Status,SignerCertificate,TimeStamperCertificate,Path
+```
+
+必须看到 `Status : Valid`，并检查证书主体、用途和时间戳符合发布要求；`SignerCertificate : null` 或 `SignatureType : 0` 表示未签名。当前开发环境没有可用代码签名证书和已定位的 `signtool.exe`，因此本地只能完成静态校验，不能声称 Smart App Control 已解决。自签名证书仅适合开发机或受控内网测试；它不等于面向公众的正规发布签名，不能据此承诺绕过 Windows Smart App Control。
+
 ```bash
 python -m PyInstaller --noconfirm LinRouter.spec
 ```

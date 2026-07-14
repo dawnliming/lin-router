@@ -78,6 +78,11 @@ class ModelConfig:
     last_checked_at: str = ""
     cooldown_until: int = 0
     cooldown_reason: str = ""
+    health_state: str = "normal"
+    consecutive_failures: int = 0
+    last_failure_at: int = 0
+    breaker_until: int = 0
+    breaker_reason: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ModelConfig":
@@ -98,6 +103,11 @@ class ModelConfig:
             last_checked_at=str(data.get("last_checked_at", "")),
             cooldown_until=int(data.get("cooldown_until") or 0),
             cooldown_reason=str(data.get("cooldown_reason", "")),
+            health_state=str(data.get("health_state") or "normal"),
+            consecutive_failures=max(0, int(data.get("consecutive_failures") or 0)),
+            last_failure_at=max(0, int(data.get("last_failure_at") or 0)),
+            breaker_until=max(0, int(data.get("breaker_until") or 0)),
+            breaker_reason=str(data.get("breaker_reason", "")),
         )
 
 
@@ -166,6 +176,11 @@ class AggregateMember:
     last_error: str = ""
     last_success_at: str = ""
     last_checked_at: str = ""
+    health_state: str = "normal"
+    consecutive_failures: int = 0
+    last_failure_at: int = 0
+    breaker_until: int = 0
+    breaker_reason: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AggregateMember":
@@ -191,4 +206,9 @@ class AggregateMember:
             last_error=str(data.get("last_error", "")),
             last_success_at=str(data.get("last_success_at", "")),
             last_checked_at=str(data.get("last_checked_at", "")),
+            health_state=str(data.get("health_state") or "normal"),
+            consecutive_failures=max(0, int(data.get("consecutive_failures") or 0)),
+            last_failure_at=max(0, int(data.get("last_failure_at") or 0)),
+            breaker_until=max(0, int(data.get("breaker_until") or 0)),
+            breaker_reason=str(data.get("breaker_reason", "")),
         )

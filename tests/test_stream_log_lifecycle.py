@@ -34,8 +34,8 @@ class FinishedStreamHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b'event: response.completed\n\n')
         self.wfile.write(
+            b'event: response.completed\n'
             b'data: {"response":{"status":"completed","usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6,"prompt_tokens_details":{"cached_tokens":0}}}}\n\n'
         )
         self.wfile.flush()
@@ -49,8 +49,8 @@ class AllZeroResponseCompletedHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b'event: response.completed\n\n')
         self.wfile.write(
+            b'event: response.completed\n'
             b'data: {"response":{"status":"completed","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":0}}}}\n\n'
         )
         self.wfile.flush()
@@ -112,6 +112,10 @@ def test_stream_lifecycle_patches_matching_candidate_only():
         assert "lifecycle=stream_done" in fallback.detail
         assert "chunks_received=8" in fallback.detail
         assert "bytes_received=900" in fallback.detail
+        assert fallback.detail.count("chunks_received=") == 1
+        assert fallback.detail.count("bytes_received=") == 1
+        assert router._detail_value(fallback.detail, "chunks_received") == "8"
+        assert router._detail_value(fallback.detail, "bytes_received") == "900"
 
         router.patch_stream_lifecycle(
             "req-stream",
@@ -194,6 +198,9 @@ def test_finished_stream_keeps_one_primary_log_with_first_byte_and_usage():
             assert "lifecycle=stream_done" in item.detail
             assert "final_result=stream_done" in item.detail
             assert "completion_signal=response.completed" in item.detail
+            assert "first_complete_frame_ms=" in item.detail
+            assert "stream_frame_count=1" in item.detail
+            assert "stream_wire_mode=sse" in item.detail
             assert not any(
                 log.request_id == request_id and log.event in {"stream_done", "stream_idle_timeout", "client_disconnected"}
                 for log in router.logs

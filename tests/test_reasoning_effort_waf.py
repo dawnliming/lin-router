@@ -226,8 +226,10 @@ def test_reasoning_field_selection_and_raw_model_patch_bytes():
     future_payload = {"model": "client-model", "reasoning": {"effort": "future_level"}}
     future_body, future_mode = ArkProxyRouter._body_for_upstream(future_payload, None, "client-model", "target-model")
     future_fields = ArkProxyRouter._reasoning_log_fields("/v1/responses", future_payload, future_body, future_mode, group)
-    assert "requested_reasoning_effort=future_level" in future_fields
+    assert "requested_reasoning_effort=unrecognized" in future_fields
+    assert "future_level" not in future_fields
     assert "reasoning_value_status=unrecognized" in future_fields
+    assert "reasoning_effort_sha256=" in future_fields
     assert "reasoning_preserved=true" in future_fields
 
     absent_payload = {"model": "client-model", "input": "ping"}
@@ -241,8 +243,12 @@ def test_reasoning_field_selection_and_raw_model_patch_bytes():
         payload = {"model": "client-model", "messages": [], "reasoning_effort": effort}
         body, mode = ArkProxyRouter._body_for_upstream(payload, None, "client-model", "target-model")
         fields = ArkProxyRouter._reasoning_log_fields("/v1/chat/completions", payload, body, mode, group)
-        assert f"requested_reasoning_effort={effort}" in fields
+        expected_effort = effort if effort != "future_level" else "unrecognized"
+        assert f"requested_reasoning_effort={expected_effort}" in fields
         assert f"reasoning_value_status={'recognized' if effort != 'future_level' else 'unrecognized'}" in fields
+        if effort == "future_level":
+            assert effort not in fields
+            assert "reasoning_effort_sha256=" in fields
         assert "reasoning_preserved=true" in fields
 
 
@@ -278,7 +284,7 @@ def test_chat_completions_reasoning_effort_is_preserved_through_waf_and_logged()
             expected_details = [
                 ("max", "recognized", "true"),
                 ("ultra", "recognized", "true"),
-                ("future_level", "unrecognized", "true"),
+                ("unrecognized", "unrecognized", "true"),
                 ("unset", "absent", "n/a"),
             ]
             for item, (effort, status, preserved) in zip(reversed(success_logs), expected_details):
@@ -288,6 +294,7 @@ def test_chat_completions_reasoning_effort_is_preserved_through_waf_and_logged()
                 assert f"reasoning_field_source={field_source}" in item.detail
                 assert f"reasoning_value_status={status}" in item.detail
                 assert f"reasoning_preserved={preserved}" in item.detail
+            assert all("future_level" not in item.detail for item in success_logs)
         finally:
             server.shutdown()
             server.server_close()

@@ -200,7 +200,7 @@ def test_v054_frontend_contracts():
     assert "reasoningPreservedLabel" in logs_js
     assert "reasoningValueStatusLabel" in logs_js
     assert "不适用（未携带字段）" in logs_js
-    assert "未识别，但已记录原值" in logs_js
+    assert "未识别，日志已脱敏" in logs_js
     assert "group-reasoning-support" in config_sources
     assert "aggregate-client-model-aliases" in config_sources
     assert r"split(/[\n,]+/)" in config_sources

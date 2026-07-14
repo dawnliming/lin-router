@@ -262,13 +262,13 @@ const LogsTab = {
     }
     if (event === 'stream_ok' && item) {
       const finalResult = this.parseDetail(item.detail).final_result;
-      if (finalResult === 'stream_done') return '首包成功 / 流式完成';
-      if (finalResult === 'stream_failed') return '首包成功 / 流式失败';
-      if (finalResult === 'stream_incomplete') return '首包成功 / 流式不完整';
-      if (finalResult === 'stream_idle_timeout') return '首包成功 / 流式空闲超时';
-      if (finalResult === 'client_disconnected') return '首包成功 / 客户端断开';
+      if (finalResult === 'stream_done') return '首完整帧成功 / 流式完成';
+      if (finalResult === 'stream_failed') return '首完整帧成功 / 流式失败';
+      if (finalResult === 'stream_incomplete') return '首完整帧成功 / 流式不完整';
+      if (finalResult === 'stream_idle_timeout') return '首完整帧成功 / 流式空闲超时';
+      if (finalResult === 'client_disconnected') return '首完整帧成功 / 客户端断开';
     }
-    const map = { ok:'成功', stream_ok:'首包成功', retry_ok:'重试成功', cooldown:'冷却切换', fallback:'自动切换', skip:'跳过', network:'网络错误', error:'错误', system:'系统', stream_timeout:'流式超时', serial_protection_timeout:'串行保护候选忙', waf_lock_timeout:'候选忙（旧版）', stream_done:'流式完成', stream_idle_timeout:'流式空闲超时', client_disconnected:'客户端断开', manual_probe:'人工探测' };
+    const map = { ok:'成功', stream_ok:'首完整帧成功', retry_ok:'重试成功', cooldown:'冷却切换', fallback:'自动切换', skip:'跳过', network:'网络错误', protocol:'协议错误', stream_protocol_error:'上游流式协议错误', error:'错误', system:'系统', stream_timeout:'流式超时', serial_protection_timeout:'串行保护候选忙', waf_lock_timeout:'候选忙（旧版）', stream_done:'流式完成', stream_idle_timeout:'流式空闲超时', client_disconnected:'客户端断开', manual_probe:'人工探测' };
     return map[event] || event || '-';
   },
 
@@ -293,6 +293,7 @@ const LogsTab = {
       probe_ok: '探测成功',
       probe_failed: '探测失败',
       network: '网络错误',
+      protocol: '协议错误',
       timeout: '请求超时',
       busy: '候选忙',
       streaming: '流式中',
@@ -307,7 +308,7 @@ const LogsTab = {
     if (item && this.isStableConfigSkip(item)) return 'info';
     const text = String(status || '');
     if (text === '200' || text.startsWith('2')) return 'success';
-    if (text === 'network' || text.includes('failed') || text.startsWith('5')) return 'error';
+    if (text === 'network' || text === 'protocol' || text.includes('failed') || text.includes('protocol') || text.startsWith('5')) return 'error';
     return 'warning';
   },
 
@@ -342,25 +343,31 @@ const LogsTab = {
     const totalMilliseconds = Number(item?.duration_ms);
     if (!Number.isFinite(totalMilliseconds) || totalMilliseconds < 0) return null;
     const parsed = this.parseDetail(item?.detail);
-    if (parsed.first_byte_ms === undefined || parsed.first_byte_ms === '') {
-      return { totalMilliseconds, firstByteMilliseconds: null, streamMilliseconds: null };
-    }
-    const firstByteMilliseconds = Number(parsed.first_byte_ms);
-    if (!Number.isFinite(firstByteMilliseconds) || firstByteMilliseconds < 0) {
-      return { totalMilliseconds, firstByteMilliseconds: null, streamMilliseconds: null };
-    }
+    const numericTiming = key => {
+      const value = Number(parsed[key]);
+      return Number.isFinite(value) && value >= 0 ? value : null;
+    };
+    const firstContentDeltaMilliseconds = numericTiming('first_content_delta_ms');
+    const firstCompleteFrameMilliseconds = numericTiming('first_complete_frame_ms') ?? numericTiming('first_byte_ms');
+    const primaryMilliseconds = firstContentDeltaMilliseconds ?? firstCompleteFrameMilliseconds;
+    const primaryLabel = firstContentDeltaMilliseconds !== null ? '首文本' : (firstCompleteFrameMilliseconds !== null ? '首完整帧' : '');
     return {
       totalMilliseconds,
-      firstByteMilliseconds,
-      streamMilliseconds: Math.max(0, totalMilliseconds - firstByteMilliseconds),
+      firstContentDeltaMilliseconds,
+      firstCompleteFrameMilliseconds,
+      firstRawLineMilliseconds: numericTiming('first_raw_line_ms'),
+      firstDownstreamFlushMilliseconds: numericTiming('first_downstream_flush_ms'),
+      primaryMilliseconds,
+      primaryLabel,
+      streamMilliseconds: primaryMilliseconds === null ? null : Math.max(0, totalMilliseconds - primaryMilliseconds),
     };
   },
 
   durationSummary(item) {
     const timing = this.streamTiming(item);
     if (!timing || !timing.totalMilliseconds) return '-';
-    if (timing.firstByteMilliseconds === null) return `总 ${this.formatDurationSeconds(timing.totalMilliseconds)}`;
-    return `首 ${this.formatDurationSeconds(timing.firstByteMilliseconds)} / 流 ${this.formatDurationSeconds(timing.streamMilliseconds)} / 总 ${this.formatDurationSeconds(timing.totalMilliseconds)}`;
+    if (timing.primaryMilliseconds === null) return `总 ${this.formatDurationSeconds(timing.totalMilliseconds)}`;
+    return `${timing.primaryLabel} ${this.formatDurationSeconds(timing.primaryMilliseconds)} / 后续 ${this.formatDurationSeconds(timing.streamMilliseconds)} / 总 ${this.formatDurationSeconds(timing.totalMilliseconds)}`;
   },
 
   renderRows(keepScroll = false) {
@@ -477,7 +484,7 @@ const LogsTab = {
       if (parsed.final_result === 'stream_incomplete') return '上游返回流式不完整终态';
       if (parsed.final_result === 'stream_idle_timeout') return '上游流式响应空闲超时';
       if (parsed.final_result === 'client_disconnected') return '客户端已断开连接';
-      return '首包成功，流式响应仍在进行';
+      return '首完整帧成功，流式响应仍在进行';
     }
     if (event === 'stream_done' || event === 'stream_finalized') return '流式响应已完成';
     if (event === 'client_disconnected') return '客户端已断开连接';
@@ -663,7 +670,7 @@ const LogsTab = {
     const map = {
       absent: '未携带字段',
       recognized: '已识别',
-      unrecognized: '未识别，但已记录原值',
+      unrecognized: '未识别，日志已脱敏',
     };
     return map[String(value || '')] || '-';
   },
@@ -675,7 +682,7 @@ const LogsTab = {
       return '推理强度字段未被完整保留，请检查请求体转换路径。';
     }
     if (String(parsed.reasoning_value_status) === 'unrecognized') {
-      return '请求携带了尚未纳入已知枚举的推理强度；Lin Router 已按原值记录并透传。';
+      return '请求携带了尚未纳入已知枚举的推理强度；Lin Router 已原样透传，日志仅保留脱敏摘要。';
     }
     if (['unknown', 'unsupported'].includes(String(parsed.upstream_reasoning_support || 'unknown'))) {
       return '当前中转渠道未确认支持推理强度，实际可能按上游默认值执行。';
@@ -755,6 +762,43 @@ const LogsTab = {
       </details>
     `;
   },
+
+  streamObservationDetails(parsed, timing) {
+    const hasStreamEvidence = [
+      'candidate_selected_ms', 'upstream_request_started_ms', 'upstream_headers_ms',
+      'first_raw_line_ms', 'first_complete_frame_ms', 'first_content_delta_ms',
+      'first_downstream_flush_ms', 'stream_frame_count', 'stream_wire_mode',
+    ].some(key => parsed[key] !== undefined);
+    if (!hasStreamEvidence) return '';
+    const ms = value => {
+      const number = Number(value);
+      return Number.isFinite(number) && number >= 0 ? this.formatDurationSeconds(number) : '-';
+    };
+    const mode = {
+      sse: '标准 SSE',
+      json_compat: 'JSON 兼容响应',
+      buffered_or_non_delimited: '缓冲或非分隔响应',
+    }[parsed.stream_wire_mode] || '-';
+    return `
+      <div class="log-detail-block">
+        <h4>流式时序</h4>
+        <dl>
+          <dt>候选完成</dt><dd>${ms(parsed.candidate_selected_ms)}</dd>
+          <dt>开始上游请求</dt><dd>${ms(parsed.upstream_request_started_ms)}</dd>
+          <dt>上游响应头</dt><dd>${ms(parsed.upstream_headers_ms)}</dd>
+          <dt>首原始行</dt><dd>${ms(parsed.first_raw_line_ms)}</dd>
+          <dt>首完整帧</dt><dd>${ms(timing?.firstCompleteFrameMilliseconds)}</dd>
+          <dt>首文本 delta</dt><dd>${ms(timing?.firstContentDeltaMilliseconds)}</dd>
+          <dt>首次下游 flush</dt><dd>${ms(timing?.firstDownstreamFlushMilliseconds)}</dd>
+          <dt>帧数 / 首帧字节</dt><dd>${Utils.escapeHtml(parsed.stream_frame_count || '-')} / ${Utils.escapeHtml(parsed.initial_frame_bytes || '-')}</dd>
+          <dt>上游传输</dt><dd>${Utils.escapeHtml(parsed.upstream_transport || parsed.http_client || '-')} / ${Utils.escapeHtml(parsed.upstream_http_version || '-')}</dd>
+          <dt>响应模式</dt><dd>${Utils.escapeHtml(mode)}</dd>
+          <dt>媒体 / 编码</dt><dd>${Utils.escapeHtml(parsed.upstream_content_type || '-')} / ${Utils.escapeHtml(parsed.upstream_content_encoding || '-')}</dd>
+        </dl>
+      </div>
+    `;
+  },
+
   detailHtml(item) {
     const parsed = this.parseDetail(item.detail);
     const debugMode = Store.state.settings?.debug_mode === true;
@@ -765,7 +809,7 @@ const LogsTab = {
       parsed.requested ? Utils.escapeHtml(parsed.requested) : Utils.escapeHtml(item.requested_model || item.model || 'lin-router-auto'),
       parsed.group_name ? Utils.escapeHtml(parsed.group_name) : Utils.escapeHtml(this.groupName(item)),
       parsed.model ? Utils.escapeHtml(parsed.model) : Utils.escapeHtml(item.selected_model || item.model || '-'),
-      parsed.upstream ? Utils.escapeHtml(parsed.upstream) : Utils.escapeHtml(parsed.selected_upstream_model || '-'),
+      Utils.escapeHtml(parsed.selected_upstream_model || '-'),
     ];
     const aggregateChain = isAggregate ? this.renderAggregateChain(parsed) : '';
     const candidateFilterDetails = this.renderCandidateFilterDetails(item);
@@ -776,6 +820,7 @@ const LogsTab = {
     const fallbackReason = this.userFacingFallbackReason(item, parsed);
     const cooldownApplied = this.firstValue(item.cooldown_applied, parsed.cooldown_applied, parsed.cooldown_reason ? 'true' : 'false');
     const timing = this.streamTiming(item);
+    const streamObservations = this.streamObservationDetails(parsed, timing);
     const streamLifecycle = {
       stream_done: '流式响应已完成',
       stream_failed: '上游返回流式失败终态',
@@ -808,8 +853,8 @@ const LogsTab = {
           <h4>基础信息</h4>
           <dl>
             <dt>时间</dt><dd>${Utils.escapeHtml(item.time)}</dd>
-            <dt>首包耗时</dt><dd>${timing?.firstByteMilliseconds !== null && timing?.firstByteMilliseconds !== undefined ? this.formatDurationSeconds(timing.firstByteMilliseconds) : '-'}</dd>
-            <dt>流式耗时</dt><dd>${timing?.streamMilliseconds !== null && timing?.streamMilliseconds !== undefined ? this.formatDurationSeconds(timing.streamMilliseconds) : '-'}</dd>
+            <dt>首文本耗时</dt><dd>${timing?.firstContentDeltaMilliseconds !== null && timing?.firstContentDeltaMilliseconds !== undefined ? this.formatDurationSeconds(timing.firstContentDeltaMilliseconds) : '-'}</dd>
+            <dt>后续流耗时</dt><dd>${timing?.streamMilliseconds !== null && timing?.streamMilliseconds !== undefined ? this.formatDurationSeconds(timing.streamMilliseconds) : '-'}</dd>
             <dt>总耗时</dt><dd>${timing ? this.formatDurationSeconds(timing.totalMilliseconds) : '-'}</dd>
             <dt>流生命周期</dt><dd>${Utils.escapeHtml(streamLifecycle)}</dd>
             <dt>完成信号</dt><dd>${Utils.escapeHtml(parsed.completion_signal || '-')}</dd>
@@ -825,9 +870,11 @@ const LogsTab = {
             <dt>请求模型</dt><dd>${Utils.escapeHtml(this.firstValue(parsed.requested, item.requested_model, item.model))}</dd>
             <dt>连接组</dt><dd>${Utils.escapeHtml(this.firstValue(parsed.group_name, parsed.selected_group, this.groupName(item)))}</dd>
             <dt>实际模型</dt><dd>${Utils.escapeHtml(this.firstValue(parsed.selected_model, parsed.model, item.selected_model, item.model))}</dd>
-            <dt>上游地址</dt><dd>${Utils.escapeHtml(this.firstValue(parsed.selected_upstream_model, parsed.upstream))}</dd>
+            <dt>上游模型</dt><dd>${Utils.escapeHtml(this.firstValue(parsed.selected_upstream_model, parsed.model))}</dd>
+            <dt>上游端点</dt><dd>${Utils.escapeHtml(parsed.upstream_endpoint || '-')}</dd>
           </dl>
         </div>
+        ${streamObservations}
         <div class="log-detail-block">
           <h4>诊断信息</h4>
           <dl>

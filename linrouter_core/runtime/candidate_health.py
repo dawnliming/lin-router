@@ -6,6 +6,7 @@ the legacy facade, HTTP transport, execution services, or a broad router depende
 """
 from __future__ import annotations
 
+import hashlib
 import time
 from typing import Callable, Iterator, Tuple
 
@@ -29,6 +30,7 @@ class CandidateHealthService:
         auth_for: Callable[[ConnectionGroup, ModelConfig | None], str],
         candidate_type: type[UpstreamCandidate],
         log_aggregate_member_skip: Callable[..., None],
+        breaker_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self._store = store
         self._now = now
@@ -38,6 +40,41 @@ class CandidateHealthService:
         self._auth_for = auth_for
         self._candidate_type = candidate_type
         self._log_aggregate_member_skip = log_aggregate_member_skip
+        self._breaker_enabled = breaker_enabled or (lambda: False)
+
+    @staticmethod
+    def _safe_error_reference(error: str) -> str:
+        """Persist an error correlation token, never an upstream response body."""
+        text = str(error or "")
+        if not text:
+            return ""
+        encoded = text.encode("utf-8", "replace")
+        return f"redacted_sha256:{hashlib.sha256(encoded).hexdigest()[:16]},bytes:{len(encoded)}"
+
+    def _breaker_is_open(self, item: ModelConfig | AggregateMember) -> bool:
+        """Keep an open breaker out of automatic selection until a manual probe recovers it."""
+        if not self._breaker_enabled():
+            # A breaker toggle is a runtime policy switch. Do not let health
+            # state persisted while it was enabled keep a candidate unusable
+            # after the feature is turned off.
+            if getattr(item, "health_state", "") in {"cooling", "breaker_open"}:
+                item.health_state = "normal"
+                item.consecutive_failures = 0
+                item.last_failure_at = 0
+                item.breaker_until = 0
+                item.breaker_reason = ""
+                item.cooldown_until = 0
+                item.cooldown_reason = ""
+                item.last_error = ""
+                if isinstance(item, ModelConfig) and not item.disabled_by_user:
+                    item.usable = True
+                self._store.save()
+            return False
+        until = int(getattr(item, "breaker_until", 0) or 0)
+        if not until:
+            return False
+        item.health_state = "breaker_open"
+        return True
 
     def iter_candidates(
         self,
@@ -56,13 +93,46 @@ class CandidateHealthService:
                 model.last_error = ""
                 model.last_checked_at = self._now()
                 self._store.save()
-            if model.disabled_by_user or not model.usable:
+            if self._breaker_is_open(model):
+                continue
+            requested_match = bool(
+                requested_model
+                and requested_model in {model.id, model.name, model.ep_id}
+            )
+            # A named request is allowed to make the next breaker attempt while
+            # the model is only cooling.  Once the breaker opens it is still
+            # excluded above.  Auto and aggregate routing retain their existing
+            # cooldown behaviour.
+            explicit_breaker_retry = bool(
+                self._breaker_enabled()
+                and requested_match
+                and model.health_state == "cooling"
+                and model.cooldown_until
+            )
+            if model.disabled_by_user or (not model.usable and not explicit_breaker_retry):
                 continue
             if group_id and model.group_id != group_id:
                 continue
-            if requested_model and requested_model not in {model.id, model.name, model.ep_id}:
+            if requested_model and not requested_match:
                 continue
             yield idx, model
+
+    def supports_group_requested_model(self, requested_model: str | None, group: ConnectionGroup | None) -> bool:
+        """Return whether an explicit model satisfies a non-proxy group contract.
+
+        Auto model names keep their existing selection semantics; proxy groups are
+        intentionally excluded because their explicit pass-through contract is
+        handled by ``iter_upstream_candidates``.
+        """
+        if not requested_model or self._is_auto_model(requested_model, group):
+            return True
+        if not group or self._mode_for(group) == PROVIDER_PROXY:
+            return True
+        return any(
+            model.group_id == group.id
+            and requested_model in {model.id, model.name, model.ep_id}
+            for model in self._store.models
+        )
 
     def candidate_from_model(
         self,
@@ -124,13 +194,19 @@ class CandidateHealthService:
         now_ts = int(time.time())
         if not member.enabled:
             return "member_disabled", "该聚合成员已手动停用，不参与本次调度。", group, model
+        if self._breaker_is_open(member):
+            return "member_breaker_open", "该聚合成员已触发熔断，暂不参与本次调度。", group, model
         if member.cooldown_until and member.cooldown_until > now_ts:
             return "member_cooling", "该聚合成员正在冷却中，本次直接跳过。", group, model
         if not group:
             return "underlying_group_missing", "底层连接组不存在，请检查聚合成员配置。", group, model
         if not model:
             return "underlying_model_missing", "底层真实模型不存在，请检查聚合成员配置。", group, model
-        if not model.usable or model.disabled_by_user:
+        if model.disabled_by_user:
+            return "underlying_model_disabled", "底层真实模型已停用，请先启用真实模型。", group, model
+        if self._breaker_is_open(model):
+            return "underlying_model_breaker_open", "底层真实模型已熔断，暂不参与本次调度。", group, model
+        if not model.usable:
             return "underlying_model_disabled", "底层真实模型已停用，请先启用真实模型。", group, model
         if model.cooldown_until and model.cooldown_until > now_ts:
             return "underlying_model_cooling", "底层真实模型冷却中，本次直接跳过。", group, model
@@ -163,24 +239,49 @@ class CandidateHealthService:
 
     def set_cooldown(self, idx: int, error: str, cooldown_seconds: int, reason: str) -> None:
         model = self._store.models[idx]
+        now_ts = int(time.time())
+        if self._breaker_enabled():
+            model.consecutive_failures = 0 if not model.last_failure_at or now_ts - model.last_failure_at > 300 else model.consecutive_failures
+            model.consecutive_failures += 1
+            model.last_failure_at = now_ts
+            model.health_state = "breaker_open" if model.consecutive_failures >= 3 else "cooling"
+            if model.consecutive_failures >= 3:
+                model.breaker_until = now_ts + 60
+                model.breaker_reason = reason[:120]
         model.usable = False
-        model.last_error = error[:500]
+        model.last_error = self._safe_error_reference(error)
         model.last_checked_at = self._now()
         model.cooldown_until = int(time.time()) + max(0, cooldown_seconds)
         model.cooldown_reason = reason[:120]
         self._store.save()
 
+    def record_qualified_failure(self, idx: int, error: str, cooldown_seconds: int, reason: str) -> bool:
+        """Apply the existing cooldown/breaker state only when it is enabled."""
+        if not self._breaker_enabled():
+            return False
+        self.set_cooldown(idx, error, cooldown_seconds, reason)
+        return True
+
     def set_success(self, idx: int) -> None:
         model = self._store.models[idx]
+        if not model.disabled_by_user:
+            model.usable = True
         model.last_error = ""
         model.last_success_at = self._now()
         model.last_checked_at = model.last_success_at
+        model.cooldown_until = 0
+        model.cooldown_reason = ""
+        model.health_state = "normal"
+        model.consecutive_failures = 0
+        model.last_failure_at = 0
+        model.breaker_until = 0
+        model.breaker_reason = ""
         self._store.save()
 
     def set_unusable(self, idx: int, error: str) -> None:
         model = self._store.models[idx]
         model.usable = False
-        model.last_error = error[:500]
+        model.last_error = self._safe_error_reference(error)
         model.last_checked_at = self._now()
         model.cooldown_until = 0
         model.cooldown_reason = ""
@@ -190,9 +291,18 @@ class CandidateHealthService:
         member = self._store.find_aggregate_member(member_id)
         if not member:
             return
-        member.last_error = error[:500]
+        now_ts = int(time.time())
+        if self._breaker_enabled():
+            member.consecutive_failures = 0 if not member.last_failure_at or now_ts - member.last_failure_at > 300 else member.consecutive_failures
+            member.consecutive_failures += 1
+            member.last_failure_at = now_ts
+            member.health_state = "breaker_open" if member.consecutive_failures >= 3 else "cooling"
+            if member.consecutive_failures >= 3:
+                member.breaker_until = now_ts + 60
+                member.breaker_reason = reason[:120]
+        member.last_error = self._safe_error_reference(error)
         member.last_checked_at = self._now()
-        member.cooldown_until = int(time.time()) + max(0, cooldown_seconds)
+        member.cooldown_until = now_ts + max(0, cooldown_seconds)
         member.cooldown_reason = reason[:120]
         self._store.save()
 
@@ -203,4 +313,11 @@ class CandidateHealthService:
         member.last_error = ""
         member.last_success_at = self._now()
         member.last_checked_at = member.last_success_at
+        member.cooldown_until = 0
+        member.cooldown_reason = ""
+        member.health_state = "normal"
+        member.consecutive_failures = 0
+        member.last_failure_at = 0
+        member.breaker_until = 0
+        member.breaker_reason = ""
         self._store.save()

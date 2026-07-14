@@ -100,6 +100,8 @@ const API = {
   saveSettings(data) { return this.req('/api/settings', { method: 'PUT', body: JSON.stringify(data) }); },
   exportConfig() { return this.req('/api/config/export'); },
   getAggregates() { return this.req('/api/aggregates'); },
+  speedTestGroup(id) { return this.req(`/api/groups/${encodeURIComponent(id)}/speed-test`, { method: 'POST' }); },
+  speedTestAggregate(id) { return this.req(`/api/aggregates/${encodeURIComponent(id)}/speed-test`, { method: 'POST' }); },
   getAggregateStats(id, limit = 100) { return this.req(`/api/aggregates/${id}/stats?limit=${encodeURIComponent(limit)}`); },
   createAggregate(data) { return this.req('/api/aggregates', { method: 'POST', body: JSON.stringify(data) }); },
   saveAggregate(id, data) { return this.req(`/api/aggregates/${id}`, { method: 'PUT', body: JSON.stringify(data) }); },

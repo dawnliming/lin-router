@@ -18,6 +18,7 @@ DEFAULT_SETTINGS = {
     "debug_capture_enabled": False,
     "debug_capture_last_body": False,
     "normalize_tools_order": False,
+    "smart_breaker_enabled": False,
 }
 
 

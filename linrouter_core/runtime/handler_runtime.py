@@ -9,6 +9,12 @@ HOP_BY_HOP_HEADERS = {
 }
 
 
+def _is_json_compat_response(headers: Dict[str, str]) -> bool:
+    content_type = next((str(value) for key, value in headers.items() if str(key).lower() == "content-type"), "")
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    return media_type == "application/json" or media_type.endswith("+json")
+
+
 def _forward_response_headers(handler: Any, headers: Dict[str, str], *, stream: bool, data_length: int = 0) -> None:
     connection_header = next((value for key, value in headers.items() if key.lower() == "connection"), "")
     connection_tokens = {
@@ -18,14 +24,19 @@ def _forward_response_headers(handler: Any, headers: Dict[str, str], *, stream: 
         if token.strip()
     }
     sent_content_type = False
+    json_compat = bool(stream and _is_json_compat_response(headers))
     for key, value in headers.items():
         lowered = key.lower()
-        if lowered in HOP_BY_HOP_HEADERS or lowered in connection_tokens or lowered == "content-length":
+        if lowered in HOP_BY_HOP_HEADERS or lowered in connection_tokens:
             continue
-        # The downstream client must always receive a genuine SSE response for
-        # a streaming route, even when a relay incorrectly labels its payload
-        # as JSON (or supplies buffering-related headers of its own).
-        if stream and lowered in {"content-type", "cache-control", "x-accel-buffering"}:
+        if lowered == "content-length" and not (stream and json_compat):
+            continue
+        # Normal streaming routes are normalized to SSE.  A fully buffered
+        # JSON compatibility response keeps its JSON media type so clients do
+        # not mistake one body for an incremental SSE stream.
+        if stream and lowered in {"cache-control", "x-accel-buffering"}:
+            continue
+        if stream and lowered == "content-type" and not json_compat:
             continue
         if lowered == "content-type":
             if sent_content_type:
@@ -33,7 +44,8 @@ def _forward_response_headers(handler: Any, headers: Dict[str, str], *, stream: 
             sent_content_type = True
         handler.send_header(key, value)
     if stream:
-        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        if not sent_content_type:
+            handler.send_header("Content-Type", "application/json; charset=utf-8" if json_compat else "text/event-stream; charset=utf-8")
         handler.send_header("Cache-Control", "no-cache")
         handler.send_header("X-Accel-Buffering", "no")
     elif not sent_content_type:
@@ -69,17 +81,23 @@ def handle_proxy_request(
             _forward_response_headers(handler, headers, stream=True)
             handler.end_headers()
             response_started = True
+            first_flush_recorded = False
             try:
                 for chunk in iterator:
                     handler.wfile.write(chunk)
                     handler.wfile.flush()
+                    if not first_flush_recorded and hasattr(handler.router, "record_stream_transport_event"):
+                        handler.router.record_stream_transport_event(request_id, "downstream_first_flush")
+                        first_flush_recorded = True
                     if _is_terminal_chunk(chunk) and hasattr(handler.router, "record_stream_transport_event"):
                         handler.router.record_stream_transport_event(request_id, "downstream_terminal_forwarded")
             except (BrokenPipeError, ConnectionResetError, OSError):
                 if not _dashboard_cancellation_requested(handler.router, request_id) and hasattr(handler.router, "record_stream_transport_event"):
                     handler.router.record_stream_transport_event(request_id, "downstream_write_failed")
             finally:
-                iterator.close()
+                close = getattr(iterator, "close", None)
+                if callable(close):
+                    close()
                 handler.router.finalize_stream_if_needed(request_id)
             return
         status, headers, data = handler.router.call(path, payload, route, dict(handler.headers.items()), raw_body)

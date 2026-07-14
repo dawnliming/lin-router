@@ -73,3 +73,29 @@ def test_observability_loads_and_retains_more_than_legacy_eighty_rows(tmp_path: 
     restored = ArkProxyRouter(Store(), None, tmp_path / "logs.jsonl")
     assert len(restored.logs) == 120
     assert restored.all_logs()[0].request_id == "request-0"
+
+
+def test_first_downstream_flush_is_recorded_once_without_overwriting_lifecycle_metrics(tmp_path: Path) -> None:
+    router = ArkProxyRouter(Store(), None, tmp_path / "logs.jsonl")
+    router.add_log(
+        "/v1/chat/completions",
+        "demo",
+        "streaming",
+        "stream ok; stream_started_at_ms=1; first_downstream_flush_ms=-1; stream_frame_count=1",
+        request_id="request-flush",
+        event="stream_ok",
+    )
+
+    router.record_stream_transport_event("request-flush", "downstream_first_flush")
+    router.record_stream_transport_event("request-flush", "downstream_first_flush")
+    item = router.logs[0]
+    assert int(router._detail_value(item.detail, "first_downstream_flush_ms")) >= 0
+    assert item.detail.count("first_downstream_flush_ms=") == 1
+
+    assert router.patch_stream_lifecycle(
+        "request-flush", 0, "demo", (0, 0, 0, 0, 0), "stream_final",
+        final_status="200", lifecycle="stream_done", final_result="stream_done", chunks_received=3, bytes_received=20,
+        stream_metrics={"first_downstream_flush_ms": -1, "stream_frame_count": 3},
+    )
+    assert int(router._detail_value(item.detail, "first_downstream_flush_ms")) >= 0
+    assert router._detail_value(item.detail, "stream_frame_count") == "3"

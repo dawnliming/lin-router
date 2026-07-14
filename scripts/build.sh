@@ -5,13 +5,16 @@ set -e
 # 用法：
 #   scripts/build.sh --target win32
 #   scripts/build.sh --target win32 --installer
+#   scripts/build.sh --target win32 --installer --sign
 #   scripts/build.sh --target darwin
 #   scripts/build.sh --target darwin --dmg
 # 默认只输出到 dist/；如需同时复制到桌面，请加 --desktop。
+# Windows 签名为显式可选项；--sign 会要求完整签名配置，不会静默降级。
 
 TARGET=""
 BUILD_DMG=0
 BUILD_INSTALLER=0
+SIGN_WINDOWS=0
 COPY_TO_DESKTOP=0
 APP_VERSION="0.6.0"
 
@@ -29,6 +32,10 @@ while [[ $# -gt 0 ]]; do
       BUILD_INSTALLER=1
       shift
       ;;
+    --sign)
+      SIGN_WINDOWS=1
+      shift
+      ;;
     --version)
       if [[ -z "${2:-}" ]]; then
         echo "--version 需要指定版本号" >&2
@@ -43,7 +50,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "未知选项：$1" >&2
-      echo "用法：$0 --target {win32|darwin} [--installer] [--dmg] [--desktop] [--version x.y.z]" >&2
+      echo "用法：$0 --target {win32|darwin} [--installer] [--sign] [--dmg] [--desktop] [--version x.y.z]" >&2
       echo "注意：--desktop 显式指定后才会复制产物到桌面" >&2
       exit 1
       ;;
@@ -52,7 +59,7 @@ done
 
 if [[ -z "$TARGET" ]]; then
   echo "必须指定 --target {win32|darwin}" >&2
-  echo "用法：$0 --target {win32|darwin} [--installer] [--dmg] [--desktop] [--version x.y.z]" >&2
+  echo "用法：$0 --target {win32|darwin} [--installer] [--sign] [--dmg] [--desktop] [--version x.y.z]" >&2
   echo "注意：--desktop 显式指定后才会复制产物到桌面" >&2
   exit 1
 fi
@@ -62,12 +69,38 @@ if [[ "$BUILD_INSTALLER" == "1" && "$TARGET" != "win32" ]]; then
   exit 1
 fi
 
+if [[ "$SIGN_WINDOWS" == "1" && "$TARGET" != "win32" ]]; then
+  echo "--sign 仅支持 --target win32；macOS 签名/公证不在本次发布链范围内" >&2
+  exit 1
+fi
+
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RESOURCES_DIR="$PROJECT_ROOT/resources"
 DIST_DIR="$PROJECT_ROOT/dist"
 INSTALLER_SCRIPT="$PROJECT_ROOT/scripts/installer/LinRouter.iss"
 SELF_INSTALLER_BUILDER="$PROJECT_ROOT/scripts/installer/build_self_installer.py"
 RELEASE_GUARD="$PROJECT_ROOT/scripts/release_guard.py"
+SIGNING_HELPER="$PROJECT_ROOT/scripts/sign_windows_artifact.py"
+
+validate_windows_signing() {
+  if [[ "$SIGN_WINDOWS" != "1" ]]; then
+    return 0
+  fi
+  local helper_win
+  helper_win="$(to_windows_path "$SIGNING_HELPER")"
+  python "$helper_win" --validate-only
+}
+
+sign_windows_artifact() {
+  if [[ "$SIGN_WINDOWS" != "1" ]]; then
+    return 0
+  fi
+  local artifact="$1"
+  local helper_win artifact_win
+  helper_win="$(to_windows_path "$SIGNING_HELPER")"
+  artifact_win="$(to_windows_path "$artifact")"
+  python "$helper_win" "$artifact_win"
+}
 
 generate_icon() {
   python "$PROJECT_ROOT/scripts/generate_icon.py" "$1" "$2"
@@ -191,6 +224,7 @@ build_windows_installer() {
   fi
 
   echo "Windows 安装包构建完成：$output_file"
+  sign_windows_artifact "$output_file"
   if [[ "$COPY_TO_DESKTOP" == "1" ]]; then
     copy_to_desktop "$output_file" || exit 1
   fi
@@ -198,6 +232,7 @@ build_windows_installer() {
 
 case "$TARGET" in
   win32)
+    validate_windows_signing
     ICON_PATH="$RESOURCES_DIR/win32/LinRouter.ico"
     if [[ ! -f "$ICON_PATH" ]]; then
       echo "生成 Windows 图标..."
@@ -209,6 +244,8 @@ case "$TARGET" in
     rm -f "$DIST_DIR/LinRouter_windows.exe"
     mv "$DIST_DIR/LinRouter.exe" "$DIST_DIR/LinRouter_windows.exe"
     echo "Windows 构建完成：$DIST_DIR/LinRouter_windows.exe"
+    # 必须先签 payload；自举安装器随后会把这个已签名 EXE 嵌入安装包。
+    sign_windows_artifact "$DIST_DIR/LinRouter_windows.exe"
     if [[ "$BUILD_INSTALLER" == "1" ]]; then
       build_windows_zip
       build_windows_installer
@@ -256,7 +293,7 @@ case "$TARGET" in
 
   *)
     echo "不支持的目标平台：$TARGET" >&2
-    echo "用法：$0 --target {win32|darwin} [--installer] [--dmg] [--desktop] [--version x.y.z]" >&2
+    echo "用法：$0 --target {win32|darwin} [--installer] [--sign] [--dmg] [--desktop] [--version x.y.z]" >&2
     echo "注意：--desktop 显式指定后才会复制产物到桌面" >&2
     exit 1
     ;;

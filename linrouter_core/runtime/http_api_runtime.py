@@ -280,6 +280,32 @@ def handle_get(handler: Any) -> None:
 
 def handle_post(handler: Any) -> None:
     parsed = urlparse(handler.path)
+    if parsed.path.startswith("/api/groups/") and parsed.path.endswith("/speed-test"):
+        payload = handler.router.speed_test_group(parsed.path.split("/")[3])
+        code = str(payload.get("code") or "")
+        if code == "group_not_found":
+            status = 404
+        elif code == "speed_test_running":
+            status = 409
+        elif code == "speed_test_rate_limited":
+            status = 429
+        else:
+            status = 200 if payload.get("ok") else 503
+        handler._send_json(payload, status=status)
+        return
+    if parsed.path.startswith("/api/aggregates/") and parsed.path.endswith("/speed-test"):
+        payload = handler.router.speed_test_aggregate(parsed.path.split("/")[3])
+        code = str(payload.get("code") or "")
+        if code == "aggregate_not_found":
+            status = 404
+        elif code == "speed_test_running":
+            status = 409
+        elif code == "speed_test_rate_limited":
+            status = 429
+        else:
+            status = 200 if payload.get("ok") else 503
+        handler._send_json(payload, status=status)
+        return
     if parsed.path.startswith("/api/live-requests/") and parsed.path.endswith("/cancel"):
         request_id = parsed.path[len("/api/live-requests/"):-len("/cancel")].strip("/")
         payload = handler.router.cancel_live_request(request_id, source="dashboard")

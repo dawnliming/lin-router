@@ -7,6 +7,7 @@ unchanged while dependencies are kept narrow and auditable.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import uuid
@@ -78,6 +79,20 @@ class SerialProtectionState:
 WafLockState = SerialProtectionState
 
 
+MAX_SSE_FRAME_BYTES = 4 * 1024 * 1024
+MAX_SSE_FRAME_WAIT_SECONDS = 15
+
+
+class StreamFrameProtocolError(URLError):
+    """Raised before response commitment when an SSE frame never completes."""
+
+    def __init__(self, reason: str, frame_bytes: int, frame_wait_ms: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.frame_bytes = max(0, int(frame_bytes))
+        self.frame_wait_ms = max(0, int(frame_wait_ms))
+
+
 class ManagedStreamIterator:
     """Ensures stream resources are released even when no chunk is consumed."""
 
@@ -104,7 +119,14 @@ class ManagedStreamIterator:
             self._finalize()
 
 
-def _read_sse_frame(readline: Callable[[int], bytes], timeout_seconds: int) -> bytes:
+def _read_sse_frame(
+    readline: Callable[[int], bytes],
+    timeout_seconds: int,
+    on_raw_line: Optional[Callable[[bytes], None]] = None,
+    *,
+    max_frame_bytes: int = MAX_SSE_FRAME_BYTES,
+    max_frame_wait_seconds: int = MAX_SSE_FRAME_WAIT_SECONDS,
+) -> bytes:
     """Read one complete SSE frame, delimited by a blank line.
 
     Upstream ``readline`` calls may return an ``event:`` line before the
@@ -114,15 +136,161 @@ def _read_sse_frame(readline: Callable[[int], bytes], timeout_seconds: int) -> b
     returns ``b""``.
     """
     lines: list[bytes] = []
+    frame_bytes = 0
+    frame_started_at = 0.0
     while True:
-        line = readline(timeout_seconds)
+        read_timeout = timeout_seconds
+        if frame_started_at and max_frame_wait_seconds > 0:
+            remaining_seconds = max_frame_wait_seconds - (time.perf_counter() - frame_started_at)
+            if remaining_seconds <= 0:
+                raise StreamFrameProtocolError(
+                    "stream_frame_wait_limit",
+                    frame_bytes,
+                    _elapsed_ms(frame_started_at),
+                )
+            remaining_timeout = max(1, int(remaining_seconds + 0.999))
+            if read_timeout <= 0 or read_timeout > remaining_timeout:
+                read_timeout = remaining_timeout
+        try:
+            line = readline(read_timeout)
+        except TimeoutError as exc:
+            if frame_started_at:
+                raise StreamFrameProtocolError(
+                    "stream_frame_wait_limit",
+                    frame_bytes,
+                    _elapsed_ms(frame_started_at),
+                ) from exc
+            raise
+        if line and on_raw_line:
+            # The callback receives no persisted content.  It only marks the
+            # first logical upstream line for timing attribution.
+            on_raw_line(line)
         if not line:
             return b"".join(lines)
         if line in {b"\n", b"\r\n"}:
             if lines:
                 return b"".join(lines) + line
             continue
+        if not frame_started_at:
+            frame_started_at = time.perf_counter()
+        frame_bytes += len(line)
+        if max_frame_bytes > 0 and frame_bytes > max_frame_bytes:
+            raise StreamFrameProtocolError(
+                "stream_frame_size_limit",
+                frame_bytes,
+                _elapsed_ms(frame_started_at),
+            )
         lines.append(line)
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return max(0, int((time.perf_counter() - started_at) * 1000))
+
+
+def _stream_metrics_text(stream_metrics: Dict[str, Any]) -> str:
+    return "; ".join(f"{key}={value}" for key, value in stream_metrics.items())
+
+
+def _header_value(headers: Any, name: str) -> str:
+    for key, value in getattr(headers, "items", lambda: [])():
+        if str(key).lower() == name:
+            return str(value)
+    return ""
+
+
+def _safe_media_type(value: str) -> str:
+    media_type = str(value or "").split(";", 1)[0].strip().lower()
+    if not media_type or not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", media_type):
+        return "unknown"
+    return media_type
+
+
+def _safe_header_token(value: str) -> str:
+    token = str(value or "").split(",", 1)[0].strip().lower()
+    if not token:
+        return "-"
+    return token if re.fullmatch(r"[a-z0-9._-]+", token) else "unknown"
+
+
+def _safe_http_version(value: Any) -> str:
+    normalized = str(value or "").upper().strip()
+    return normalized if normalized in {"HTTP/1.0", "HTTP/1.1", "HTTP/2"} else "unknown"
+
+
+def _frame_is_delimited(frame: bytes) -> bool:
+    return frame.endswith(b"\n\n") or frame.endswith(b"\r\n\r\n")
+
+
+def _frame_has_text_delta(frame: bytes) -> bool:
+    """Detect text-bearing deltas without retaining their content."""
+    for line in frame.decode("utf-8", "ignore").splitlines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        event_type = str(payload.get("type") or payload.get("event") or "").lower()
+        if event_type in {"response.output_text.delta", "response.output_text.done"}:
+            if isinstance(payload.get("delta"), str) and payload.get("delta"):
+                return True
+            if isinstance(payload.get("text"), str) and payload.get("text"):
+                return True
+        if event_type == "content_block_delta":
+            delta = payload.get("delta")
+            if isinstance(delta, dict) and isinstance(delta.get("text"), str) and delta.get("text"):
+                return True
+        choices = payload.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                delta = choice.get("delta") if isinstance(choice, dict) else None
+                if not isinstance(delta, dict):
+                    continue
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    return True
+                if isinstance(content, list) and any(
+                    isinstance(part, dict) and isinstance(part.get("text"), str) and part.get("text")
+                    for part in content
+                ):
+                    return True
+    return False
+
+
+def _stream_wire_mode(
+    media_type: str,
+    content_encoding: str,
+    *,
+    saw_non_delimited_frame: bool,
+    stream_frame_count: int,
+    initial_frame_bytes: int,
+) -> str:
+    if media_type == "application/json" or media_type.endswith("+json"):
+        return "json_compat"
+    if (
+        content_encoding not in {"-", "identity"}
+        or saw_non_delimited_frame
+        or (stream_frame_count == 1 and initial_frame_bytes >= 65536)
+    ):
+        return "buffered_or_non_delimited"
+    return "sse"
+
+
+def _response_headers_for_downstream(response: Any) -> Dict[str, str]:
+    """Avoid advertising a content encoding after httpx has decoded it."""
+    headers = dict(getattr(response, "headers", {}).items())
+    if getattr(response, "content_decoded", False):
+        return {
+            key: value
+            for key, value in headers.items()
+            if str(key).lower() not in {"content-encoding", "content-length"}
+        }
+    return headers
 
 
 class CandidateRuntime:
@@ -188,6 +356,68 @@ class CandidateRuntime:
         )
         self.observability.finish_live_request(request_id, "manual_cancelled")
 
+    def _record_explicit_qualified_failure(
+        self,
+        state: CandidateStatePort,
+        candidate: UpstreamCandidate,
+        group: Any,
+        error: str,
+        reason: str,
+        *,
+        auto_fallback: bool,
+    ) -> bool:
+        """Feed explicit-model upstream failures into the existing breaker state."""
+        if auto_fallback or candidate.aggregate_member_id or candidate.idx is None:
+            return False
+        return state.record_qualified_failure(
+            candidate.idx,
+            error,
+            self.policy.auto_cooldown_seconds(group),
+            reason,
+        )
+
+    def _record_stream_terminal_failure(
+        self,
+        state: CandidateStatePort,
+        candidate: UpstreamCandidate,
+        group: Any,
+        aggregate_model: Optional[AggregateModel],
+        error: str,
+        reason: str,
+        *,
+        auto_fallback: bool,
+    ) -> bool:
+        """Apply the existing route-specific health policy after a started stream fails."""
+        if candidate.aggregate_member_id and aggregate_model:
+            state.set_aggregate_member_cooldown(
+                candidate.aggregate_member_id,
+                error,
+                state.aggregate_cooldown_seconds(aggregate_model),
+                reason,
+            )
+            return True
+        if auto_fallback:
+            if candidate.group.provider_type == PROVIDER_RELAY and candidate.idx is not None:
+                state.set_cooldown(
+                    candidate.idx,
+                    error,
+                    self.policy.auto_cooldown_seconds(group),
+                    reason,
+                )
+                return True
+            if candidate.idx is not None:
+                state.set_unusable(candidate.idx, error)
+                return True
+            return False
+        return self._record_explicit_qualified_failure(
+            state,
+            candidate,
+            group,
+            error,
+            reason,
+            auto_fallback=auto_fallback,
+        )
+
     def execute_non_stream(
         self,
         path: str,
@@ -213,6 +443,14 @@ class CandidateRuntime:
         auto_mode = self.policy.is_auto_model(str(requested_model) if requested_model else None, route_group)
         # auto_fallback：组级 auto 或聚合模型下，失败时尝试下一个候选（全局 Key 已退役）
         auto_fallback = auto_mode or bool(route_aggregate)
+        # Contract failures are rejected before a live-request record is created.
+        aggregate_info = state.resolve_aggregate(str(requested_model) if requested_model else None, route)
+        if not aggregate_info and route_group and requested_model and not state.supports_requested_model(str(requested_model), route_group):
+            raise self.faults.all_models_failed(
+                "当前连接组未配置该模型，请检查模型配置或使用已配置模型",
+                attempted=0,
+                error_code="model_not_found",
+            )
         request_id = uuid.uuid4().hex[:12]
         self.observability.start_live_request(request_id, path, requested_label, stream=False)
         attempt = 0
@@ -220,11 +458,7 @@ class CandidateRuntime:
         saw_cooldown = False
         saw_request_level = False
 
-        # 聚合模型解析
-        aggregate_info = state.resolve_aggregate(
-            str(requested_model) if requested_model else None,
-            route,
-        )
+        # 聚合模型已在创建 live request 前完成契约解析。
         aggregate_model: Optional[AggregateModel] = None
         resolved_as = ""
         fallback_index = 0
@@ -380,7 +614,7 @@ class CandidateRuntime:
                     except Exception:
                         pass
                     self.observability.finish_live_request(request_id, "done")
-                    return resp.status, dict(resp.headers.items()), data
+                    return resp.status, _response_headers_for_downstream(resp), data
             except HTTPError as err:
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 raw = err.read().decode("utf-8", "ignore") if hasattr(err, "read") else str(err)
@@ -441,11 +675,12 @@ class CandidateRuntime:
                                 cooldown_applied=False,
                             )
                             self.observability.finish_live_request(request_id, "done")
-                            return resp.status, dict(resp.headers.items()), data
+                            return resp.status, _response_headers_for_downstream(resp), data
                     except Exception as retry_err:
                         last_error = retry_err
                         retry_duration_ms = int((time.perf_counter() - started_at) * 1000)
-                        self.observability.add_log(path, candidate.label, "retry failed", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, str(retry_err), lock_wait_ms=lock_wait_ms, lock_release_reason="retry_failed"), retry_duration_ms, group=group, request_id=request_id, attempt=attempt, event="error", cooldown_applied=False)
+                        detail = f"retry_failed; error={self.preparation.short_error(str(retry_err))}"
+                        self.observability.add_log(path, candidate.label, "retry failed", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="retry_failed"), retry_duration_ms, group=group, request_id=request_id, attempt=attempt, event="error", cooldown_applied=False)
 
                 # 自动 fallback（组级 auto 或聚合模型）
                 if auto_fallback:
@@ -475,16 +710,28 @@ class CandidateRuntime:
                     continue
 
                 # 非自动 fallback：保留原有显式模型处理逻辑
+                # 该请求已实际发往上游，且未被即时重试恢复。显式模型也要把
+                # 合格的上游故障写入同一 breaker 状态机，但保持原有响应路径。
+                explicit_failure_recorded = False
+                if cooldown_applied:
+                    explicit_failure_recorded = self._record_explicit_qualified_failure(
+                        state,
+                        candidate,
+                        group,
+                        raw or str(err),
+                        classification.log_reason,
+                        auto_fallback=auto_fallback,
+                    )
                 if classification.category == "quota_exhausted":
                     state.mark_unusable(candidate, raw)
-                    self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "quota exhausted, try next", lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=False, failure_scope="upstream")
+                    self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "quota exhausted, try next", lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=explicit_failure_recorded, failure_scope="upstream")
                     continue
                 if classification.category == "server_error":
-                    self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "server error, try next", lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=False, failure_scope="upstream")
+                    self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "server error, try next", lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=explicit_failure_recorded, failure_scope="upstream")
                     continue
                 headers = dict(getattr(err, "headers", {}) or {})
                 detail = f"error={self.preparation.short_error(raw)}"
-                self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="error", cooldown_applied=False)
+                self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="error", cooldown_applied=explicit_failure_recorded)
                 self.observability.finish_live_request(request_id, "error")
                 return err.code, headers, raw.encode("utf-8")
             except (URLError, TimeoutError, OSError) as err:
@@ -546,8 +793,16 @@ class CandidateRuntime:
                     self.observability.add_log(path, candidate.label, "network", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="network_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network", cooldown_applied=True, failure_scope=failure_scope)
                     continue
                 failure_scope = classification.failure_scope
-                detail = f"cooldown_applied=false; failure_scope={failure_scope}; {classification.log_reason}; error={self.preparation.short_error(str(err))}"
-                self.observability.add_log(path, candidate.label, "network", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="network_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network", cooldown_applied=False, failure_scope=failure_scope)
+                explicit_failure_recorded = self._record_explicit_qualified_failure(
+                    state,
+                    candidate,
+                    group,
+                    str(err),
+                    classification.log_reason,
+                    auto_fallback=auto_fallback,
+                )
+                detail = f"cooldown_applied={str(explicit_failure_recorded).lower()}; failure_scope={failure_scope}; {classification.log_reason}; error={self.preparation.short_error(str(err))}"
+                self.observability.add_log(path, candidate.label, "network", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="network_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network", cooldown_applied=explicit_failure_recorded, failure_scope=failure_scope)
                 continue
             finally:
                 self.concurrency.release(upstream_lock)
@@ -587,6 +842,8 @@ class CandidateRuntime:
 
     def execute_stream(self, path: str, payload: Dict[str, Any], route: Any = None, incoming_headers: Optional[Dict[str, str]] = None, raw_body: bytes | None = None) -> Any:
         """Execute the frozen stream candidate/request/fallback chain via explicit ports."""
+        stream_started_at = time.perf_counter()
+        stream_started_at_ms = int(time.time() * 1000)
         state = self.candidate_state
         state.refresh_expired_cooldowns()
         incoming_headers = incoming_headers or {}
@@ -603,6 +860,14 @@ class CandidateRuntime:
         is_global = isinstance(route, self.faults.route_context) and route.is_global
         auto_mode = self.policy.is_auto_model(str(requested_model) if requested_model else None, route_group)
         auto_fallback = auto_mode or bool(route_aggregate)
+        # Contract failures are rejected before a live-request record is created.
+        aggregate_info = state.resolve_aggregate(str(requested_model) if requested_model else None, route)
+        if not aggregate_info and route_group and requested_model and not state.supports_requested_model(str(requested_model), route_group):
+            raise self.faults.all_models_failed(
+                "当前连接组未配置该模型，请检查模型配置或使用已配置模型",
+                attempted=0,
+                error_code="model_not_found",
+            )
         request_id = uuid.uuid4().hex[:12]
         self.observability.start_live_request(request_id, path, requested_label, stream=True)
         attempt = 0
@@ -611,11 +876,7 @@ class CandidateRuntime:
         saw_cooldown = False
         saw_request_level = False
 
-        # 聚合模型解析
-        aggregate_info = state.resolve_aggregate(
-            str(requested_model) if requested_model else None,
-            route,
-        )
+        # 聚合模型已在创建 live request 前完成契约解析。
         aggregate_model: Optional[AggregateModel] = None
         resolved_as = ""
         fallback_index = 0
@@ -634,6 +895,24 @@ class CandidateRuntime:
                 return 499, {"Content-Type": "application/json; charset=utf-8"}, [error_body], request_id
             attempt += 1
             group = candidate.group
+            candidate_selected_ms = _elapsed_ms(stream_started_at)
+            stream_metrics: Dict[str, Any] = {
+                "candidate_selected_ms": candidate_selected_ms,
+                "upstream_request_started_ms": -1,
+                "upstream_headers_ms": -1,
+                "first_raw_line_ms": -1,
+                "first_complete_frame_ms": -1,
+                "first_content_delta_ms": -1,
+                "first_downstream_flush_ms": -1,
+                "initial_frame_bytes": 0,
+                "stream_frame_count": 0,
+                "upstream_content_type": "-",
+                "upstream_content_encoding": "-",
+                "upstream_transfer_encoding": "-",
+                "upstream_http_version": "unknown",
+                "upstream_transport": "unknown",
+                "stream_wire_mode": "unknown",
+            }
             target_url = self.preparation.resolve_url(group.base_url, path)
             self.observability.update_live_request(
                 request_id,
@@ -714,7 +993,11 @@ class CandidateRuntime:
                     error_body = json.dumps({"error": {"message": "请求已由用户终止", "type": "request_cancelled", "code": "manual_cancelled", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
                     return 499, {"Content-Type": "application/json; charset=utf-8"}, [error_body], request_id
                 self.observability.update_live_request(request_id, stage="connecting_upstream", stage_label="连接上游")
+                upstream_request_started_ms = _elapsed_ms(stream_started_at)
+                stream_metrics["upstream_request_started_ms"] = upstream_request_started_ms
                 resp = self.upstream.request("POST", target_url, outbound_headers, body, stream=True, timeout=120)
+                upstream_headers_ms = _elapsed_ms(stream_started_at)
+                stream_metrics["upstream_headers_ms"] = upstream_headers_ms
                 self.observability.set_live_response(request_id, resp)
                 if self.observability.cancellation_requested(request_id):
                     self.observability.close_live_response(request_id, resp)
@@ -722,10 +1005,172 @@ class CandidateRuntime:
                     self._finalize_cancelled(request_id, path, requested_label, group=group, candidate=candidate, attempt=attempt, lock_released=lock_released)
                     error_body = json.dumps({"error": {"message": "请求已由用户终止", "type": "request_cancelled", "code": "manual_cancelled", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
                     return 499, {"Content-Type": "application/json; charset=utf-8"}, [error_body], request_id
-                self.observability.update_live_request(request_id, stage="waiting_first_byte", stage_label="等待首包")
+                upstream_content_type = _safe_media_type(_header_value(resp.headers, "content-type"))
+                upstream_content_encoding = _safe_header_token(_header_value(resp.headers, "content-encoding"))
+                upstream_transfer_encoding = _safe_header_token(_header_value(resp.headers, "transfer-encoding"))
+                upstream_http_version = _safe_http_version(getattr(resp, "http_version", ""))
+                upstream_transport = _safe_header_token(getattr(resp, "transport", "unknown"))
+                stream_metrics.update({
+                    "upstream_content_type": upstream_content_type,
+                    "upstream_content_encoding": upstream_content_encoding,
+                    "upstream_transfer_encoding": upstream_transfer_encoding,
+                    "upstream_http_version": upstream_http_version,
+                    "upstream_transport": upstream_transport,
+                })
+
+                def mark_first_raw_line(_line: bytes) -> None:
+                    if stream_metrics["first_raw_line_ms"] < 0:
+                        stream_metrics["first_raw_line_ms"] = _elapsed_ms(stream_started_at)
+
+                if bool(getattr(resp, "opaque_stream", False)):
+                    # Unknown encodings cannot be parsed as SSE safely.  Keep
+                    # their bytes opaque and let the downstream client decode
+                    # them, while still closing and accounting for the stream.
+                    self.observability.update_live_request(request_id, stage="waiting_first_byte", stage_label="等待未知编码流首块")
+                    first_opaque_chunk = resp.read_chunk(idle_timeout)
+                    if self.observability.cancellation_requested(request_id):
+                        self.observability.close_live_response(request_id, resp)
+                        lock_released = self.concurrency.release(upstream_lock)
+                        self._finalize_cancelled(request_id, path, requested_label, group=group, candidate=candidate, attempt=attempt, lock_released=lock_released)
+                        error_body = json.dumps({"error": {"message": "请求已由用户终止", "type": "request_cancelled", "code": "manual_cancelled", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
+                        return 499, {"Content-Type": "application/json; charset=utf-8"}, [error_body], request_id
+                    if not first_opaque_chunk:
+                        raise URLError("upstream opaque stream closed before first chunk")
+                    stream_metrics.update({
+                        "stream_wire_mode": "buffered_or_non_delimited",
+                        "opaque_first_chunk_ms": _elapsed_ms(stream_started_at),
+                        "opaque_first_chunk_bytes": len(first_opaque_chunk),
+                        "opaque_chunk_count": 1,
+                        "opaque_bytes_received": len(first_opaque_chunk),
+                    })
+                    self.observability.add_log(
+                        path,
+                        candidate.label,
+                        "streaming",
+                        self.preparation.debug_detail(
+                            candidate,
+                            requested_label,
+                            target_url,
+                            body_mode,
+                            body,
+                            payload_for_upstream,
+                            outbound_headers,
+                            "stream ok; opaque_encoding_passthrough=true; first_byte_metric=opaque_chunk; " + _stream_metrics_text(stream_metrics),
+                            resp=resp,
+                            tools_normalized=tools_normalized,
+                            lock_wait_ms=lock_wait_ms,
+                            aggregate_suffix=aggregate_suffix,
+                        ),
+                        int((time.perf_counter() - started_at) * 1000),
+                        group=group,
+                        request_id=request_id,
+                        attempt=attempt,
+                        event="stream_ok",
+                    )
+                    self.observability.update_live_request(request_id, stage="streaming", stage_label="透传未知编码流")
+                    self.concurrency.mark_stream_active(candidate, 1)
+                    opaque_chunks = 1
+                    opaque_bytes = len(first_opaque_chunk)
+                    opaque_state: Dict[str, Any] = {"timeout": False, "transport_error": "", "lifecycle": "", "completion_signal": ""}
+                    opaque_release_reason = "client_disconnect"
+                    opaque_finalized = False
+                    opaque_usage = (0, 0, 0, 0, 0)
+
+                    def finalize_opaque_stream() -> None:
+                        nonlocal opaque_finalized
+                        if opaque_finalized:
+                            return
+                        opaque_finalized = True
+                        self.observability.close_live_response(request_id, resp)
+                        final_duration_ms = int((time.perf_counter() - started_at) * 1000)
+                        failure_recorded = False
+                        if self.observability.cancellation_requested(request_id):
+                            lifecycle_status = "cancelled"
+                            lifecycle_result = "manual_cancelled"
+                            lifecycle_scope = "client_cancelled"
+                            usage_source = "stream_incomplete"
+                        elif opaque_state["timeout"]:
+                            lifecycle_status = "timeout"
+                            lifecycle_result = "stream_idle_timeout"
+                            lifecycle_scope = "upstream"
+                            usage_source = "stream_incomplete"
+                            failure_recorded = self._record_stream_terminal_failure(state, candidate, group, aggregate_model, lifecycle_result, lifecycle_result, auto_fallback=auto_fallback)
+                        elif opaque_state["transport_error"]:
+                            lifecycle_status = "network"
+                            lifecycle_result = "stream_incomplete"
+                            lifecycle_scope = "upstream"
+                            usage_source = "stream_incomplete"
+                            failure_recorded = self._record_stream_terminal_failure(state, candidate, group, aggregate_model, str(opaque_state["transport_error"]), "network", auto_fallback=auto_fallback)
+                        else:
+                            lifecycle_status = "200"
+                            lifecycle_result = "stream_done"
+                            lifecycle_scope = ""
+                            usage_source = "missing"
+                            state.mark_success(candidate)
+                            if candidate.aggregate_member_id:
+                                state.mark_aggregate_member_success(candidate.aggregate_member_id)
+                        stream_metrics["opaque_chunk_count"] = opaque_chunks
+                        stream_metrics["opaque_bytes_received"] = opaque_bytes
+                        stream_metrics["stream_frame_count"] = 0
+                        self.observability.patch_stream_lifecycle(
+                            request_id,
+                            attempt,
+                            candidate.label,
+                            opaque_usage,
+                            usage_source,
+                            final_status=lifecycle_status,
+                            lifecycle=lifecycle_result,
+                            final_result=lifecycle_result,
+                            chunks_received=0,
+                            bytes_received=opaque_bytes,
+                            duration_ms=final_duration_ms,
+                            lock_wait_ms=lock_wait_ms,
+                            lock_release_reason=opaque_release_reason,
+                            failure_scope=lifecycle_scope,
+                            completion_signal=str(opaque_state["completion_signal"]),
+                            cooldown_applied=(False if lifecycle_result == "manual_cancelled" else failure_recorded if lifecycle_scope == "upstream" else None),
+                            stream_metrics=stream_metrics,
+                        )
+                        self.observability.finish_live_request(request_id, "done" if lifecycle_result == "stream_done" else ("manual_cancelled" if lifecycle_result == "manual_cancelled" else "ended"))
+                        self.concurrency.mark_stream_active(candidate, -1)
+                        self.concurrency.release(upstream_lock)
+
+                    def opaque_iterator() -> Iterator[bytes]:
+                        nonlocal opaque_chunks, opaque_bytes, opaque_release_reason
+                        try:
+                            yield first_opaque_chunk
+                            while True:
+                                try:
+                                    chunk = resp.read_chunk(idle_timeout)
+                                except self.faults.stream_idle_timeout:
+                                    opaque_state["timeout"] = True
+                                    opaque_release_reason = "stream_idle_timeout"
+                                    break
+                                except (URLError, TimeoutError, OSError) as err:
+                                    if not self.observability.cancellation_requested(request_id):
+                                        opaque_state["transport_error"] = str(err)
+                                        opaque_state["completion_signal"] = "network_error"
+                                        opaque_release_reason = "network_error"
+                                    break
+                                if not chunk:
+                                    opaque_state["lifecycle"] = "stream_done"
+                                    opaque_state["completion_signal"] = "eof"
+                                    opaque_release_reason = "eof"
+                                    break
+                                opaque_chunks += 1
+                                opaque_bytes += len(chunk)
+                                yield chunk
+                        finally:
+                            finalize_opaque_stream()
+
+                    downstream_headers = _response_headers_for_downstream(resp)
+                    return 200, downstream_headers, ManagedStreamIterator(opaque_iterator(), finalize_opaque_stream), request_id
+
+                self.observability.update_live_request(request_id, stage="waiting_first_byte", stage_label="等待首完整 SSE 帧")
                 first_chunk = _read_sse_frame(
                     lambda timeout: self.stream_lifecycle.readline_with_idle_timeout(resp, timeout),
                     idle_timeout,
+                    mark_first_raw_line,
                 )
                 if self.observability.cancellation_requested(request_id):
                     self.observability.close_live_response(request_id, resp)
@@ -736,10 +1181,20 @@ class CandidateRuntime:
                 if not first_chunk:
                     raise URLError("upstream stream closed before first chunk")
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
+                stream_metrics["first_complete_frame_ms"] = _elapsed_ms(stream_started_at)
+                stream_metrics["initial_frame_bytes"] = len(first_chunk)
+                stream_metrics["stream_frame_count"] = 1
+                saw_non_delimited_frame = not _frame_is_delimited(first_chunk)
+                if _frame_is_delimited(first_chunk) and _frame_has_text_delta(first_chunk):
+                    stream_metrics["first_content_delta_ms"] = stream_metrics["first_complete_frame_ms"]
+                stream_metrics["stream_wire_mode"] = _stream_wire_mode(
+                    upstream_content_type,
+                    upstream_content_encoding,
+                    saw_non_delimited_frame=saw_non_delimited_frame,
+                    stream_frame_count=1,
+                    initial_frame_bytes=len(first_chunk),
+                )
                 latest_usage, usage_present = self.stream_lifecycle.usage_from_stream_chunk_with_presence(first_chunk)
-                state.mark_success(candidate)
-                if candidate.aggregate_member_id:
-                    state.mark_aggregate_member_success(candidate.aggregate_member_id)
                 detail = self.preparation.debug_detail(
                     candidate,
                     requested_label,
@@ -748,9 +1203,11 @@ class CandidateRuntime:
                     body,
                     payload_for_upstream,
                     outbound_headers,
-                    f"stream ok; first_byte_ms={duration_ms}; stream_started_at_ms={int(time.time() * 1000) - duration_ms}; "
-                    f"idle_timeout_seconds={idle_timeout}; initial_chunks_received=1; initial_bytes_received={len(first_chunk)}; "
-                    f"chunks_received=1; bytes_received={len(first_chunk)}; final_result=streaming",
+                    f"stream ok; first_byte_ms={stream_metrics['first_complete_frame_ms']}; first_byte_metric=complete_sse_frame_legacy; "
+                    f"stream_started_at_ms={stream_started_at_ms}; idle_timeout_seconds={idle_timeout}; "
+                    f"initial_chunks_received=1; initial_bytes_received={len(first_chunk)}; chunks_received=1; "
+                    f"bytes_received={len(first_chunk)}; final_result=streaming; "
+                    + _stream_metrics_text(stream_metrics),
                     resp=resp,
                     tools_normalized=tools_normalized,
                     lock_wait_ms=lock_wait_ms,
@@ -778,25 +1235,15 @@ class CandidateRuntime:
                 usage_total = latest_usage
                 chunks_received = 1
                 bytes_received = len(first_chunk)
-                stream_state: Dict[str, Any] = {"timeout": False, "lifecycle": "", "completion_signal": ""}
+                stream_state: Dict[str, Any] = {"timeout": False, "transport_error": "", "lifecycle": "", "completion_signal": ""}
                 release_reason = "client_disconnect"
                 finalized = False
-                pending_event_signal = ""
 
                 def terminal_signal_for(chunk: bytes) -> str:
-                    nonlocal pending_event_signal
                     signal = self.stream_lifecycle.completion_signal(chunk)
                     if signal.startswith("event:"):
-                        pending_event_signal = signal.split(":", 1)[1]
-                        return ""
-                    if signal:
-                        pending_event_signal = ""
-                        return signal
-                    if pending_event_signal and chunk.lstrip().startswith(b"data:"):
-                        signal = pending_event_signal
-                        pending_event_signal = ""
-                        return signal
-                    return ""
+                        return signal.split(":", 1)[1]
+                    return signal
 
                 def mark_stream_terminal(signal: str) -> None:
                     if signal in {"response.failed", "response.incomplete"}:
@@ -818,6 +1265,7 @@ class CandidateRuntime:
                     if resp:
                         self.observability.close_live_response(request_id, resp)
                     final_duration_ms = int((time.perf_counter() - started_at) * 1000)
+                    stream_failure_recorded = False
                     if self.observability.cancellation_requested(request_id):
                         usage_source = "stream_incomplete"
                         lifecycle_status = "cancelled"
@@ -828,21 +1276,65 @@ class CandidateRuntime:
                         lifecycle_status = "timeout"
                         lifecycle_result = "stream_idle_timeout"
                         lifecycle_scope = "upstream"
+                        stream_failure_recorded = self._record_stream_terminal_failure(
+                            state,
+                            candidate,
+                            group,
+                            aggregate_model,
+                            "stream_idle_timeout",
+                            "stream_idle_timeout",
+                            auto_fallback=auto_fallback,
+                        )
+                    elif stream_state["transport_error"]:
+                        usage_source = "stream_incomplete"
+                        lifecycle_status = "network"
+                        lifecycle_result = "stream_incomplete"
+                        lifecycle_scope = "upstream"
+                        stream_failure_recorded = self._record_stream_terminal_failure(
+                            state,
+                            candidate,
+                            group,
+                            aggregate_model,
+                            str(stream_state["transport_error"]),
+                            "network",
+                            auto_fallback=auto_fallback,
+                        )
                     elif stream_state["lifecycle"] == "stream_done":
                         usage_source = "stream_final" if usage_present else "missing"
                         lifecycle_status = "200"
                         lifecycle_result = "stream_done"
                         lifecycle_scope = ""
+                        state.mark_success(candidate)
+                        if candidate.aggregate_member_id:
+                            state.mark_aggregate_member_success(candidate.aggregate_member_id)
                     elif stream_state["lifecycle"] in {"stream_failed", "stream_incomplete"}:
                         usage_source = "stream_incomplete"
                         lifecycle_status = str(stream_state["lifecycle"])
                         lifecycle_result = str(stream_state["lifecycle"])
                         lifecycle_scope = "upstream"
+                        completion_signal = str(stream_state["completion_signal"] or lifecycle_result)
+                        stream_failure_recorded = self._record_stream_terminal_failure(
+                            state,
+                            candidate,
+                            group,
+                            aggregate_model,
+                            f"{lifecycle_result}: {completion_signal}",
+                            completion_signal.replace(".", "_"),
+                            auto_fallback=auto_fallback,
+                        )
                     else:
                         usage_source = "stream_incomplete"
                         lifecycle_status = "client_disconnected"
                         lifecycle_result = "client_disconnected"
                         lifecycle_scope = "request"
+                    stream_metrics["stream_frame_count"] = chunks_received
+                    stream_metrics["stream_wire_mode"] = _stream_wire_mode(
+                        upstream_content_type,
+                        upstream_content_encoding,
+                        saw_non_delimited_frame=saw_non_delimited_frame,
+                        stream_frame_count=chunks_received,
+                        initial_frame_bytes=len(first_chunk),
+                    )
                     self.observability.patch_stream_lifecycle(
                         request_id,
                         attempt,
@@ -859,15 +1351,20 @@ class CandidateRuntime:
                         lock_release_reason=release_reason,
                         failure_scope=lifecycle_scope,
                         completion_signal=str(stream_state["completion_signal"]),
-                        cooldown_applied=False if lifecycle_result == "manual_cancelled" else None,
+                        cooldown_applied=(
+                            False if lifecycle_result == "manual_cancelled"
+                            else stream_failure_recorded if lifecycle_scope == "upstream"
+                            else None
+                        ),
                         final_event="request_cancelled" if lifecycle_result == "manual_cancelled" else ("stream_disconnected_before_completion" if lifecycle_result == "stream_incomplete" and stream_state["completion_signal"] == "missing" else ""),
+                        stream_metrics=stream_metrics,
                     )
                     self.observability.finish_live_request(request_id, "done" if stream_state["lifecycle"] == "stream_done" else ("manual_cancelled" if lifecycle_result == "manual_cancelled" else "ended"))
                     self.concurrency.mark_stream_active(candidate, -1)
                     self.concurrency.release(upstream_lock)
 
                 def iterator() -> Iterator[bytes]:
-                    nonlocal usage_total, usage_present, chunks_received, bytes_received, release_reason
+                    nonlocal usage_total, usage_present, chunks_received, bytes_received, release_reason, saw_non_delimited_frame
                     try:
                         if first_completion_signal:
                             finalize_stream()
@@ -879,10 +1376,17 @@ class CandidateRuntime:
                                 chunk = _read_sse_frame(
                                     lambda timeout: self.stream_lifecycle.readline_with_idle_timeout(resp, timeout),
                                     idle_timeout,
+                                    mark_first_raw_line,
                                 )
                             except self.faults.stream_idle_timeout:
                                 stream_state["timeout"] = True
                                 release_reason = "stream_idle_timeout"
+                                break
+                            except (URLError, TimeoutError, OSError) as err:
+                                if not self.observability.cancellation_requested(request_id):
+                                    stream_state["transport_error"] = str(err)
+                                    stream_state["completion_signal"] = "network_error"
+                                    release_reason = "network_error"
                                 break
                             if not chunk:
                                 mark_stream_terminal("eof")
@@ -890,6 +1394,14 @@ class CandidateRuntime:
                                 break
                             chunks_received += 1
                             bytes_received += len(chunk)
+                            stream_metrics["stream_frame_count"] = chunks_received
+                            saw_non_delimited_frame = saw_non_delimited_frame or not _frame_is_delimited(chunk)
+                            if (
+                                stream_metrics["first_content_delta_ms"] < 0
+                                and _frame_is_delimited(chunk)
+                                and _frame_has_text_delta(chunk)
+                            ):
+                                stream_metrics["first_content_delta_ms"] = _elapsed_ms(stream_started_at)
                             usage, chunk_usage_present = self.stream_lifecycle.usage_from_stream_chunk_with_presence(chunk)
                             if chunk_usage_present:
                                 usage_total = usage
@@ -905,7 +1417,12 @@ class CandidateRuntime:
                     finally:
                         finalize_stream()
 
-                return 200, dict(resp.headers.items()), ManagedStreamIterator(iterator(), finalize_stream), request_id
+                downstream_headers = _response_headers_for_downstream(resp)
+                if stream_metrics["stream_wire_mode"] == "json_compat" and not _frame_is_delimited(first_chunk):
+                    downstream_headers.pop("Content-Length", None)
+                    downstream_headers.pop("content-length", None)
+                    downstream_headers["Content-Length"] = str(len(first_chunk))
+                return 200, downstream_headers, ManagedStreamIterator(iterator(), finalize_stream), request_id
             except self.faults.stream_idle_timeout as err:
                 if self.observability.cancellation_requested(request_id):
                     if resp:
@@ -946,7 +1463,7 @@ class CandidateRuntime:
                         "waf_compatible": group.waf_compatible,
                     })
                     fallback_index += 1
-                    detail = f"cooldown_applied=true; failure_scope=upstream; reason=stream_idle_timeout; idle_timeout_seconds={idle_timeout}; chunks_received=0; bytes_received=0; cooldown_minutes={cooldown_seconds // 60}; fallback_next=true; final_result=timeout"
+                    detail = f"cooldown_applied=true; failure_scope=upstream; reason=stream_idle_timeout; idle_timeout_seconds={idle_timeout}; chunks_received=0; bytes_received=0; cooldown_minutes={cooldown_seconds // 60}; fallback_next=true; final_result=timeout; {_stream_metrics_text(stream_metrics)}"
                     self.observability.add_log(path, candidate.label, "timeout", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="stream_idle_timeout", aggregate_suffix=aggregate_suffix), duration_ms, group=group, request_id=request_id, attempt=attempt, event="stream_timeout", usage_source="stream_incomplete", cooldown_applied=True, failure_scope="upstream")
                     continue
                 cooldown_seconds = self.stream_lifecycle.mark_stream_timeout(candidate, "stream_idle_timeout")
@@ -958,7 +1475,7 @@ class CandidateRuntime:
                     body,
                     payload,
                     outbound_headers,
-                    f"cooldown_applied=true; reason=stream_idle_timeout; idle_timeout_seconds={idle_timeout}; chunks_received=0; bytes_received=0; cooldown_minutes={cooldown_seconds // 60}; fallback_next={str(auto_fallback).lower()}; final_result=timeout",
+                    f"cooldown_applied=true; reason=stream_idle_timeout; idle_timeout_seconds={idle_timeout}; chunks_received=0; bytes_received=0; cooldown_minutes={cooldown_seconds // 60}; fallback_next={str(auto_fallback).lower()}; final_result=timeout; {_stream_metrics_text(stream_metrics)}",
                     lock_wait_ms=lock_wait_ms,
                     lock_release_reason="stream_idle_timeout",
                 )
@@ -967,12 +1484,15 @@ class CandidateRuntime:
                     self.observability.add_log(path, candidate.label, "fallback", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "reason=stream_idle_timeout; fallback_next=true", lock_wait_ms=lock_wait_ms), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=True, failure_scope="upstream")
                     continue
                 error_body = json.dumps({"error": {"message": "流式响应空闲超时，请稍后重试", "type": "timeout", "code": "stream_idle_timeout", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
+                self.observability.finish_live_request(request_id, "error")
                 return 504, {"Content-Type": "application/json; charset=utf-8"}, [error_body], request_id
             except HTTPError as err:
                 if resp:
                     self.observability.close_live_response(request_id, resp)
                 self.concurrency.release(upstream_lock)
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
+                if stream_metrics["upstream_request_started_ms"] >= 0 and stream_metrics["upstream_headers_ms"] < 0:
+                    stream_metrics["upstream_headers_ms"] = _elapsed_ms(stream_started_at)
                 raw = err.read().decode("utf-8", "ignore") if hasattr(err, "read") else str(err)
                 last_error = err
                 classification = self.policy.classify_candidate_error(err.code, raw, "http")
@@ -1002,7 +1522,7 @@ class CandidateRuntime:
                         "waf_compatible": group.waf_compatible,
                     })
                     fallback_index += 1
-                    detail = f"cooldown_applied={str(cooldown_applied).lower()}; failure_scope={failure_scope}; {classification.log_reason}; try next; error={self.preparation.short_error(raw)}{self.policy.waf_blocked_suffix(classification, group)}"
+                    detail = f"cooldown_applied={str(cooldown_applied).lower()}; failure_scope={failure_scope}; {classification.log_reason}; try next; error={self.preparation.short_error(raw)}{self.policy.waf_blocked_suffix(classification, group)}; {_stream_metrics_text(stream_metrics)}"
                     self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="http_error", aggregate_suffix=aggregate_suffix), duration_ms, group=group, request_id=request_id, attempt=attempt, event="cooldown" if cooldown_applied else "fallback", cooldown_applied=cooldown_applied, failure_scope=failure_scope)
                     continue
 
@@ -1029,21 +1549,34 @@ class CandidateRuntime:
                             "waf_compatible": group.waf_compatible,
                         })
                         fallback_index += 1
-                    detail = f"cooldown_applied={str(cooldown_applied).lower()}; failure_scope={failure_scope}; {classification.log_reason}; try next; error={self.preparation.short_error(raw)}{self.policy.waf_blocked_suffix(classification, group)}"
+                    detail = f"cooldown_applied={str(cooldown_applied).lower()}; failure_scope={failure_scope}; {classification.log_reason}; try next; error={self.preparation.short_error(raw)}{self.policy.waf_blocked_suffix(classification, group)}; {_stream_metrics_text(stream_metrics)}"
                     self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="cooldown" if cooldown_applied else "fallback", cooldown_applied=cooldown_applied, failure_scope=failure_scope)
                     continue
 
                 # 非自动 fallback：保留原有显式模型处理逻辑
+                # 该请求已实际发往上游，且未被即时重试恢复。显式模型也要把
+                # 合格的上游故障写入同一 breaker 状态机，但保持原有响应路径。
+                explicit_failure_recorded = False
+                if cooldown_applied:
+                    explicit_failure_recorded = self._record_explicit_qualified_failure(
+                        state,
+                        candidate,
+                        group,
+                        raw or str(err),
+                        classification.log_reason,
+                        auto_fallback=auto_fallback,
+                    )
                 if classification.category == "quota_exhausted":
                     state.mark_unusable(candidate, raw)
-                    self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "quota exhausted, try next", lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=False, failure_scope="upstream")
+                    self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "quota exhausted, try next", lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=explicit_failure_recorded, failure_scope="upstream")
                     continue
                 if classification.category == "server_error":
-                    self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "server error, try next", lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=False, failure_scope="upstream")
+                    self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, "server error, try next", lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=explicit_failure_recorded, failure_scope="upstream")
                     continue
                 headers = dict(getattr(err, "headers", {}) or {})
-                detail = f"error={self.preparation.short_error(raw)}"
-                self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="error", cooldown_applied=False)
+                detail = f"error={self.preparation.short_error(raw)}; {_stream_metrics_text(stream_metrics)}"
+                self.observability.add_log(path, candidate.label, str(err.code), self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="http_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="error", cooldown_applied=explicit_failure_recorded)
+                self.observability.finish_live_request(request_id, "error")
                 return err.code, headers, [raw.encode("utf-8")], request_id
             except (URLError, TimeoutError, OSError) as err:
                 # Dashboard cancellation closes the registered response to interrupt a
@@ -1071,12 +1604,25 @@ class CandidateRuntime:
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 last_error = err
                 classification = self.policy.classify_candidate_error(None, str(err), "network")
+                is_stream_protocol_error = isinstance(err, StreamFrameProtocolError)
+                failure_reason = "stream_protocol_error" if is_stream_protocol_error else classification.log_reason
+                lock_release_reason = "stream_protocol_error" if is_stream_protocol_error else "network_error"
+                log_status = "protocol" if is_stream_protocol_error else "network"
+                log_event = "stream_protocol_error" if is_stream_protocol_error else "network"
+                if is_stream_protocol_error:
+                    stream_metrics.update({
+                        "initial_frame_bytes": err.frame_bytes,
+                        "stream_wire_mode": "buffered_or_non_delimited",
+                        "stream_protocol_error": "true",
+                        "stream_protocol_reason": err.reason,
+                        "stream_protocol_wait_ms": err.frame_wait_ms,
+                    })
                 saw_cooldown = True
 
                 # 聚合成员网络失败：cooldown 聚合成员本身并记录 fallback 链路
                 if is_aggregate_candidate and aggregate_model and candidate.aggregate_member_id:
                     cooldown_seconds = state.aggregate_cooldown_seconds(aggregate_model)
-                    state.set_aggregate_member_cooldown(candidate.aggregate_member_id, str(err), cooldown_seconds, classification.log_reason)
+                    state.set_aggregate_member_cooldown(candidate.aggregate_member_id, str(err), cooldown_seconds, failure_reason)
                     failure_scope = classification.failure_scope
                     fallback_chain.append({
                         "member_id": candidate.aggregate_member_id,
@@ -1087,16 +1633,16 @@ class CandidateRuntime:
                         "reason": self.preparation.short_error(str(err)),
                         "cooldown_applied": True,
                         "failure_scope": failure_scope,
-                        "category": classification.category,
+                        "category": failure_reason,
                         "waf_compatible": group.waf_compatible,
                     })
                     fallback_index += 1
-                    detail = f"cooldown_applied=true; failure_scope={failure_scope}; {classification.log_reason}; try next; error={self.preparation.short_error(str(err))}"
-                    self.observability.add_log(path, candidate.label, "network", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="network_error", aggregate_suffix=aggregate_suffix), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network", cooldown_applied=True, failure_scope=failure_scope)
+                    detail = f"cooldown_applied=true; failure_scope={failure_scope}; {failure_reason}; try next; error={self.preparation.short_error(str(err))}; {_stream_metrics_text(stream_metrics)}"
+                    self.observability.add_log(path, candidate.label, log_status, self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason=lock_release_reason, aggregate_suffix=aggregate_suffix), duration_ms, group=group, request_id=request_id, attempt=attempt, event=log_event, cooldown_applied=True, failure_scope=failure_scope)
                     continue
                 if auto_fallback:
                     if candidate.group.provider_type == PROVIDER_RELAY and candidate.idx is not None:
-                        state.set_cooldown(candidate.idx, str(err), self.policy.auto_cooldown_seconds(group), classification.log_reason)
+                        state.set_cooldown(candidate.idx, str(err), self.policy.auto_cooldown_seconds(group), failure_reason)
                     elif candidate.idx is not None:
                         state.set_unusable(candidate.idx, str(err))
                     failure_scope = classification.failure_scope
@@ -1110,18 +1656,30 @@ class CandidateRuntime:
                             "reason": self.preparation.short_error(str(err)),
                             "cooldown_applied": True,
                             "failure_scope": failure_scope,
-                            "category": classification.category,
+                            "category": failure_reason,
                             "waf_compatible": group.waf_compatible,
                         })
                         fallback_index += 1
-                    detail = f"cooldown_applied=true; failure_scope={failure_scope}; {classification.log_reason}; try next; error={self.preparation.short_error(str(err))}"
-                    self.observability.add_log(path, candidate.label, "network", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="network_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network", cooldown_applied=True, failure_scope=failure_scope)
+                    detail = f"cooldown_applied=true; failure_scope={failure_scope}; {failure_reason}; try next; error={self.preparation.short_error(str(err))}; {_stream_metrics_text(stream_metrics)}"
+                    self.observability.add_log(path, candidate.label, log_status, self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason=lock_release_reason), duration_ms, group=group, request_id=request_id, attempt=attempt, event=log_event, cooldown_applied=True, failure_scope=failure_scope)
                     continue
                 failure_scope = classification.failure_scope
-                detail = f"cooldown_applied=false; failure_scope={failure_scope}; {classification.log_reason}; error={self.preparation.short_error(str(err))}"
-                self.observability.add_log(path, candidate.label, "network", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="network_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network", cooldown_applied=False, failure_scope=failure_scope)
+                explicit_failure_recorded = self._record_explicit_qualified_failure(
+                    state,
+                    candidate,
+                    group,
+                    str(err),
+                    failure_reason,
+                    auto_fallback=auto_fallback,
+                )
+                detail = f"cooldown_applied={str(explicit_failure_recorded).lower()}; failure_scope={failure_scope}; {failure_reason}; error={self.preparation.short_error(str(err))}; {_stream_metrics_text(stream_metrics)}"
+                self.observability.add_log(path, candidate.label, log_status, self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason=lock_release_reason), duration_ms, group=group, request_id=request_id, attempt=attempt, event=log_event, cooldown_applied=explicit_failure_recorded, failure_scope=failure_scope)
                 continue
 
+        if isinstance(last_error, StreamFrameProtocolError):
+            self.observability.finish_live_request(request_id, "error")
+            error_body = json.dumps({"error": {"message": "上游流式响应不是完整 SSE 帧，已在首帧前中止", "type": "upstream_stream_protocol_error", "code": "stream_protocol_error", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
+            return 502, {"Content-Type": "application/json; charset=utf-8"}, [error_body], request_id
         if aggregate_model:
             self.observability.finish_live_request(request_id, "error")
             if not saw_cooldown and saw_request_level:

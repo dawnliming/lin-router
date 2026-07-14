@@ -50,8 +50,10 @@ class ObservabilityService:
 
     @staticmethod
     def detail_value(detail: str, key: str) -> str:
-        match = re.search(rf"(?:^|; ){re.escape(key)}=([^;]*)", detail or "")
-        return match.group(1).strip() if match else ""
+        matches = re.findall(rf"(?:^|; ){re.escape(key)}=([^;]*)", detail or "")
+        # Lifecycle patches historically appended newer values.  Prefer the
+        # final value in legacy logs and keep that convention for readers.
+        return matches[-1].strip() if matches else ""
 
     @staticmethod
     def infer_event(status: str, detail: str) -> str:
@@ -75,6 +77,23 @@ class ObservabilityService:
     @staticmethod
     def append_detail(detail: str, suffix: str) -> str:
         return suffix if not detail else f"{detail}; {suffix}"
+
+    @staticmethod
+    def update_detail_fields(detail: str, fields: Dict[str, Any]) -> str:
+        """Replace structured detail fields without duplicating lifecycle values."""
+        if not fields:
+            return detail
+        normalized = {
+            str(key): " ".join(str(value).replace(";", ",").split())
+            for key, value in fields.items()
+        }
+        keys = set(normalized)
+        parts = [
+            part for part in (detail or "").split("; ")
+            if part.split("=", 1)[0].strip() not in keys
+        ]
+        parts.extend(f"{key}={value}" for key, value in normalized.items())
+        return "; ".join(part for part in parts if part)
 
     @staticmethod
     def _log_from_row(row: Dict[str, Any]) -> RequestLog:
@@ -176,7 +195,9 @@ class ObservabilityService:
     def _find_stream_log(self, request_id: str, attempt: Optional[int] = None, candidate_label: str = "") -> Optional[RequestLog]:
         with self._logs_lock:
             for item in self.logs:
-                if item.request_id != request_id or item.event != "stream_ok":
+                if item.request_id != request_id or (
+                    item.event != "stream_ok" and "stream_started_at_ms=" not in item.detail
+                ):
                     continue
                 if attempt is not None and item.attempt != attempt:
                     continue
@@ -190,7 +211,7 @@ class ObservabilityService:
         usage_source: str, *, final_status: str, lifecycle: str, final_result: str, chunks_received: int,
         bytes_received: int, duration_ms: Optional[int] = None, lock_wait_ms: Optional[int] = None,
         lock_release_reason: str = "", cooldown_applied: Optional[bool] = None, failure_scope: str = "",
-        completion_signal: str = "", final_event: str = "",
+        completion_signal: str = "", final_event: str = "", stream_metrics: Optional[Dict[str, Any]] = None,
     ) -> bool:
         with self._logs_lock:
             item = self._find_stream_log(request_id, attempt, candidate_label)
@@ -206,20 +227,41 @@ class ObservabilityService:
                 item.cooldown_applied = cooldown_applied
             if failure_scope:
                 item.failure_scope = failure_scope
-            suffix_parts = ["stream_finalized=true", f"lifecycle={lifecycle}", f"final_result={final_result}", f"chunks_received={chunks_received}", f"bytes_received={bytes_received}", "lock_released=true"]
+            fields: Dict[str, Any] = {
+                "stream_finalized": "true",
+                "lifecycle": lifecycle,
+                "final_result": final_result,
+                "chunks_received": chunks_received,
+                "bytes_received": bytes_received,
+                "lock_released": "true",
+            }
             if lifecycle == "manual_cancelled":
-                suffix_parts.extend(["cancel_source=dashboard", "cooldown_applied=false", "failure_scope=client_cancelled"])
+                fields.update({"cancel_source": "dashboard", "cooldown_applied": "false", "failure_scope": "client_cancelled"})
             if completion_signal:
-                suffix_parts.append(f"completion_signal={completion_signal}")
-                suffix_parts.append(
-                    "upstream_terminal_missing=true" if completion_signal == "eof"
-                    else "upstream_terminal_received=true"
-                )
+                fields["completion_signal"] = completion_signal
+                fields["upstream_terminal_missing" if completion_signal == "eof" else "upstream_terminal_received"] = "true"
             if lock_wait_ms is not None:
-                suffix_parts.append(f"lock_wait_ms={lock_wait_ms}")
+                fields["lock_wait_ms"] = lock_wait_ms
             if lock_release_reason:
-                suffix_parts.append(f"lock_release_reason={lock_release_reason}")
-            item.detail = self.append_detail(item.detail, "; ".join(suffix_parts))
+                fields["lock_release_reason"] = lock_release_reason
+            if cooldown_applied is not None:
+                fields["cooldown_applied"] = str(bool(cooldown_applied)).lower()
+            if failure_scope:
+                fields["failure_scope"] = failure_scope
+            if stream_metrics:
+                metrics = dict(stream_metrics)
+                # The handler records this after an actual flush.  Do not let
+                # a runtime-side placeholder overwrite that completed timing
+                # when a later frame finalizes the iterator.
+                if int(metrics.get("first_downstream_flush_ms", -1) or -1) < 0:
+                    try:
+                        existing_flush_ms = int(self.detail_value(item.detail, "first_downstream_flush_ms") or -1)
+                    except ValueError:
+                        existing_flush_ms = -1
+                    if existing_flush_ms >= 0:
+                        metrics.pop("first_downstream_flush_ms", None)
+                fields.update(metrics)
+            item.detail = self.update_detail_fields(item.detail, fields)
             self.rewrite_log_file()
             return True
 
@@ -232,7 +274,7 @@ class ObservabilityService:
 
     def record_stream_transport_event(self, request_id: str, event: str) -> None:
         """Persist transport-side evidence after the HTTP response has begun."""
-        if event not in {"downstream_terminal_forwarded", "downstream_write_failed"}:
+        if event not in {"downstream_first_flush", "downstream_terminal_forwarded", "downstream_write_failed"}:
             return
         with self._logs_lock:
             item = self._find_stream_log(request_id)
@@ -240,10 +282,29 @@ class ObservabilityService:
                 return
             if event == "downstream_write_failed" and (item.event == "request_cancelled" or item.failure_scope == "client_cancelled"):
                 return
-            item.detail = self.append_detail(item.detail, f"{event}=true")
+            if event == "downstream_first_flush":
+                try:
+                    started_at_ms = int(self.detail_value(item.detail, "stream_started_at_ms") or 0)
+                except ValueError:
+                    started_at_ms = 0
+                try:
+                    recorded = int(self.detail_value(item.detail, "first_downstream_flush_ms") or -1)
+                except ValueError:
+                    recorded = -1
+                if recorded >= 0:
+                    return
+                elapsed_ms = max(0, int(time.time() * 1000) - started_at_ms) if started_at_ms else -1
+                item.detail = self.update_detail_fields(item.detail, {"first_downstream_flush_ms": elapsed_ms})
+            else:
+                item.detail = self.update_detail_fields(item.detail, {event: "true"})
             if event == "downstream_write_failed":
                 item.event = event
                 item.failure_scope = "downstream"
+            if event == "downstream_first_flush":
+                # The stream finalizer, terminal-forwarded event, or write
+                # failure will persist this field shortly afterwards.  Do not
+                # rewrite up to 5000 log rows in the forwarding hot path.
+                return
             self.rewrite_log_file()
 
     def export_logs_csv(self) -> str:
@@ -349,7 +410,7 @@ class ObservabilityService:
                 row["elapsed_ms"] = elapsed_ms
                 row["slow"] = elapsed_ms >= 10000 or str(row.get("stage") or "") in {"waiting_serial_protection", "waiting_first_byte"} and elapsed_ms >= 5000
                 if row["slow"] and not row.get("possible_reason"):
-                    row["possible_reason"] = {"waiting_serial_protection": "该连接组已开启串行保护，正在等待同一候选完成", "waiting_first_byte": "上游首包较慢，可能是模型正在执行复杂任务"}.get(str(row.get("stage") or ""), "请求耗时较长，请关注上游状态")
+                    row["possible_reason"] = {"waiting_serial_protection": "该连接组已开启串行保护，正在等待同一候选完成", "waiting_first_byte": "正在等待首个完整 SSE 帧；上游可能处于缓冲或使用非标准分隔"}.get(str(row.get("stage") or ""), "请求耗时较长，请关注上游状态")
                 row["request_id_short"] = str(row.get("request_id") or "")[:8]
                 items.append(row)
         items.sort(key=lambda row: row.get("started_at") or 0, reverse=True)
