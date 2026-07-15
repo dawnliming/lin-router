@@ -174,10 +174,12 @@ def test_v055_frontend_onboarding_contracts():
     assert "https://www.codeok.cc/" in dashboard_js
     assert 'target="_blank" rel="noopener noreferrer"' in dashboard_js
     assert "renderDirectAccessCards" in dashboard_js
-    assert "renderClientTemplates" in dashboard_js
-    assert "model_providers.lin-router" in dashboard_js
+    assert "onboardingClientText" in dashboard_js
+    assert "一键复制接入信息" in dashboard_js
+    assert "renderClientTemplates" not in dashboard_js
+    assert "model_providers.lin-router" not in dashboard_js
     assert "通用 OpenAI" in dashboard_js
-    assert "_openClientTemplates" in dashboard_js
+    assert "_openClientTemplates" not in dashboard_js
     assert "不是上游 API Key" in dashboard_js
     assert "renderGroupWorkflow" in config_js
     assert "ConnectionStatus.draftGroup" in config_js
@@ -198,4 +200,4 @@ def test_v055_frontend_onboarding_contracts():
     assert "快速测试" in test_js
     assert "请回复：连接成功" in test_js
     assert "'/v1/chat/completions'" in test_js
-    assert "v0.6.2" in settings_js
+    assert "v0.6.3" in settings_js

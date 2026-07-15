@@ -263,7 +263,7 @@ const ConfigTabActions = {
       client_model_aliases: document.getElementById('aggregate-client-model-aliases').value.split(/[\n,]+/).map(value => value.trim()).filter(Boolean),
       enabled: document.getElementById('aggregate-enabled').checked,
       cooldown_minutes: Math.max(0, Number(document.getElementById('aggregate-cooldown').value || 0)),
-      strategy: document.getElementById('aggregate-strategy').value,
+      strategy: 'priority',
     };
     try {
       controller.setSaveStatus('saving');
@@ -319,10 +319,6 @@ const ConfigTabActions = {
         <select id="member-model"><option value="">请选择模型</option></select>
       </div>
       <div class="form-row">
-        <label>手动价格（可选）</label>
-        <input id="member-price" type="number" step="0.001" placeholder="默认继承底层模型价格，可手动覆盖">
-      </div>
-      <div class="form-row">
         <label>预览</label>
         <div id="member-preview" class="form-hint">-</div>
       </div>
@@ -332,13 +328,6 @@ const ConfigTabActions = {
       const modelSelect = overlay.querySelector('#member-model');
       const preview = overlay.querySelector('#member-preview');
       if (!groupSelect || !modelSelect) return;
-      const priceInput = overlay.querySelector('#member-price');
-      const applyDefaultPrice = () => {
-        const model = Store.getModel(modelSelect.value);
-        if (!priceInput || !model || priceInput.dataset.touched === 'true') return;
-        const candidates = [model.price_input, model.price_output].map(v => Number(v || 0)).filter(v => v > 0);
-        priceInput.value = candidates.length ? String(Math.min(...candidates)) : '';
-      };
       const refresh = () => {
         const groupId = groupSelect.value;
         const group = Store.getGroup(groupId);
@@ -348,19 +337,16 @@ const ConfigTabActions = {
           return;
         }
         const models = Store.getModelsByGroup(groupId).filter(m => m.usable !== false);
-        const existing = Store.getAggregateMembers(aggregateId).map(m => m.model_id);
+        const existing = new Set(Store.getAggregateMembers(aggregateId)
+          .filter(member => member.group_id === groupId)
+          .map(member => member.model_id));
         modelSelect.innerHTML = '<option value="">请选择模型</option>' + models.map(m =>
-          `<option value="${m.id}" ${existing.includes(m.id) ? 'disabled' : ''}>${Utils.escapeHtml(m.name)}${m.upstream_model && m.upstream_model !== m.name ? ` (${Utils.escapeHtml(m.upstream_model)})` : ''}</option>`
+          `<option value="${Utils.escapeHtml(m.id)}" ${existing.has(m.id) ? 'disabled' : ''}>${Utils.escapeHtml(m.name)}${m.upstream_model && m.upstream_model !== m.name ? ` (${Utils.escapeHtml(m.upstream_model)})` : ''}${existing.has(m.id) ? '（已存在）' : ''}</option>`
         ).join('');
         controller._updateMemberPreview(groupSelect.value, modelSelect.value, preview);
       };
-      priceInput?.addEventListener('input', () => { priceInput.dataset.touched = 'true'; });
-      groupSelect.addEventListener('change', () => {
-        if (priceInput) { priceInput.dataset.touched = ''; priceInput.value = ''; }
-        refresh();
-      });
+      groupSelect.addEventListener('change', refresh);
       modelSelect.addEventListener('change', () => {
-        applyDefaultPrice();
         controller._updateMemberPreview(groupSelect.value, modelSelect.value, preview);
       });
       refresh();
@@ -376,18 +362,74 @@ const ConfigTabActions = {
       }
     });
     if (!values) return;
-    const priceValue = values['member-price']?.trim();
-    const manualPrice = priceValue === '' ? null : Number(priceValue);
-    if (priceValue !== '' && (isNaN(manualPrice) || manualPrice < 0)) {
-      Toast.error('手动价格必须是大于等于 0 的数字');
-      return;
-    }
     try {
-      await API.createAggregateMember(aggregateId, { group_id: values['member-group'], model_id: values['member-model'], manual_price: manualPrice });
+      await API.createAggregateMember(aggregateId, { group_id: values['member-group'], model_id: values['member-model'] });
       await controller.reloadAfterAggregateMemberChange();
       Toast.success('成员已添加');
     } catch (err) {
       Toast.error('添加失败：' + err.message);
+    }
+  },
+
+  async onAddAggregateMembersByGroup(controller) {
+    const aggregateId = document.getElementById('aggregate-id')?.value;
+    if (!aggregateId) {
+      Toast.warning('请先保存聚合模型');
+      return;
+    }
+    const groups = (Store.state.groups || []).filter(group => group.provider_type === 'relay');
+    if (!groups.length) {
+      Toast.warning('请先创建 relay 中转站连接组');
+      return;
+    }
+    const groupOptions = groups.map(group => {
+      const summary = Store.getAggregateBatchGroupSummary(aggregateId, group.id);
+      return `<option value="${Utils.escapeHtml(group.id)}">${Utils.escapeHtml(group.name)}（可添加 ${summary.addableCount} / 已存在 ${summary.existingCount}）</option>`;
+    }).join('');
+    const html = `
+      <div class="form-hint aggregate-batch-intro">只添加所选 relay 连接组中当前可用的模型；已存在成员会自动跳过，并追加到现有优先级末尾。</div>
+      <div class="form-row">
+        <label>连接组</label>
+        <select id="member-batch-group">${groupOptions}</select>
+      </div>
+      <div class="form-row">
+        <label>添加范围</label>
+        <div id="member-batch-summary" class="aggregate-batch-summary" aria-live="polite"></div>
+      </div>
+    `;
+    const values = await Modal.form({
+      title: '按连接组批量添加模型',
+      html,
+      confirmText: '批量添加',
+      onRender: overlay => {
+        const select = overlay.querySelector('#member-batch-group');
+        const summaryElement = overlay.querySelector('#member-batch-summary');
+        const refreshSummary = () => {
+          const summary = Store.getAggregateBatchGroupSummary(aggregateId, select?.value || '');
+          if (summaryElement) {
+            summaryElement.textContent = `可添加 ${summary.addableCount} 个，已存在 ${summary.existingCount} 个，不可添加 ${summary.unavailableCount} 个。`;
+          }
+        };
+        select?.addEventListener('change', refreshSummary);
+        refreshSummary();
+      },
+      validate: formValues => formValues['member-batch-group'] ? null : '请选择连接组',
+    });
+    if (!values) return;
+    try {
+      const result = await API.createAggregateMembersBatch(aggregateId, {
+        group_id: values['member-batch-group'],
+      });
+      await controller.reloadAfterAggregateMemberChange();
+      const added = Number(result?.added_count ?? result?.counts?.added ?? (Array.isArray(result?.added) ? result.added.length : 0));
+      const skipped = Number(result?.skipped_count ?? result?.counts?.skipped ?? (Array.isArray(result?.skipped) ? result.skipped.length : 0));
+      const failed = Number(result?.failed_count ?? result?.counts?.failed ?? (Array.isArray(result?.failed) ? result.failed.length : 0));
+      const summary = `新增 ${added} 个，跳过 ${skipped} 个，失败 ${failed} 个`;
+      const message = result?.message ? `${result.message}（${summary}）` : `批量添加完成：${summary}`;
+      if (failed > 0 || added === 0) Toast.warning(message);
+      else Toast.success(message);
+    } catch (err) {
+      Toast.error('批量添加失败：' + err.message);
     }
   },
 
@@ -400,10 +442,8 @@ const ConfigTabActions = {
       return;
     }
     const upstream = model.upstream_model || model.ep_id || model.name;
-    const priceHint = (Number(model.price_input || 0) || Number(model.price_output || 0))
-      ? ` / 底层价格 输入 ${model.price_input || 0} 输出 ${model.price_output || 0}`
-      : '';
-    previewEl.innerHTML = Utils.escapeHtml(`${group.name} / ${model.name} → ${upstream}${model.price_group ? ' / 价格组 ' + model.price_group : ''}${priceHint}`);
+    const priceGroup = String(model.price_group || '').trim() || '未设置';
+    previewEl.innerHTML = Utils.escapeHtml(`${group.name} / ${model.name} → ${upstream} / 价格组 ${priceGroup}`);
   },
 
   onAggregateMemberAction(controller, action, memberId) {
@@ -543,26 +583,6 @@ const ConfigTabActions = {
       input.select();
       document.execCommand('copy');
       Toast.success('聚合模型 Key 已复制');
-    }
-  },
-
-  async onUpdateAggregateMemberPrice(controller, memberId, value) {
-    const member = Store.state.aggregate_members?.find(m => m.id === memberId);
-    if (!member) return;
-    const trimmed = value.trim();
-    const manualPrice = trimmed === '' ? null : Number(trimmed);
-    if (trimmed !== '' && (isNaN(manualPrice) || manualPrice < 0)) {
-      Toast.error('手动价格必须是大于等于 0 的数字');
-      return;
-    }
-    // 避免 change + blur 重复保存，或重新渲染后旧值触发无意义请求
-    const currentPrice = member.manual_price != null ? Number(member.manual_price) : null;
-    if (manualPrice === currentPrice) return;
-    try {
-      await API.saveAggregateMember(memberId, { manual_price: manualPrice });
-      await controller.reloadAfterAggregateMemberChange();
-    } catch (err) {
-      Toast.error('价格更新失败：' + err.message);
     }
   },
 

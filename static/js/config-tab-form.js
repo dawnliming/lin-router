@@ -208,8 +208,7 @@ const ConfigTabForm = {
     if (!form) return;
     form.querySelectorAll('input, select, textarea').forEach(el => {
       // 失焦/变更只保存进程内草稿，正式保存统一由显式 submit 触发。
-      const cls = el.className || '';
-      if (cls.includes('aggregate-member-price') || el.id === 'aggregate-stats-limit') return;
+      if (el.id === 'aggregate-stats-limit') return;
       ['input', 'change', 'blur'].forEach(event => {
         el.addEventListener(event, () => this.captureDraft(controller, form));
       });

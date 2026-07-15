@@ -215,10 +215,8 @@ class CandidateHealthService:
     def iter_aggregate_candidates(self, aggregate: AggregateModel, **kwargs: object) -> Iterator[UpstreamCandidate]:
         self._store.refresh_expired_cooldowns()
         members = self._store.get_aggregate_members(aggregate.id)
-        if aggregate.strategy == "price_first":
-            members = sorted(members, key=lambda member: (member.manual_price is None, member.manual_price if member.manual_price is not None else 0, member.priority))
-        else:
-            members = sorted(members, key=lambda member: member.priority)
+        # 价格字段仅用于展示和统计；历史 strategy 值也必须按手动 priority 调度。
+        members = sorted(members, key=lambda member: member.priority)
         for member in members:
             reason, message, group, model = self.aggregate_member_skip_reason(member)
             if reason:

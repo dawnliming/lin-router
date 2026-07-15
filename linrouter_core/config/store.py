@@ -6,7 +6,7 @@ import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .constants import (
     DEFAULT_AUTO_MODEL_NAME,
@@ -136,6 +136,9 @@ class ConfigStore:
 
     def save(self) -> None:
         with self._lock:
+            # 所有配置保存入口都收口历史策略，避免其他字段保存时把旧值重新写回。
+            for aggregate in self.aggregate_models:
+                aggregate.strategy = AggregateModel.normalize_strategy(aggregate.strategy)
             payload = {
                 "groups": [asdict(g) for g in self.groups],
                 "models": [asdict(m) for m in self.models],
@@ -237,6 +240,7 @@ class ConfigStore:
 
     def upsert_aggregate(self, aggregate: AggregateModel) -> Tuple[bool, str]:
         with self._lock:
+            aggregate.strategy = AggregateModel.normalize_strategy(aggregate.strategy)
             aggregate.client_model_aliases = AggregateModel._normalize_client_model_aliases(aggregate.client_model_aliases)
             ok, msg = self._validate_aggregate_name(aggregate.name, aggregate.id)
             if not ok:
@@ -329,6 +333,268 @@ class ConfigStore:
             self._touch_aggregate_member_revision(member.aggregate_id)
             self.save()
             return True, ""
+
+    def batch_add_aggregate_members(
+        self,
+        aggregate_id: str,
+        group_id: str,
+        model_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """按连接组一次性添加聚合成员，并在一次保存中完成变更。
+
+        这里不接受客户端提交的完整模型配置，而是在锁内重新读取当前 Store
+        中的聚合、连接组和模型。这样批量操作不会绕过 relay、可用状态或重复
+        成员校验，也不会因前端并发发起多个请求而留下半截顺序。
+        """
+
+        def detail(
+            model_id: str,
+            *,
+            model_name: str = "",
+            code: str,
+            reason: str,
+            member_id: str = "",
+            priority: Optional[int] = None,
+        ) -> Dict[str, Any]:
+            item: Dict[str, Any] = {
+                "model_id": model_id,
+                "model_name": model_name,
+                "code": code,
+                "reason": reason,
+            }
+            if member_id:
+                item["member_id"] = member_id
+            if priority is not None:
+                item["priority"] = priority
+            return item
+
+        def result(
+            *,
+            ok: bool,
+            message: str,
+            code: str = "",
+            added: Optional[List[Dict[str, Any]]] = None,
+            skipped: Optional[List[Dict[str, Any]]] = None,
+            failed: Optional[List[Dict[str, Any]]] = None,
+            revision: int = 0,
+            members: Optional[List[AggregateMember]] = None,
+        ) -> Dict[str, Any]:
+            added_items = added or []
+            skipped_items = skipped or []
+            failed_items = failed or []
+            payload: Dict[str, Any] = {
+                "ok": ok,
+                "message": message,
+                "added_count": len(added_items),
+                "skipped_count": len(skipped_items),
+                "failed_count": len(failed_items),
+                "counts": {
+                    "added": len(added_items),
+                    "skipped": len(skipped_items),
+                    "failed": len(failed_items),
+                },
+                "summary": {
+                    "added": len(added_items),
+                    "skipped": len(skipped_items),
+                    "failed": len(failed_items),
+                },
+                "added": added_items,
+                "skipped": skipped_items,
+                "failed": failed_items,
+                "revision": revision,
+                "members": [asdict(member) for member in (members or [])],
+            }
+            if code:
+                payload["code"] = code
+            return payload
+
+        with self._lock:
+            # 批量请求必须以当前内存中的配置为准，避免客户端传入过期或伪造模型字段。
+            aggregate = self.find_aggregate(str(aggregate_id or "").strip())
+            if not aggregate:
+                return result(ok=False, message="聚合模型不存在", code="aggregate_not_found")
+            group = self.find_group(str(group_id or "").strip())
+            if not group:
+                return result(ok=False, message="连接组不存在", code="group_not_found")
+            if group.provider_type != PROVIDER_RELAY:
+                return result(
+                    ok=False,
+                    message="聚合成员只能来自 relay 连接组",
+                    code="aggregate_group_not_relay",
+                )
+
+            # 显式选择时保留请求顺序的唯一项；重复选择本身作为 skipped 返回，便于前端解释结果。
+            requested_ids: Optional[List[str]] = None
+            duplicate_requested: List[str] = []
+            if model_ids is not None:
+                requested_ids = []
+                seen_requested: set[str] = set()
+                for raw_model_id in model_ids:
+                    model_id = str(raw_model_id or "").strip()
+                    if not model_id:
+                        continue
+                    if model_id in seen_requested:
+                        duplicate_requested.append(model_id)
+                        continue
+                    seen_requested.add(model_id)
+                    requested_ids.append(model_id)
+
+            all_models = [model for model in self.models if model.group_id == group.id]
+            models_by_id = {model.id: model for model in self.models}
+            existing_keys = {
+                (member.group_id, member.model_id)
+                for member in self.aggregate_members
+                if member.aggregate_id == aggregate.id
+            }
+            added: List[Dict[str, Any]] = []
+            skipped: List[Dict[str, Any]] = []
+            failed: List[Dict[str, Any]] = []
+            candidates: List[ModelConfig] = []
+
+            if requested_ids is None:
+                selected_models = all_models
+            else:
+                requested_set = set(requested_ids)
+                # 以配置中的模型顺序为准，确保 priority 追加顺序稳定。
+                selected_models = [model for model in all_models if model.id in requested_set]
+                selected_ids = {model.id for model in selected_models}
+                for model_id in requested_ids:
+                    if model_id not in models_by_id:
+                        failed.append(detail(model_id, code="model_not_found", reason="模型不存在"))
+                    elif model_id not in selected_ids:
+                        model = models_by_id[model_id]
+                        failed.append(
+                            detail(
+                                model_id,
+                                model_name=model.name,
+                                code="model_not_in_group",
+                                reason="模型不属于所选连接组",
+                            )
+                        )
+                for model_id in duplicate_requested:
+                    model = models_by_id.get(model_id)
+                    skipped.append(
+                        detail(
+                            model_id,
+                            model_name=model.name if model else "",
+                            code="duplicate_request",
+                            reason="请求中重复选择，已跳过重复项",
+                        )
+                    )
+
+            for model in selected_models:
+                key = (group.id, model.id)
+                if key in existing_keys:
+                    skipped.append(
+                        detail(
+                            model.id,
+                            model_name=model.name,
+                            code="member_exists",
+                            reason="该连接组/模型组合已存在于当前聚合模型",
+                        )
+                    )
+                    continue
+                if model.usable is not True:
+                    failed.append(
+                        detail(
+                            model.id,
+                            model_name=model.name,
+                            code="model_unusable",
+                            reason="模型当前不可用，未加入聚合模型",
+                        )
+                    )
+                    continue
+                candidates.append(model)
+
+            previous_members = list(self.aggregate_members)
+            previous_revision_present = aggregate.id in self.aggregate_member_revisions
+            previous_revision = self.aggregate_member_revision(aggregate.id)
+            max_priority = max(
+                (member.priority for member in self.aggregate_members if member.aggregate_id == aggregate.id),
+                default=0,
+            )
+            new_members: List[AggregateMember] = []
+            for model in candidates:
+                max_priority += 1
+                member = AggregateMember(
+                    id=uuid.uuid4().hex,
+                    aggregate_id=aggregate.id,
+                    group_id=group.id,
+                    model_id=model.id,
+                    priority=max_priority,
+                )
+                new_members.append(member)
+                added.append(
+                    detail(
+                        model.id,
+                        model_name=model.name,
+                        code="added",
+                        reason="已添加到聚合模型",
+                        member_id=member.id,
+                        priority=member.priority,
+                    )
+                )
+
+            revision = previous_revision
+            if new_members:
+                # 先更新内存，再一次性落盘；落盘失败时恢复两个状态，避免半截批量结果。
+                self.aggregate_members.extend(new_members)
+                revision = self._touch_aggregate_member_revision(aggregate.id)
+                try:
+                    self.save()
+                except Exception:
+                    self.aggregate_members = previous_members
+                    if previous_revision_present:
+                        self.aggregate_member_revisions[aggregate.id] = previous_revision
+                    else:
+                        self.aggregate_member_revisions.pop(aggregate.id, None)
+                    failed.extend(
+                        detail(
+                            model.id,
+                            model_name=model.name,
+                            code="config_save_failed",
+                            reason="保存批量成员失败，已回滚本次变更",
+                        )
+                        for model in candidates
+                    )
+                    added = []
+                    revision = previous_revision
+                    members = sorted(previous_members, key=lambda member: member.priority)
+                    return result(
+                        ok=False,
+                        message="保存批量成员失败，本次变更已回滚",
+                        code="config_save_failed",
+                        added=added,
+                        skipped=skipped,
+                        failed=failed,
+                        revision=revision,
+                        members=members,
+                    )
+
+            members = sorted(self.get_aggregate_members(aggregate.id), key=lambda member: member.priority)
+            if added:
+                message = f"已添加 {len(added)} 个模型"
+                if skipped:
+                    message += f"，跳过 {len(skipped)} 个重复项"
+                if failed:
+                    message += f"，{len(failed)} 个模型不可添加"
+            elif skipped and not failed:
+                message = "所选模型已全部存在，未新增成员"
+            elif failed and not skipped:
+                message = "没有可添加的模型"
+            elif not all_models:
+                message = "该连接组没有可添加的模型"
+            else:
+                message = "没有可添加的模型"
+            return result(
+                ok=True,
+                message=message,
+                added=added,
+                skipped=skipped,
+                failed=failed,
+                revision=revision,
+                members=members,
+            )
 
     def remove_aggregate_member(self, member_id: str) -> bool:
         with self._lock:

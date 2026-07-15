@@ -1,6 +1,6 @@
 # Lin Router
 
-本地 OpenAI 兼容路由器，为 Hermes、Codex++ 和通用 OpenAI 客户端提供统一入口。
+Lin Router 是本地 OpenAI 兼容中转站：它接收 Codex、Hermes 和通用 OpenAI 客户端的请求，按选定的连接组和模型转发到上游，同时保留健康、熔断、日志、测速和路由能力。
 
 现已支持 **Windows** 与 **macOS** 跨平台运行，核心代理逻辑完全复用，仅托盘、开机自启、路径等系统能力做平台适配。
 
@@ -76,12 +76,12 @@ http://127.0.0.1:18400/v1
 ## 主要能力
 
 - 连接组管理：火山方舟 / 中转站 / 通用 OpenAI 代理
-- 聚合模型：多中转站 fallback 调度，支持手动优先级与价格优先两种策略
+- 聚合模型：多中转站 fallback 调度，按手动优先级顺序尝试
 - 连接组级自动冷却：仅中转站启用
 - 自动获取上游模型
 - 最近请求日志、详情展开、筛选与 CSV 导出
 - 代理测试
-- 复制 Hermes 配置
+- 客户端接入信息快捷复制
 - 复制连接组
 - 跨平台系统托盘 / 状态栏、开机自启、启动最小化
 
@@ -113,29 +113,38 @@ http://127.0.0.1:18400/v1
 - 成员只能选自 `relay` 模式的连接组。
 - 调度策略：
   - `priority`（手动优先级）：按成员在列表中的顺序依次尝试。
-  - `price_first`（价格优先）：按成员手动价格从低到高尝试；同价按成员顺序；未填写价格的成员排在最后。
 - 失败处理：成员失败且聚合模型配置了冷却分钟数时，该成员会进入冷却状态并在冷却期间被排除；所有成员均失败时返回 `503 all_aggregate_members_failed`，不会回退到全局 Key、其他聚合模型或非成员模型。
 - 流式首包保护：流式响应一旦开始向客户端输出，即使后续上游失败也不会无感切换到其他成员，避免客户端收到混合内容。
 
-## Hermes / Codex++
+## 自助接入 Codex / Hermes
 
-Hermes 推荐配置（连接组模式）：
+管理台首页的“接入 Codex / Hermes”区域只会为**已经验证可用的中转站连接组**提供接入信息。它只帮助你准备本地入口，不会修改客户端配置、监听客户端请求，或判断客户端是否已经接入成功。
+
+### 两类 Key 不可混用
+
+| 名称 | 用途 | 填写位置 |
+| --- | --- | --- |
+| 上游 API Key | Lin Router 连接中转站 / 模型服务 | 连接组配置 |
+| route key | Codex/Hermes 访问本机 Lin Router | 客户端接入信息 |
+
+route key 是客户端到本机 Lin Router 的认证信息，**不是上游 API Key**；不要把它填回连接组，也不要把上游 API Key 填入 Codex 或 Hermes 的 Lin Router 接入配置。
+
+### 快捷复制
+
+首页会根据当前选择的已验证连接组、模型和目标客户端生成以下四项。切换连接组或模型后，请重新复制，避免混用不同连接组的 route key。
 
 ```text
 Base URL: http://127.0.0.1:18400/v1
-API Key: 对应连接组的 lr-... key
-Model: 连接组的自动路由模型名（默认 lin-router-auto）
+route key: 当前连接组的本地 route key（lr-...）
+Model: 当前选择的已验证模型
+客户端: Codex 或 Hermes
 ```
 
-Hermes 推荐配置（聚合模型模式）：
+- Base URL 指向本机 Lin Router，不是上游地址。
+- route key 填入目标客户端的 API Key 位置，用于客户端到 Lin Router 的认证。
+- Model 是当前选择的已验证上游模型。
 
-```text
-Base URL: http://127.0.0.1:18400/v1
-API Key: 聚合模型的 lr-ag-... key
-Model: 聚合模型名
-```
-
-Codex++ 也走同样的本地入口，建议单独建连接组，并保持请求语义尽量原样透传。
+页面提供单项复制和“一键复制接入信息”。复制下方接入信息，在目标客户端中按其已有方式填写即可；客户端是否可用由你在客户端中自行验证。
 
 ## 预览 / 调试
 
@@ -158,11 +167,11 @@ scripts/build.sh --target win32
 
 # Windows + 安装包（默认使用内置自举安装器；装了 Inno Setup 6 会优先使用 ISCC）
 scripts/build.sh --target win32 --installer
-# -> dist/LinRouter_windows.exe + dist/LinRouter-v0.6.0-win-x64.zip + dist/LinRouter-Setup-v0.6.0-win-x64.exe
+# -> dist/LinRouter_windows.exe + dist/LinRouter-v0.6.3-win-x64.zip + dist/LinRouter-Setup-v0.6.3-win-x64.exe
 
 # 指定安装包版本号
-scripts/build.sh --target win32 --installer --version 0.6.0
-# -> dist/LinRouter-Setup-v0.6.0-win-x64.exe
+scripts/build.sh --target win32 --installer --version 0.6.3
+# -> dist/LinRouter-Setup-v0.6.3-win-x64.exe
 
 # macOS
 scripts/build.sh --target darwin
@@ -228,11 +237,10 @@ python -m PyInstaller --noconfirm LinRouter.spec
 
 真实配置已加入 `.gitignore`，不要提交真实 API Key。
 
-## 推理强度与 WAF 验证
+## 推理字段与 WAF 验证
 
 - `/v1/responses` 使用 `reasoning.effort`；`/v1/chat/completions` 使用 `reasoning_effort`。Lin Router 只按对应协议读取和透传，不会同时注入两种字段。
 - WAF 兼容只调整 Header；请求体仅在路由到真实上游模型时补丁替换 `model`，推理字段保持不变。
-- 连接组高级配置可标记“推理强度支持”为未知、已验证支持或不支持；未知/不支持会在日志诊断卡片中明确提示。
 - 对真实渠道执行 low/high A/B（先关闭 WAF 运行一次，再开启 WAF 运行一次）：
 
 ```powershell

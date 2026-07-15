@@ -76,6 +76,22 @@ const Store = {
     return Number(this.state.aggregate_member_revisions?.[aggregateId] || 0);
   },
 
+  getAggregateBatchGroupSummary(aggregateId, groupId) {
+    const models = this.getModelsByGroup(groupId);
+    const eligibleModels = models.filter(model => model.usable !== false);
+    const existingModelIds = new Set(
+      this.getAggregateMembers(aggregateId)
+        .filter(member => member.group_id === groupId)
+        .map(member => member.model_id)
+    );
+    return {
+      modelCount: models.length,
+      addableCount: eligibleModels.filter(model => !existingModelIds.has(model.id)).length,
+      existingCount: existingModelIds.size,
+      unavailableCount: models.length - eligibleModels.length,
+    };
+  },
+
   update(patch) {
     this.state = { ...this.state, ...patch };
     this.emit();

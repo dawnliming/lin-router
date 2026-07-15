@@ -414,10 +414,9 @@ const ConfigTab = {
           <div class="form-row">
             <label>调度策略</label>
             <select id="aggregate-strategy">
-              <option value="priority" ${(a?.strategy || 'priority') === 'priority' ? 'selected' : ''}>手动优先级</option>
-              <option value="price_first" ${(a?.strategy || 'priority') === 'price_first' ? 'selected' : ''}>价格优先</option>
+              <option value="priority" selected>手动优先级</option>
             </select>
-            <div class="form-hint">当前策略：${(a?.strategy || 'priority') === 'price_first' ? '价格优先，按手动价格从低到高排序，同价按优先级；未填价格排最后。' : '手动优先级，按成员顺序依次尝试；价格仅展示，不参与排序。'}</div>
+            <div class="form-hint">按成员顺序依次尝试；价格信息仅用于模型配置与成本统计，不参与调度排序。</div>
           </div>
           <div class="form-actions form-actions-split">
             <div class="form-actions-left">
@@ -578,9 +577,12 @@ const ConfigTab = {
       <section class="form-card aggregate-members-card">
         <div class="aggregate-members-header">
           <h3>聚合成员</h3>
-          <button type="button" id="aggregate-add-member" class="btn-secondary btn-sm">+ 添加成员</button>
+          <div class="aggregate-members-header-actions">
+            <button type="button" id="aggregate-add-member" class="btn-secondary btn-sm">单个添加</button>
+            <button type="button" id="aggregate-add-group-models" class="btn-secondary btn-sm">按连接组批量添加</button>
+          </div>
         </div>
-        <div class="aggregate-status-note">成员状态不等于底层真实模型状态：手动停用只影响聚合成员；自动冷却表示上游健康失败；底层停用需要到真实模型配置中恢复。</div>
+        <div class="aggregate-status-note">成员状态不等于底层真实模型状态：手动停用只影响聚合成员；自动冷却表示上游健康失败；底层停用需要到真实模型配置中恢复。价格组仅展示模型配置，不参与调度排序。</div>
         ${members.length ? `
         <div class="aggregate-members-table-wrap">
           <table class="aggregate-members-table">
@@ -591,7 +593,7 @@ const ConfigTab = {
                 <th>模型</th>
                 <th>上游模型</th>
                 <th>优先级</th>
-                <th class="price-col">手动价格</th>
+                <th class="price-group-col">价格组</th>
                 <th>状态</th>
                 <th>操作</th>
               </tr>
@@ -628,7 +630,7 @@ const ConfigTab = {
         <td class="truncate-cell" title="${Utils.escapeHtml(model?.name || '-')}">${Utils.escapeHtml(model?.name || '-')}</td>
         <td class="truncate-cell" title="${Utils.escapeHtml(model?.upstream_model || model?.ep_id || '-')}">${Utils.escapeHtml(model?.upstream_model || model?.ep_id || '-')}</td>
         <td class="tiny">${idx + 1}</td>
-        <td class="price-col"><input type="number" class="aggregate-member-price" data-member-id="${member.id}" value="${member.manual_price != null ? member.manual_price : ''}" step="0.001" placeholder="继承"></td>
+        <td class="price-group-col">${this.renderAggregatePriceGroup(model)}</td>
         <td class="tiny" data-member-status-cell="${member.id}"><span data-aggregate-member-status="${member.id}" class="pill ${status.class}" title="${Utils.escapeHtml(status.title)}">${status.text}</span></td>
         <td class="aggregate-member-actions">
           ${toggleBtn}
@@ -639,6 +641,13 @@ const ConfigTab = {
         </td>
       </tr>
     `;
+  },
+
+  renderAggregatePriceGroup(model) {
+    if (!model) return '<span class="aggregate-price-state is-missing">底层模型不存在</span>';
+    const priceGroup = String(model.price_group || '').trim();
+    if (!priceGroup) return '<span class="aggregate-price-state">未设置</span>';
+    return `<span class="aggregate-price-group" title="${Utils.escapeHtml(priceGroup)}">${Utils.escapeHtml(priceGroup)}</span>`;
   },
 
   aggregateMemberStatus(member, model) {
@@ -982,13 +991,9 @@ const ConfigTab = {
       panel.querySelector('#aggregate-delete')?.addEventListener('click', () => this.onAggregateDelete());
       panel.querySelector('#aggregate-copy-route-key')?.addEventListener('click', () => this.onCopyAggregateRouteKey());
       panel.querySelector('#aggregate-add-member')?.addEventListener('click', () => this.onAddAggregateMember());
+      panel.querySelector('#aggregate-add-group-models')?.addEventListener('click', () => this.onAddAggregateMembersByGroup());
       panel.querySelector('#aggregate-stats-limit')?.addEventListener('change', () => this.refreshAggregateStats());
       this.refreshAggregateStats();
-      panel.querySelectorAll('.aggregate-member-price').forEach(el => {
-        const save = () => this.onUpdateAggregateMemberPrice(el.dataset.memberId, el.value);
-        el.addEventListener('change', save);
-        el.addEventListener('blur', save);
-      });
       panel.querySelectorAll('.aggregate-member-actions button[data-action]').forEach(el => {
         el.addEventListener('click', () => this.onAggregateMemberAction(el.dataset.action, el.dataset.memberId));
       });
@@ -1154,6 +1159,7 @@ const ConfigTab = {
   onAggregateSubmit(...args) { return ConfigTabActions.onAggregateSubmit(this, ...args); },
   onAggregateDelete(...args) { return ConfigTabActions.onAggregateDelete(this, ...args); },
   onAddAggregateMember(...args) { return ConfigTabActions.onAddAggregateMember(this, ...args); },
+  onAddAggregateMembersByGroup(...args) { return ConfigTabActions.onAddAggregateMembersByGroup(this, ...args); },
   _updateMemberPreview(...args) { return ConfigTabActions._updateMemberPreview(this, ...args); },
   onAggregateMemberAction(...args) { return ConfigTabActions.onAggregateMemberAction(this, ...args); },
   bindAggregateMemberDragAndDrop(...args) { return ConfigTabActions.bindAggregateMemberDragAndDrop(this, ...args); },
@@ -1164,7 +1170,6 @@ const ConfigTab = {
   onRecoverAggregateMember(...args) { return ConfigTabActions.onRecoverAggregateMember(this, ...args); },
   onMoveAggregateMember(...args) { return ConfigTabActions.onMoveAggregateMember(this, ...args); },
   onCopyAggregateRouteKey(...args) { return ConfigTabActions.onCopyAggregateRouteKey(this, ...args); },
-  onUpdateAggregateMemberPrice(...args) { return ConfigTabActions.onUpdateAggregateMemberPrice(this, ...args); },
   onToggleAggregateMember(...args) { return ConfigTabActions.onToggleAggregateMember(this, ...args); },
   onDeleteAggregateMember(...args) { return ConfigTabActions.onDeleteAggregateMember(this, ...args); },
   onFetchUpstream(...args) { return ConfigTabActions.onFetchUpstream(this, ...args); },

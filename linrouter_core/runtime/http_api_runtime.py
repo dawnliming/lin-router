@@ -849,6 +849,39 @@ def handle_post(handler: Any) -> None:
             return
         handler._send_json({"ok": True, "aggregate_model": asdict(aggregate)})
         return
+    if parsed.path.startswith("/api/aggregates/") and parsed.path.endswith("/members/batch"):
+        parts = parsed.path.split("/")
+        if len(parts) != 6:
+            handler._send_json({"error": {"message": "请求路径无效", "type": "invalid_request_error", "code": "invalid_path"}}, status=400)
+            return
+        payload = handler._read_json()
+        if not isinstance(payload, dict):
+            handler._send_json({"error": {"message": "请求参数无效", "type": "invalid_request_error", "code": "invalid_payload"}}, status=400)
+            return
+        group_id = str(payload.get("group_id") or "").strip()
+        if not group_id:
+            handler._send_json({"error": {"message": "连接组不能为空", "type": "invalid_request_error", "code": "missing_group_id"}}, status=400)
+            return
+        model_ids = payload.get("model_ids")
+        if model_ids is not None and (
+            not isinstance(model_ids, list)
+            or not all(isinstance(model_id, str) and model_id.strip() for model_id in model_ids)
+        ):
+            handler._send_json({"error": {"message": "模型列表参数无效", "type": "invalid_request_error", "code": "invalid_model_ids"}}, status=400)
+            return
+        aggregate_id = parts[3]
+        batch_result = handler.store.batch_add_aggregate_members(aggregate_id, group_id, model_ids)
+        code = str(batch_result.get("code") or "")
+        if code in {"aggregate_not_found", "group_not_found"}:
+            status = 404
+        elif code == "config_save_failed":
+            status = 500
+        elif not batch_result.get("ok"):
+            status = 400
+        else:
+            status = 200
+        handler._send_json(batch_result, status=status)
+        return
     if parsed.path.startswith("/api/aggregates/") and parsed.path.endswith("/members/reorder"):
         parts = parsed.path.split("/")
         if len(parts) != 6:

@@ -29,22 +29,33 @@ const Utils = {
   },
 
   async copy(text) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch (e) {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      document.body.appendChild(ta);
-      ta.select();
+    const clipboard = globalThis.navigator?.clipboard;
+    if (clipboard?.writeText) {
+      let timeoutId;
       try {
-        document.execCommand('copy');
-        return true;
+        // 内嵌浏览器可能因剪贴板权限而一直等待；超时后继续走兼容复制，避免界面无反馈。
+        const copied = await Promise.race([
+          clipboard.writeText(text).then(() => true),
+          new Promise(resolve => { timeoutId = setTimeout(() => resolve(false), 1200); }),
+        ]);
+        if (copied) return true;
       } catch (_) {
-        return false;
+        // 继续尝试兼容路径。
       } finally {
-        document.body.removeChild(ta);
+        if (timeoutId) clearTimeout(timeoutId);
       }
+    }
+
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      return document.execCommand?.('copy') === true;
+    } catch (_) {
+      return false;
+    } finally {
+      document.body.removeChild(ta);
     }
   },
 

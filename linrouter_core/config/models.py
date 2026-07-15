@@ -125,6 +125,15 @@ class AggregateModel:
     created_at: str = ""
     updated_at: str = ""
 
+    def __post_init__(self) -> None:
+        # 当前产品只保留手动优先级；历史值仍可读取，但不能继续参与价格排序。
+        self.strategy = self.normalize_strategy(self.strategy)
+
+    @staticmethod
+    def normalize_strategy(_value: Any) -> str:
+        """将历史或未知调度策略归一为当前唯一支持的 priority。"""
+        return "priority"
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AggregateModel":
         now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -136,7 +145,7 @@ class AggregateModel:
             route_key=str(data.get("route_key") or "").strip(),
             client_model_aliases=cls._normalize_client_model_aliases(data.get("client_model_aliases")),
             enabled=bool(data.get("enabled", True)),
-            strategy=str(data.get("strategy") or "priority").strip() or "priority",
+            strategy=cls.normalize_strategy(data.get("strategy")),
             cooldown_minutes=int(data.get("cooldown_minutes") or DEFAULT_AUTO_MODEL_COOLDOWN_MINUTES),
             created_at=str(data.get("created_at") or now),
             updated_at=str(data.get("updated_at") or now),

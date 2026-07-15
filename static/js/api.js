@@ -107,6 +107,7 @@ const API = {
   saveAggregate(id, data) { return this.req(`/api/aggregates/${id}`, { method: 'PUT', body: JSON.stringify(data) }); },
   deleteAggregate(id) { return this.req(`/api/aggregates/${id}`, { method: 'DELETE' }); },
   createAggregateMember(aggregateId, data) { return this.req(`/api/aggregates/${aggregateId}/members`, { method: 'POST', body: JSON.stringify(data) }); },
+  createAggregateMembersBatch(aggregateId, data) { return this.req(`/api/aggregates/${encodeURIComponent(aggregateId)}/members/batch`, { method: 'POST', body: JSON.stringify(data) }); },
   reorderAggregateMembers(aggregateId, memberIds, expectedRevision) { return this.req(`/api/aggregates/${aggregateId}/members/reorder`, { method: 'POST', body: JSON.stringify({ member_ids: memberIds, expected_revision: expectedRevision }) }); },
   saveAggregateMember(id, data) { return this.req(`/api/aggregate-members/${id}`, { method: 'PUT', body: JSON.stringify(data) }); },
   clearAggregateMemberCooldown(id) { return this.req(`/api/aggregate-members/${id}/clear-cooldown`, { method: 'POST' }); },

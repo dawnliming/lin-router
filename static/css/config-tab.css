@@ -525,6 +525,14 @@ input[aria-invalid="true"] { border-color: var(--danger); }
   font-weight: 600;
 }
 
+.aggregate-members-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .aggregate-members-table-wrap {
   overflow-x: auto;
   border: 1px solid var(--border-color);
@@ -533,7 +541,7 @@ input[aria-invalid="true"] { border-color: var(--danger); }
 
 .aggregate-members-table {
   width: 100%;
-  min-width: 560px;
+  min-width: 920px;
   border-collapse: collapse;
   font-size: 13px;
 }
@@ -590,10 +598,28 @@ input[aria-invalid="true"] { border-color: var(--danger); }
 
 .aggregate-member-actions {
   display: flex;
+  align-items: center;
   gap: 4px;
+  min-width: 224px;
   white-space: nowrap;
 }
 
+.aggregate-member-actions > button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  height: 28px;
+  min-height: 28px;
+  line-height: 20px;
+}
+
+.aggregate-member-actions > .btn-icon {
+  width: 28px;
+  min-width: 28px;
+  padding: 3px;
+}
 
 .aggregate-members-table .truncate-cell {
   max-width: 180px;
@@ -602,14 +628,33 @@ input[aria-invalid="true"] { border-color: var(--danger); }
   white-space: nowrap;
 }
 
-.aggregate-members-table .price-col {
-  width: 100px;
-  max-width: 110px;
+.aggregate-members-table .price-group-col {
+  min-width: 112px;
 }
 
-.aggregate-members-table .price-col input {
-  width: 86px;
-  padding: 5px 6px;
+.aggregate-price-group,
+.aggregate-price-state {
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.aggregate-price-state.is-missing {
+  color: var(--danger);
+}
+
+.aggregate-batch-intro {
+  margin-bottom: 12px;
+}
+
+.aggregate-batch-summary {
+  padding: 10px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .batch-preview-table-wrap {
