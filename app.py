@@ -465,6 +465,10 @@ class ArkProxyRouter:
     def recent_logs(self) -> List[Dict[str, Any]]:
         return self.observability.recent_logs()
 
+    def runtime_activity_since(self, cursor: str = "", limit: int = 30) -> Dict[str, Any]:
+        """提供管理台活动增量；日志查询 API 仍由持久化历史接口负责。"""
+        return self.observability.runtime_activity_since(cursor, limit)
+
     def all_logs(self) -> List[RequestLog]:
         return self.observability.all_logs()
 
@@ -2570,15 +2574,92 @@ class RouterHandler(BaseHTTPRequestHandler):
             and str(getattr(log, "usage_source", "")) != "manual_probe"
         ]
 
-    def _runtime_state_payload(self, include_skip: bool = False) -> Dict[str, Any]:
+    @staticmethod
+    def _runtime_live_request_signature(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """排除 elapsed_ms 等时钟字段，避免空闲状态因计时而无意义递增 revision。"""
+        keys = (
+            "request_id", "path", "requested_model", "model", "group", "candidate", "aggregate_model",
+            "stage", "stage_label", "stream", "attempt", "status", "slow", "possible_reason",
+            "cancellable", "cancellation_state", "cancelled_at_stage",
+        )
+        return [{key: item.get(key) for key in keys} for item in items]
+
+    @staticmethod
+    def _runtime_revision(scope: str, payload: Dict[str, Any]) -> str:
+        encoded = json.dumps({"scope": scope, **payload}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return f"r-{hashlib.sha256(encoded.encode('utf-8')).hexdigest()[:20]}"
+
+    def _runtime_state_payload(
+        self,
+        include_skip: bool = False,
+        *,
+        scope: str = "",
+        revision: str = "",
+        activity_cursor: str = "",
+    ) -> Dict[str, Any]:
+        """兼容旧全量响应，并为管理台提供按 scope 的轻量运行态投影。"""
         self.store.refresh_expired_cooldowns()
-        return {
-            "ok": True,
-            "models": [self._model_runtime_item(model) for model in self.store.models],
-            "aggregate_members": [self._member_runtime_item(member) for member in self.store.aggregate_members],
-            "logs": self._filtered_recent_logs(include_skip=include_skip),
-            "log_write_error": self.router.log_write_error,
+        models = [self._model_runtime_item(model) for model in self.store.models]
+        aggregate_members = [self._member_runtime_item(member) for member in self.store.aggregate_members]
+        log_write_error = self.router.log_write_error
+        if not scope:
+            return {
+                "ok": True,
+                "models": models,
+                "aggregate_members": aggregate_members,
+                "logs": self._filtered_recent_logs(include_skip=include_skip),
+                "log_write_error": log_write_error,
+            }
+
+        live_requests = self.router.live_requests_payload().get("requests", [])
+        activity: Dict[str, Any] | None = None
+        revision_payload: Dict[str, Any] = {
+            "models": models,
+            "aggregate_members": aggregate_members,
+            "live_requests": self._runtime_live_request_signature(live_requests),
+            "log_write_error": log_write_error,
         }
+        if scope == "dashboard":
+            raw_activity = self.router.runtime_activity_since(activity_cursor, limit=30)
+            activity_logs = [
+                item for item in raw_activity.get("logs", [])
+                if include_skip
+                or (
+                    not self._is_config_skip_log(item)
+                    and str(self._log_value(item, "usage_source", "") or "") != "manual_probe"
+                )
+            ]
+            activity = {
+                "cursor": str(raw_activity.get("cursor") or ""),
+                "changed": bool(raw_activity.get("changed")),
+                "mode": str(raw_activity.get("mode") or "snapshot"),
+                "logs": activity_logs,
+            }
+            revision_payload["activity_cursor"] = activity["cursor"]
+
+        runtime_revision = self._runtime_revision(scope, revision_payload)
+        changed = str(revision or "") != runtime_revision
+        response: Dict[str, Any] = {
+            "ok": True,
+            "scope": scope,
+            "runtime_revision": runtime_revision,
+            # revision 是前端请求参数名；保留同值降低过渡期接入复杂度。
+            "revision": runtime_revision,
+            "changed": changed,
+            "next_poll_ms": 1000 if live_requests else 5000,
+        }
+        # 活跃请求的 elapsed_ms 是可见信息，运行中即使状态 revision 未变也允许轻量回传。
+        if changed or live_requests:
+            response.update({
+                "models": models,
+                "aggregate_members": aggregate_members,
+                "live_requests": live_requests,
+                "log_write_error": log_write_error,
+            })
+        if activity is not None:
+            response["activity"] = activity
+            response["activity_cursor"] = activity["cursor"]
+        return response
 
     def _aggregate_member_chain_item(self, member: AggregateMember) -> Dict[str, Any]:
         group = self.store.find_group(member.group_id)

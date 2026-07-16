@@ -22,6 +22,9 @@ class ObservabilityService:
     """
 
     LOG_RETENTION = 5000
+    # 管理台只需要短窗口内的运行态增量；超出窗口时由调用方回退到快照，
+    # 避免为了保持游标而无限增长内存。
+    ACTIVITY_JOURNAL_LIMIT = 240
 
     def __init__(
         self,
@@ -39,6 +42,8 @@ class ObservabilityService:
         self._runtime_snapshot_provider = runtime_snapshot_provider
         self._repository = LogRepository(log_file, self._log_from_row)
         self._logs_lock = threading.RLock()
+        self._activity_cursor = 0
+        self._activity_journal: List[Dict[str, Any]] = []
         self._live_requests: Dict[str, Dict[str, Any]] = {}
         self._live_requests_lock = threading.RLock()
         self.load()
@@ -124,8 +129,48 @@ class ObservabilityService:
                     item.time = self._now()
             if items:
                 self.logs = list(reversed(items))
+                # Runtime requests are memory-only.  After a process restart,
+                # no persisted log can still be a live local request.
+                if self._recover_interrupted_streams_after_restart():
+                    self.rewrite_log_file()
         except Exception as exc:
             self.log_write_error = f"日志加载失败: {exc}"
+
+    def _recover_interrupted_streams_after_restart(self) -> bool:
+        """Finalize persisted streams that cannot survive this process startup.
+
+        Do not infer a successful HTTP response: the prior process never
+        observed an upstream terminal event.  This is idempotent so later
+        restarts retain the same explicit recovered terminal state.
+        """
+        changed = False
+        for item in self.logs:
+            detail = str(item.detail or "")
+            final_result = self.detail_value(detail, "final_result").lower()
+            is_stream = (
+                str(item.event or "").startswith("stream")
+                or "stream_started_at_ms=" in detail
+                or final_result == "streaming"
+            )
+            unfinished = str(item.status or "").lower() == "streaming" or final_result == "streaming"
+            if not is_stream or not unfinished:
+                continue
+            item.status = "interrupted"
+            item.event = "stream_interrupted"
+            item.usage_source = "stream_recovered"
+            item.failure_scope = "process_restart"
+            item.cooldown_applied = False
+            item.detail = self.update_detail_fields(detail, {
+                "stream_finalized": "true",
+                "lifecycle": "stream_interrupted_after_restart",
+                "final_result": "interrupted",
+                "recovery": "recovered_after_restart",
+                "recovery_reason": "process_restart",
+                "failure_scope": "process_restart",
+                "cooldown_applied": "false",
+            })
+            changed = True
+        return changed
 
     def add_log(
         self, path: str, model: str, status: str, detail: str = "", duration_ms: int = 0,
@@ -156,6 +201,7 @@ class ObservabilityService:
             self._append(item)
             del self.logs[self.LOG_RETENTION:]
             self._trim()
+            self._record_runtime_activity(item)
 
     def _append(self, item: RequestLog) -> None:
         with self._logs_lock:
@@ -179,6 +225,79 @@ class ObservabilityService:
     def recent_logs(self) -> List[Dict[str, Any]]:
         return [asdict(item) for item in self.logs[:30]]
 
+    @staticmethod
+    def _activity_key(item: RequestLog) -> str:
+        """给可原地回写的流日志一个稳定键，供前端按条目合并。"""
+        detail = str(item.detail or "")
+        is_stream = item.event.startswith("stream") or "stream_started_at_ms=" in detail
+        if item.request_id:
+            suffix = "stream" if is_stream else f"{item.event}|{item.time}"
+            return f"{item.request_id}|{item.attempt}|{item.model}|{suffix}"
+        return f"{item.time}|{item.path}|{item.model}|{item.event}|{item.attempt}"
+
+    def _record_runtime_activity(self, item: Optional[RequestLog] = None, *, reset: bool = False) -> None:
+        """记录运行态日志变化；调用方已经持有 _logs_lock。"""
+        self._activity_cursor += 1
+        entry: Dict[str, Any] = {
+            "cursor": self._activity_cursor,
+            "reset": bool(reset),
+        }
+        if item is not None:
+            entry["key"] = self._activity_key(item)
+            # 日志对象会在流终态原地更新，journal 必须保存当时快照。
+            entry["log"] = asdict(item)
+        self._activity_journal.append(entry)
+        del self._activity_journal[:-self.ACTIVITY_JOURNAL_LIMIT]
+
+    def runtime_activity_since(self, cursor: str = "", limit: int = 30) -> Dict[str, Any]:
+        """返回运行态活动的快照或增量，不读取历史文件避免高频 I/O。"""
+        limit = max(1, min(int(limit or 30), 30))
+        with self._logs_lock:
+            current = self._activity_cursor
+            current_cursor = str(current)
+            requested_text = str(cursor or "").strip()
+
+            def snapshot(*, changed: Optional[bool] = None) -> Dict[str, Any]:
+                return {
+                    "cursor": current_cursor,
+                    "changed": bool(self.logs) if changed is None else changed,
+                    "mode": "snapshot",
+                    "logs": [asdict(item) for item in self.logs[:limit]],
+                }
+
+            if not requested_text:
+                return snapshot(changed=True)
+            try:
+                requested = int(requested_text)
+            except (TypeError, ValueError):
+                return snapshot()
+            if requested == current:
+                return {"cursor": current_cursor, "changed": False, "mode": "delta", "logs": []}
+            if requested < 0 or requested > current:
+                return snapshot()
+            if not self._activity_journal:
+                return snapshot()
+            earliest = int(self._activity_journal[0]["cursor"])
+            if requested < earliest - 1:
+                return snapshot()
+
+            updates = [entry for entry in self._activity_journal if int(entry["cursor"]) > requested]
+            if any(entry.get("reset") for entry in updates):
+                return snapshot(changed=True)
+            # 同一条流日志可能在首包、终态等阶段多次回写；只下发最新快照。
+            latest: Dict[str, Dict[str, Any]] = {}
+            for entry in updates:
+                key = str(entry.get("key") or "")
+                if key and isinstance(entry.get("log"), dict):
+                    latest[key] = entry
+            logs = [entry["log"] for entry in sorted(latest.values(), key=lambda entry: int(entry["cursor"]), reverse=True)[:limit]]
+            return {
+                "cursor": current_cursor,
+                "changed": bool(updates),
+                "mode": "delta",
+                "logs": logs,
+            }
+
     def all_logs(self) -> List[RequestLog]:
         try:
             return self._repository.read_all() or list(reversed(self.logs))
@@ -186,11 +305,13 @@ class ObservabilityService:
             return list(reversed(self.logs))
 
     def clear_logs(self) -> None:
-        self.logs.clear()
-        try:
-            self._repository.clear()
-        except Exception:
-            return
+        with self._logs_lock:
+            self.logs.clear()
+            self._record_runtime_activity(reset=True)
+            try:
+                self._repository.clear()
+            except Exception:
+                return
 
     def _find_stream_log(self, request_id: str, attempt: Optional[int] = None, candidate_label: str = "") -> Optional[RequestLog]:
         with self._logs_lock:
@@ -263,6 +384,7 @@ class ObservabilityService:
                 fields.update(metrics)
             item.detail = self.update_detail_fields(item.detail, fields)
             self.rewrite_log_file()
+            self._record_runtime_activity(item)
             return True
 
     def rewrite_log_file(self) -> None:
@@ -304,8 +426,10 @@ class ObservabilityService:
                 # The stream finalizer, terminal-forwarded event, or write
                 # failure will persist this field shortly afterwards.  Do not
                 # rewrite up to 5000 log rows in the forwarding hot path.
+                self._record_runtime_activity(item)
                 return
             self.rewrite_log_file()
+            self._record_runtime_activity(item)
 
     def export_logs_csv(self) -> str:
         output = io.StringIO()

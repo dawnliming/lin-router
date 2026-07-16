@@ -56,6 +56,10 @@ assert(logs.diagnosisFor(structuredAuth, logs.parseDetail(structuredAuth.detail)
 
 const initialStream = { ...historicalAuth, status: 'streaming', detail: 'stream_started_at_ms=1; final_result=streaming' };
 assert(logs.rowKey(initialStream) === logs.rowKey(historicalAuth), 'stream lifecycle update must keep row identity');
+const recoveredStream = { ...historicalAuth, status: 'interrupted', event: 'stream_interrupted', detail: 'stream_started_at_ms=1; stream_finalized=true; lifecycle=stream_interrupted_after_restart; final_result=interrupted; recovery=recovered_after_restart' };
+assert(logs.streamTerminalLabel(recoveredStream, logs.parseDetail(recoveredStream.detail)) === '服务重启后中断', 'recovered stream must not be shown as in progress');
+assert(logs.eventSummary(recoveredStream).includes('服务重启后中断'), 'recovered stream summary must be terminal');
+assert(logs.diagnosisFor(recoveredStream, logs.parseDetail(recoveredStream.detail)).title === '服务重启后流已中断', 'recovered stream must have restart diagnosis');
 assert(logs.safeEndpoint('https://relay.example/v1/chat/completions?token=secret') === '/v1/chat/completions', 'endpoint display must hide upstream origin and query');
 assert(!logs.redactDiagnosticEvidence('out_headers=(Authorization=Bearer secret); upstream_endpoint=https://relay.example/v1?token=secret').includes('secret'), 'detail evidence must redact headers and full URL');
 '''

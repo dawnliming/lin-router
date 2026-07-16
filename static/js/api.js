@@ -62,7 +62,25 @@ const API = {
   },
 
   getState() { return this.req('/api/state'); },
-  getRuntimeState(opts = {}) { return this.req('/api/runtime-state', opts); },
+  getRuntimeState(paramsOrOpts = {}, opts = {}) {
+    const input = paramsOrOpts && typeof paramsOrOpts === 'object' ? paramsOrOpts : {};
+    const runtimeKeys = ['scope', 'revision', 'activity_cursor', 'include_skip'];
+    const hasRuntimeParams = runtimeKeys.some(key => Object.prototype.hasOwnProperty.call(input, key));
+
+    // 兼容旧调用 API.getRuntimeState({ silent: true })，同时支持新的 scope 增量协议。
+    const params = hasRuntimeParams ? input : {};
+    const requestOpts = hasRuntimeParams ? { ...opts } : { ...input, ...opts };
+    if (hasRuntimeParams && Object.prototype.hasOwnProperty.call(input, 'silent')) {
+      requestOpts.silent = input.silent;
+    }
+    const search = new URLSearchParams();
+    runtimeKeys.forEach(key => {
+      const value = params[key];
+      if (value !== undefined && value !== null && value !== '') search.set(key, String(value));
+    });
+    const query = search.toString();
+    return this.req(`/api/runtime-state${query ? `?${query}` : ''}`, requestOpts);
+  },
   getLiveRequests(opts = {}) { return this.req('/api/live-requests', opts); },
   cancelLiveRequest(requestId) { return this.req(`/api/live-requests/${encodeURIComponent(requestId)}/cancel`, { method: 'POST' }); },
   diagnoseRequest(requestId, opts = {}) { return this.req(`/api/diagnose/${encodeURIComponent(requestId)}`, opts); },

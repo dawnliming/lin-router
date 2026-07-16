@@ -127,8 +127,25 @@ def handle_get(handler: Any) -> None:
     if parsed.path == "/api/runtime-state":
         params = parse_qs(parsed.query)
         include_skip = str((params.get("include_skip") or params.get("debug") or [""])[0] or "").lower() in {"1", "true", "yes", "on"}
-        payload = handler._runtime_state_payload(include_skip=include_skip)
-        payload["live_requests"] = handler.router.live_requests_payload().get("requests", [])
+        scope = str((params.get("scope") or [""])[0] or "").strip().lower()
+        if scope not in {"", "dashboard", "config"}:
+            handler._send_json({
+                "error": {
+                    "message": "运行态刷新范围无效，仅支持 dashboard 或 config",
+                    "type": "invalid_request_error",
+                    "code": "invalid_runtime_scope",
+                }
+            }, status=400)
+            return
+        payload = handler._runtime_state_payload(
+            include_skip=include_skip,
+            scope=scope,
+            revision=str((params.get("revision") or [""])[0] or ""),
+            activity_cursor=str((params.get("activity_cursor") or [""])[0] or ""),
+        )
+        # 无 scope 的旧调用保留原有完整 shape，避免旧管理台/脚本升级时断裂。
+        if not scope:
+            payload["live_requests"] = handler.router.live_requests_payload().get("requests", [])
         handler._send_json(payload)
         return
     if parsed.path == "/api/live-requests":

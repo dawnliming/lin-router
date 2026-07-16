@@ -12,6 +12,11 @@ const LogsTab = {
   _detailEventsBound: false,
   _currentOnlySelectionKey: '',
   _allCurrentOnlyLogs: null,
+  _refreshInFlight: null,
+  _refreshFailures: 0,
+  _nextAutoRefreshAt: 0,
+  _visibilityHandler: null,
+  REFRESH_BACKOFF_INTERVALS: [5000, 10000, 30000],
 
   refresh() {
     const panel = document.getElementById('panel-logs');
@@ -99,9 +104,11 @@ const LogsTab = {
       </div>
     `;
     this.attachEvents(panel);
+    this.bindVisibility();
     this._lastRenderSignature = '';
     this._detailEventsBound = false;
-    this.manualRefresh();
+    // 隐藏页不启动自动日志请求，恢复可见后由 visibilitychange 补一次。
+    if (!document.hidden) this.manualRefresh();
     this.startAutoRefresh();
   },
 
@@ -140,6 +147,7 @@ const LogsTab = {
   startAutoRefresh() {
     this.stopAutoRefresh();
     if (!this.autoRefresh) return;
+    this.bindVisibility();
     this.refreshTimer = setInterval(() => this.autoRefreshTick(), this.REFRESH_INTERVAL);
   },
 
@@ -148,6 +156,21 @@ const LogsTab = {
       clearInterval(this.refreshTimer);
       this.refreshTimer = null;
     }
+  },
+
+  bindVisibility() {
+    if (this._visibilityHandler || typeof document === 'undefined') return;
+    this._visibilityHandler = () => {
+      if (document.hidden || !this.autoRefresh || Tabs.current !== 'logs') return;
+      // 页面恢复时只补一次，正在进行的刷新由 single-flight 复用，不会重复发请求。
+      this.autoRefreshTick(true);
+    };
+    document.addEventListener('visibilitychange', this._visibilityHandler);
+  },
+
+  refreshBackoffDelay() {
+    const index = Math.min(Math.max(this._refreshFailures - 1, 0), this.REFRESH_BACKOFF_INTERVALS.length - 1);
+    return this.REFRESH_BACKOFF_INTERVALS[index];
   },
 
   currentOnlySelectionKey() {
@@ -193,24 +216,44 @@ const LogsTab = {
     return true;
   },
 
-  async autoRefreshTick() {
-    if (!this.autoRefresh) return;
+  async autoRefreshTick(force = false) {
+    if (!this.autoRefresh || document.hidden) return;
     // 只在当前是 logs tab 时刷新
     if (Tabs.current !== 'logs') return;
+    if (this._refreshInFlight || (!force && this._nextAutoRefreshAt > Date.now())) return;
     // 自动刷新使用静默模式，不触发全局 loading 遮罩
-    await this.manualRefresh(true);
+    const ok = await this.manualRefresh(true);
+    if (ok) {
+      this._refreshFailures = 0;
+      this._nextAutoRefreshAt = 0;
+    } else {
+      this._refreshFailures += 1;
+      this._nextAutoRefreshAt = Date.now() + this.refreshBackoffDelay();
+    }
   },
 
   async manualRefresh(silent = false) {
+    if (silent && document.hidden) return false;
+    if (this._refreshInFlight) return this._refreshInFlight;
+    const request = this._manualRefresh(silent);
+    this._refreshInFlight = request;
+    request.then(
+      () => { if (this._refreshInFlight === request) this._refreshInFlight = null; },
+      () => { if (this._refreshInFlight === request) this._refreshInFlight = null; },
+    );
+    return request;
+  },
+
+  async _manualRefresh(silent = false) {
     this.syncCurrentOnlySelection();
-    if (silent && this.page !== 0) return;
+    if (silent && this.page !== 0) return true;
     if (this.hasCurrentOnlyGroupConflict()) {
       this._allCurrentOnlyLogs = null;
       this.total = 0;
       Store.update({ logs: [] });
       this.renderRows(true);
       this.renderPagination();
-      return;
+      return true;
     }
     try {
       if (this.shouldUseLocalCurrentOnlyPagination()) {
@@ -243,14 +286,16 @@ const LogsTab = {
         const data = await API.getLogs(params, { silent });
         this._allCurrentOnlyLogs = null;
         this.total = Number(data.total || 0);
-        if (this.syncPageToTotal()) return this.manualRefresh(silent);
+        if (this.syncPageToTotal()) return this._manualRefresh(silent);
         Store.update({ logs: data.logs || [] });
       }
       this.renderRows(true);
       this.renderPagination();
+      return true;
     } catch (err) {
       if (!silent) Toast.error('刷新失败：' + err.message);
       console.error('日志刷新失败', err);
+      return false;
     }
   },
 
@@ -387,6 +432,8 @@ const LogsTab = {
       stream_idle_timeout: '流式超时',
       client_disconnected: '客户端断开',
       manual_cancelled: '客户端已取消',
+      interrupted: '服务重启后中断',
+      stream_interrupted_after_restart: '服务重启后中断',
     };
     if (map[finalResult]) return map[finalResult];
     if (['response.completed', '[done]', 'eof'].includes(completionSignal)) return '流式完成';
@@ -408,7 +455,7 @@ const LogsTab = {
 
   isExplicitFailureTerminal(item, parsed) {
     const lifecycle = this.finalLifecycle(parsed);
-    if (['stream_failed', 'stream_incomplete', 'stream_idle_timeout', 'client_disconnected', 'manual_cancelled', 'cancelled'].includes(lifecycle)) return true;
+    if (['stream_failed', 'stream_incomplete', 'stream_idle_timeout', 'client_disconnected', 'manual_cancelled', 'cancelled', 'interrupted', 'stream_interrupted_after_restart'].includes(lifecycle)) return true;
     if (['response.failed', 'response.incomplete'].includes(String(parsed.completion_signal || '').toLowerCase())) return true;
     const event = String(item?.event || '').toLowerCase();
     return ['stream_timeout', 'stream_protocol_error', 'stream_disconnected_before_completion', 'request_cancelled'].includes(event);
@@ -499,6 +546,7 @@ const LogsTab = {
       stream_failed: '流式失败',
       stream_incomplete: '流式不完整',
       client_disconnected: '客户端断开',
+      interrupted: '服务重启后中断',
     };
     return map[value] || value || '-';
   },
@@ -736,6 +784,7 @@ const LogsTab = {
       if (parsed.final_result === 'client_disconnected') return '客户端已断开连接';
       return '首完整帧成功，流式响应仍在进行';
     }
+    if (event === 'stream_interrupted') return '服务重启时未收到流终态，已标记为中断';
     if (event === 'stream_done' || event === 'stream_finalized') return '流式响应已完成';
     if (event === 'client_disconnected') return '客户端已断开连接';
     if (event === 'serial_protection_timeout') return '该连接组已开启串行保护，候选忙后已切换';
@@ -888,6 +937,9 @@ const LogsTab = {
     }
     if (lifecycle === 'stream_incomplete') {
       return { className: 'warning', title: '上游流式响应不完整', scope: 'upstream', cooldown: '否', suggestion: '上游已明确返回不完整终态；已保留已收到的流内容，不会混入其他候选。' };
+    }
+    if (lifecycle === 'interrupted' || lifecycle === 'stream_interrupted_after_restart') {
+      return { className: 'info', title: '服务重启后流已中断', scope: 'process_restart', cooldown: '否', suggestion: '重启前未收到流终态，记录已安全恢复为中断状态；不会被当作实时请求或成功响应。' };
     }
     if (lifecycle === 'stream_idle_timeout' || String(item.event || '') === 'stream_timeout') {
       return { className: 'danger', title: '上游流式响应空闲超时', scope: 'upstream', cooldown: item.cooldown_applied ? '是' : '可能', suggestion: '建议稍后重试，或对冷却中的单个模型/成员点击“重试恢复”。' };

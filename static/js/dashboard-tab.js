@@ -948,7 +948,8 @@ const DashboardTab = {
       try {
         const result = await API.cancelLiveRequest(btn.dataset.requestId);
         Toast.success(result.message || '已发送终止指令，正在释放本地请求资源…');
-        await API.getRuntimeState({ silent: true }).then(data => Store.update({ live_requests: data.live_requests || [] }));
+        // 取消后仍走 dashboard scope，复用 revision/activity cursor，避免旧全量接口覆盖近期活动。
+        await App.refreshRuntimeState('dashboard', { background: false, silent: true });
       } catch (err) {
         btn.disabled = false;
         btn.removeAttribute('aria-busy');

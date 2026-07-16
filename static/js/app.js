@@ -2,6 +2,16 @@ const App = {
   theme: 'system',
   _lastSelectionKey: '',
   _runtimeRefreshTimer: null,
+  _runtimeRefreshActiveScope: '',
+  _runtimeVisibilityHandler: null,
+  _runtimeRefreshStates: {
+    dashboard: { revision: '', activityCursor: '', inFlight: null, nextPollAt: 0, failures: 0 },
+    config: { revision: '', activityCursor: '', inFlight: null, nextPollAt: 0, failures: 0 },
+  },
+  RUNTIME_IDLE_INTERVAL: 5000,
+  RUNTIME_LIVE_INTERVAL: 1000,
+  RUNTIME_BACKOFF_INTERVALS: [5000, 10000, 30000],
+  RUNTIME_ACTIVITY_LIMIT: 30,
 
   async init() {
     this.renderTopbar();
@@ -45,31 +55,159 @@ const App = {
 
   startRuntimeRefresh() {
     if (this._runtimeRefreshTimer) clearInterval(this._runtimeRefreshTimer);
-    this._runtimeRefreshTimer = setInterval(() => this.refreshRuntimeState(), 1000);
+    this._bindRuntimeVisibility();
+    this._runtimeRefreshActiveScope = '';
+    // 计时器只负责检查当前 Tab；实际请求由 nextPollAt 控制，避免固定 1 秒全量拉取。
+    this._runtimeRefreshTimer = setInterval(() => this._runtimeRefreshTick(), 1000);
+    this._runtimeRefreshTick();
   },
 
-  async refreshRuntimeState() {
+  _bindRuntimeVisibility() {
+    if (this._runtimeVisibilityHandler || typeof document === 'undefined') return;
+    this._runtimeVisibilityHandler = () => this._onRuntimeVisibilityChange();
+    document.addEventListener('visibilitychange', this._runtimeVisibilityHandler);
+  },
+
+  _onRuntimeVisibilityChange() {
+    if (document.hidden) {
+      if (this._runtimeRefreshTimer) clearInterval(this._runtimeRefreshTimer);
+      this._runtimeRefreshTimer = null;
+      return;
+    }
+    if (!this._runtimeRefreshTimer) {
+      this._runtimeRefreshTimer = setInterval(() => this._runtimeRefreshTick(), 1000);
+    }
+    // 恢复可见后只立即补一次；后续仍由成功间隔或错误退避控制。
+    this._runtimeRefreshActiveScope = '';
+    this._runtimeRefreshTick(true);
+  },
+
+  _runtimeScopeForCurrentTab() {
+    return ['dashboard', 'config'].includes(Tabs.current) ? Tabs.current : '';
+  },
+
+  _runtimeStateFor(scope) {
+    return this._runtimeRefreshStates[scope] || null;
+  },
+
+  _runtimeRefreshTick(force = false) {
     if (document.hidden) return;
-    if (!['dashboard', 'config', 'logs'].includes(Tabs.current)) return;
+    const scope = this._runtimeScopeForCurrentTab();
+    if (!scope) {
+      this._runtimeRefreshActiveScope = '';
+      return;
+    }
+    const state = this._runtimeStateFor(scope);
+    const scopeChanged = this._runtimeRefreshActiveScope !== scope;
+    if (scopeChanged) {
+      this._runtimeRefreshActiveScope = scope;
+      state.nextPollAt = 0;
+    }
+    if (state.inFlight || (!force && state.nextPollAt > Date.now())) return;
+    this.refreshRuntimeState(scope, { background: true, silent: true });
+  },
+
+  _hasRuntimeField(payload, field) {
+    return Object.prototype.hasOwnProperty.call(payload || {}, field);
+  },
+
+  _runtimePayload(data) {
+    // 过渡期间允许服务端把运行态包在 state 内；顶层新协议优先，避免覆盖 scope/revision。
+    const nested = data?.state && typeof data.state === 'object' && !Array.isArray(data.state) ? data.state : {};
+    return { ...nested, ...(data || {}) };
+  },
+
+  _mergeRuntimeItems(current, runtimeItems, currentId, runtimeId) {
+    const byId = new Map(runtimeItems.map(item => [item[runtimeId], item]));
+    return (current || []).map(item => byId.has(item[currentId]) ? { ...item, ...byId.get(item[currentId]) } : item);
+  },
+
+  _runtimeActivityKey(item) {
+    return [
+      item?.request_id || '', item?.attempt || 0, item?.time || '', item?.aggregate_member_id || '',
+      item?.selected_model || item?.model || '', item?.fallback_index || 0,
+    ].join('|');
+  },
+
+  _mergeRuntimeActivity(previous, activity) {
+    const incoming = Array.isArray(activity?.logs) ? activity.logs : [];
+    if (activity?.mode !== 'delta') return incoming.slice(0, this.RUNTIME_ACTIVITY_LIMIT);
+    const seen = new Set(incoming.map(item => this._runtimeActivityKey(item)));
+    // delta 只包含变化项，保留之前的近期活动；同一请求的终态会覆盖旧快照。
+    return [...incoming, ...(previous || []).filter(item => !seen.has(this._runtimeActivityKey(item)))]
+      .slice(0, this.RUNTIME_ACTIVITY_LIMIT);
+  },
+
+  _runtimePollDelay(scope, payload) {
+    const hasLiveRequests = Array.isArray(payload?.live_requests)
+      ? payload.live_requests.length > 0
+      : (Store.state.live_requests || []).length > 0;
+    // next_poll_ms 仅接受本期已定义的两个档位，防止异常服务端值突破页面刷新上限。
+    const expected = scope === 'dashboard' && hasLiveRequests ? this.RUNTIME_LIVE_INTERVAL : this.RUNTIME_IDLE_INTERVAL;
+    const hint = Number(payload?.next_poll_ms);
+    return hint === expected ? hint : expected;
+  },
+
+  _runtimeBackoffDelay(failures) {
+    const index = Math.min(Math.max(failures - 1, 0), this.RUNTIME_BACKOFF_INTERVALS.length - 1);
+    return this.RUNTIME_BACKOFF_INTERVALS[index];
+  },
+
+  applyRuntimeState(data, scope) {
+    const payload = this._runtimePayload(data);
+    const state = this._runtimeStateFor(scope);
+    const patch = {};
+    if (Array.isArray(payload.models)) {
+      patch.models = this._mergeRuntimeItems(Store.state.models, payload.models, 'id', 'model_id');
+    }
+    if (Array.isArray(payload.aggregate_members)) {
+      patch.aggregate_members = this._mergeRuntimeItems(Store.state.aggregate_members, payload.aggregate_members, 'id', 'member_id');
+    }
+    if (Array.isArray(payload.live_requests)) patch.live_requests = payload.live_requests;
+    if (this._hasRuntimeField(payload, 'log_write_error')) patch.log_write_error = payload.log_write_error || '';
+
+    if (scope === 'dashboard') {
+      if (payload.activity && this._hasRuntimeField(payload.activity, 'logs')) {
+        patch.logs = this._mergeRuntimeActivity(Store.state.logs, payload.activity);
+      } else if (!payload.activity && Array.isArray(payload.logs)) {
+        // 旧服务端尚未支持 activity 时，维持首页最近活动的兼容展示。
+        patch.logs = payload.logs;
+      }
+      const activityCursor = this._hasRuntimeField(payload.activity, 'cursor')
+        ? payload.activity.cursor
+        : payload.activity_cursor;
+      if (activityCursor !== undefined && activityCursor !== null) state.activityCursor = String(activityCursor);
+    }
+
+    const revision = payload.runtime_revision ?? payload.revision;
+    if (revision !== undefined && revision !== null) state.revision = String(revision);
+    if (Object.keys(patch).length) Store.update(patch);
+    return payload;
+  },
+
+  async refreshRuntimeState(scope = this._runtimeScopeForCurrentTab(), options = {}) {
+    if (!scope || !this._runtimeStateFor(scope)) return null;
+    const state = this._runtimeStateFor(scope);
+    if (state.inFlight) return state.inFlight;
+    const params = { scope };
+    if (state.revision) params.revision = state.revision;
+    if (scope === 'dashboard' && state.activityCursor) params.activity_cursor = state.activityCursor;
+    const request = API.getRuntimeState(params, { silent: options.silent !== false });
+    state.inFlight = request;
     try {
-      const data = await API.getRuntimeState({ silent: true });
-      const patch = {
-        log_write_error: data.log_write_error || '',
-        live_requests: data.live_requests || [],
-      };
-      if (Tabs.current !== 'logs') patch.logs = data.logs || Store.state.logs || [];
-      if (data.models) {
-        const runtimeById = new Map(data.models.map(item => [item.model_id, item]));
-        patch.models = (Store.state.models || []).map(model => runtimeById.has(model.id) ? { ...model, ...runtimeById.get(model.id) } : model);
-      }
-      if (data.aggregate_members) {
-        const runtimeById = new Map(data.aggregate_members.map(item => [item.member_id, item]));
-        patch.aggregate_members = (Store.state.aggregate_members || []).map(member => runtimeById.has(member.id) ? { ...member, ...runtimeById.get(member.id) } : member);
-      }
-      Store.update(patch);
-      if (Tabs.current === 'logs') LogsTab.renderRows(true);
+      const data = await request;
+      const payload = this.applyRuntimeState(data, scope);
+      state.failures = 0;
+      state.nextPollAt = Date.now() + this._runtimePollDelay(scope, payload);
+      return data;
     } catch (err) {
+      state.failures += 1;
+      state.nextPollAt = Date.now() + this._runtimeBackoffDelay(state.failures);
+      if (!options.background) throw err;
       console.warn('运行态刷新失败', err);
+      return null;
+    } finally {
+      if (state.inFlight === request) state.inFlight = null;
     }
   },
 

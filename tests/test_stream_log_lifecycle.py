@@ -170,6 +170,34 @@ def test_unfinalized_stream_is_patched_as_client_disconnected():
         assert "final_result=client_disconnected" in item.detail
 
 
+def test_restart_recovers_persisted_streaming_log_without_fabricating_success(tmp_path):
+    log_file = tmp_path / "logs.jsonl"
+    log_file.write_text(json.dumps({
+        "time": "2026-07-15 12:00:00", "path": "/v1/responses", "model": "candidate",
+        "status": "streaming", "detail": "stream_started_at_ms=1; final_result=streaming",
+        "event": "stream_ok", "request_id": "orphaned-stream", "attempt": 1,
+    }) + "\n", encoding="utf-8")
+    config_path = tmp_path / "config.json"
+    write_config(config_path)
+
+    recovered = ArkProxyRouter(ConfigStore(config_path), settings_store=None, log_file=log_file)
+    assert recovered.live_requests_payload()["count"] == 0
+    item = next(log for log in recovered.logs if log.request_id == "orphaned-stream")
+    assert item.status == "interrupted"
+    assert item.status != "200"
+    assert item.event == "stream_interrupted"
+    assert item.usage_source == "stream_recovered"
+    assert item.failure_scope == "process_restart"
+    assert "lifecycle=stream_interrupted_after_restart" in item.detail
+    assert "final_result=interrupted" in item.detail
+    assert "recovery=recovered_after_restart" in item.detail
+
+    restarted = ArkProxyRouter(ConfigStore(config_path), settings_store=None, log_file=log_file)
+    persisted = next(log for log in restarted.logs if log.request_id == "orphaned-stream")
+    assert persisted.status == "interrupted"
+    assert persisted.detail.count("recovery=recovered_after_restart") == 1
+
+
 def test_finished_stream_keeps_one_primary_log_with_first_byte_and_usage():
     upstream = ThreadingHTTPServer(("127.0.0.1", get_free_port()), FinishedStreamHandler)
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
