@@ -42,9 +42,20 @@ def signing_env(tmp_path: Path) -> dict[str, str]:
         (signing.PASSWORD_ENV, "PFX 密码"),
     ],
 )
-def test_explicit_signing_requires_every_input(tmp_path: Path, missing: str, expected: str) -> None:
+def test_explicit_signing_requires_every_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    missing: str,
+    expected: str,
+) -> None:
     env = signing_env(tmp_path)
     env.pop(missing)
+
+    # Hosted Linux runner may happen to expose an unrelated signtool command.
+    # This case verifies the configured-input error path, not host autodiscovery.
+    if missing == signing.SIGNTOOL_ENV:
+        monkeypatch.setattr(signing.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(signing, "_find_windows_sdk_signtool", lambda: None)
 
     with pytest.raises(signing.SigningConfigError, match=expected):
         signing.validate_signing_config(env=env)
