@@ -159,6 +159,10 @@ run_release_guard() {
 }
 
 find_inno_compiler() {
+  if [[ "${LINROUTER_FORCE_SELF_INSTALLER:-}" == "1" ]]; then
+    return 1
+  fi
+
   if command -v iscc >/dev/null 2>&1; then
     command -v iscc
     return 0

@@ -1,0 +1,165 @@
+name: package
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build, like v0.6.3. Leave empty to use the latest tag.
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            tag="$INPUT_TAG"
+          elif [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="$(git describe --tags --abbrev=0)"
+          fi
+          if ! git rev-parse -q --verify "${tag}^{commit}" >/dev/null 2>&1; then
+            echo "找不到要构建的 tag：$tag" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: package (${{ matrix.os }})
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: win32
+            build_args: --installer
+            artifact_name: linrouter-windows
+          - os: macos-14
+            target: darwin
+            build_args: --dmg
+            artifact_name: linrouter-macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Force self-installer on Windows
+        if: matrix.target == 'win32'
+        shell: bash
+        run: echo "LINROUTER_FORCE_SELF_INSTALLER=1" >> "$GITHUB_ENV"
+
+      - name: Resolve version
+        run: echo "Using version ${{ needs.resolve.outputs.version }}"
+
+      - name: Build package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/build.sh \
+            --target "${{ matrix.target }}" \
+            ${{ matrix.build_args }} \
+            --version "${{ needs.resolve.outputs.version }}"
+
+      - name: Validate Windows release artifacts
+        if: matrix.target == 'win32'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/release_guard.py \
+            "dist/LinRouter-v${{ needs.resolve.outputs.version }}-win-x64.zip" \
+            "dist/LinRouter-Setup-v${{ needs.resolve.outputs.version }}-win-x64.exe"
+
+      - name: Upload Windows artifact
+        if: matrix.target == 'win32'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-v${{ needs.resolve.outputs.version }}
+          if-no-files-found: error
+          path: |
+            dist/LinRouter_windows.exe
+            dist/LinRouter-v${{ needs.resolve.outputs.version }}-win-x64.zip
+            dist/LinRouter-Setup-v${{ needs.resolve.outputs.version }}-win-x64.exe
+
+      - name: Upload macOS artifact
+        if: matrix.target == 'darwin'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-v${{ needs.resolve.outputs.version }}
+          if-no-files-found: error
+          path: |
+            dist/LinRouter.app
+            dist/LinRouter.dmg
+
+  release:
+    name: GitHub Release
+    needs: [resolve, build]
+    if: startsWith(needs.resolve.outputs.tag, 'v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linrouter-windows-v${{ needs.resolve.outputs.version }}
+          path: release/windows
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linrouter-macos-v${{ needs.resolve.outputs.version }}
+          path: release/macos
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: LinRouter v${{ needs.resolve.outputs.version }}
+          generate_release_notes: true
+          files: |
+            release/windows/LinRouter_windows.exe
+            release/windows/LinRouter-v${{ needs.resolve.outputs.version }}-win-x64.zip
+            release/windows/LinRouter-Setup-v${{ needs.resolve.outputs.version }}-win-x64.exe
+            release/macos/LinRouter.app
+            release/macos/LinRouter.dmg
