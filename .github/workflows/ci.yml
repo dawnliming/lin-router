@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify source and tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 冻结契约测试会读取历史基线提交，浅克隆会使这些测试误失败。
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Check changed diff whitespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 仓库历史中存在 CRLF Python 文件；保留行尾 CR，仍检查其余空白错误。
+          git -c core.whitespace=cr-at-eol diff --check HEAD^ HEAD
+
+      - name: Check Python, JavaScript and build script syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q app.py linrouter_core
+          find static/js -type f -name '*.js' -print0 | xargs -0 -n1 node --check
+          bash -n scripts/build.sh
+
+      - name: Run test suite
+        shell: bash
+        run: python -m pytest -q -p no:cacheprovider
+
+  package_windows_preview:
+    name: Build Windows preview package
+    needs: verify
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build unsigned Windows preview package
+        shell: bash
+        env:
+          LINROUTER_FORCE_SELF_INSTALLER: "1"
+        run: |
+          set -euo pipefail
+          bash scripts/build.sh \
+            --target win32 \
+            --installer \
+            --version "0.0.0-ci.${{ github.run_number }}"
+
+      - name: Upload Windows preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linrouter-windows-ci-${{ github.run_id }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            dist/LinRouter_windows.exe
+            dist/LinRouter-v0.0.0-ci.${{ github.run_number }}-win-x64.zip
+            dist/LinRouter-Setup-v0.0.0-ci.${{ github.run_number }}-win-x64.exe

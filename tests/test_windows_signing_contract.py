@@ -42,9 +42,20 @@ def signing_env(tmp_path: Path) -> dict[str, str]:
         (signing.PASSWORD_ENV, "PFX 密码"),
     ],
 )
-def test_explicit_signing_requires_every_input(tmp_path: Path, missing: str, expected: str) -> None:
+def test_explicit_signing_requires_every_input(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    missing: str,
+    expected: str,
+) -> None:
     env = signing_env(tmp_path)
     env.pop(missing)
+
+    # Hosted Linux runner may happen to expose an unrelated signtool command.
+    # This case verifies the configured-input error path, not host autodiscovery.
+    if missing == signing.SIGNTOOL_ENV:
+        monkeypatch.setattr(signing.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(signing, "_find_windows_sdk_signtool", lambda: None)
 
     with pytest.raises(signing.SigningConfigError, match=expected):
         signing.validate_signing_config(env=env)
@@ -112,3 +123,12 @@ def test_build_script_signs_payload_before_packaging_and_installer_afterwards() 
     assert script.index('echo "Windows 安装包构建完成：$output_file"', installer_function_position) < installer_sign_position
     assert "--sign" in script
     assert 'if [[ "$SIGN_WINDOWS" != "1" ]]; then' in script
+
+
+def test_build_script_can_force_self_installer_for_hosted_ci() -> None:
+    script = (ROOT / "scripts" / "build.sh").read_text(encoding="utf-8")
+
+    assert '"${LINROUTER_FORCE_SELF_INSTALLER:-}" == "1"' in script
+    force_position = script.index('"${LINROUTER_FORCE_SELF_INSTALLER:-}" == "1"')
+    compiler_lookup_position = script.index('command -v iscc', force_position)
+    assert force_position < compiler_lookup_position
