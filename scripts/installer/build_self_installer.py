@@ -239,8 +239,14 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--project-root", default=str(Path(__file__).resolve().parents[2]))
     args = parser.parse_args()
+    if sys.platform.startswith("win32"):
+        for stream in (sys.stdout, sys.stderr):
+          try:
+              stream.reconfigure(encoding="utf-8")
+          except Exception:
+              pass
     build_installer(Path(args.source_exe).resolve(), Path(args.output).resolve(), Path(args.project_root).resolve())
-    print(f"Windows 安装包构建完成：{Path(args.output).resolve()}")
+    print(f"Windows installer build complete: {Path(args.output).resolve()}")
     return 0
 
 
