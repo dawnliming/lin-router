@@ -79,6 +79,15 @@ const SettingsPanel = {
           </section>
 
           <section class="settings-section">
+            <h3>路由保护</h3>
+            <label class="settings-row">
+              <span>智能熔断</span>
+              <input id="setting-smart-breaker-enabled" type="checkbox" ${s.smart_breaker_enabled !== false ? 'checked' : ''}>
+            </label>
+            <div class="settings-hint">连续上游故障前 3 次仅记录并切换候选，第 4 次起逐级冷却，最高 5 分钟。关闭会停止全部连接组和聚合模型的熔断策略并清理自动健康状态，不会启用手动停用对象。</div>
+          </section>
+
+          <section class="settings-section">
             <h3>实验功能</h3>
             <div class="settings-row">
               <span>上游 HTTP 客户端</span>
@@ -167,6 +176,7 @@ const SettingsPanel = {
     panel.querySelector('#setting-start-minimized')?.addEventListener('change', e => this.updateCheckboxSetting(e, 'start_minimized'));
     panel.querySelector('#setting-auto-refresh-logs')?.addEventListener('change', e => this.updateCheckboxSetting(e, 'auto_refresh_logs'));
     panel.querySelector('#setting-debug-mode')?.addEventListener('change', e => this.updateCheckboxSetting(e, 'debug_mode'));
+    panel.querySelector('#setting-smart-breaker-enabled')?.addEventListener('change', e => this.updateSmartBreakerSetting(e));
 
     panel.querySelectorAll('input[name="setting-theme"]').forEach(radio => {
       radio.addEventListener('change', e => {
@@ -283,6 +293,27 @@ const SettingsPanel = {
     this.updateSetting(key, !!input.checked);
   },
 
+  async updateSmartBreakerSetting(event) {
+    event.stopPropagation();
+    const input = event.currentTarget || event.target;
+    if (!input || input.disabled) return;
+    if (input.checked) {
+      this.updateSetting('smart_breaker_enabled', true);
+      return;
+    }
+    const confirmed = await Modal.confirm({
+      title: '关闭智能熔断',
+      message: '关闭后会停止全部连接组和聚合模型的熔断策略，并立即清理系统健康状态和冷却记录，但不会改变手动停用对象。是否继续？',
+      confirmText: '确定关闭',
+      confirmClass: 'btn-danger',
+    });
+    if (!confirmed) {
+      input.checked = true;
+      return;
+    }
+    this.updateSetting('smart_breaker_enabled', false);
+  },
+
   applySettingSideEffects(key, value) {
     if (key === 'auto_refresh_logs') {
       LogsTab.setAutoRefresh(value);
@@ -305,6 +336,7 @@ const SettingsPanel = {
       'setting-start-minimized': !!s.start_minimized,
       'setting-auto-refresh-logs': s.auto_refresh_logs !== false,
       'setting-debug-mode': !!s.debug_mode,
+      'setting-smart-breaker-enabled': s.smart_breaker_enabled !== false,
       'setting-upstream-http2': !!s.upstream_http2,
       'setting-upstream-keepalive': !!s.upstream_keepalive,
       'setting-normalize-tools-order': !!s.normalize_tools_order,

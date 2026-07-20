@@ -359,7 +359,8 @@ def test_group_auto_500_cooldown_and_fallback():
         assert resp["choices"][0]["message"]["content"] == "ok"
 
         model1, model2 = store.models[0], store.models[1]
-        assert model1.cooldown_until > int(time.time()), "第一个模型应进入 cooldown"
+        assert model1.health_state == "observing", "第一个模型应进入观察态"
+        assert model1.consecutive_failures == 1
         assert model2.cooldown_until == 0, "第二个模型不应 cooldown"
         print("PASS: 连接组 auto 500 进入 cooldown 并成功 fallback")
     finally:
@@ -490,7 +491,8 @@ def test_aggregate_500_cooldown_and_fallback():
 
         member1 = next(m for m in store.aggregate_members if m.id == member1_id)
         member2 = next(m for m in store.aggregate_members if m.id == member2_id)
-        assert member1.cooldown_until > int(time.time()), "第一个成员应进入 cooldown"
+        assert member1.health_state == "observing", "第一个成员应进入观察态"
+        assert member1.consecutive_failures == 1
         assert member2.cooldown_until == 0, "第二个成员不应 cooldown"
         print("PASS: 聚合模型 500 进入 cooldown 并成功 fallback")
     finally:

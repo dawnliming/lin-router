@@ -36,7 +36,10 @@ class _PutHandler:
 class _LogsHandler:
     def __init__(self, logs: list[RequestLog]) -> None:
         self.path = "/api/logs?offset=1&limit=2"
-        self.router = SimpleNamespace(all_logs=lambda: logs)
+        self.router = SimpleNamespace(
+            all_logs=lambda: logs,
+            live_requests_payload=lambda: {"count": 1, "requests": [{"request_id": "request-2", "stage": "streaming"}]},
+        )
         self.response: dict[str, object] | None = None
 
     @staticmethod
@@ -75,3 +78,4 @@ def test_logs_api_reads_persisted_history_before_server_side_pagination() -> Non
     assert handler.response["offset"] == 1
     assert handler.response["limit"] == 2
     assert [item["request_id"] for item in handler.response["logs"]] == ["request-2", "request-1"]
+    assert handler.response["live_requests"] == [{"request_id": "request-2", "stage": "streaming"}]

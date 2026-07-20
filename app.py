@@ -256,7 +256,11 @@ class ArkProxyRouter:
             auth_for=self._auth_for,
             candidate_type=UpstreamCandidate,
             log_aggregate_member_skip=self._log_aggregate_member_skip,
-            breaker_enabled=lambda: bool(self.settings_store and self.settings_store.get("smart_breaker_enabled", False)),
+            breaker_enabled=lambda: (
+                True
+                if self.settings_store is None
+                else bool(self.settings_store.get("smart_breaker_enabled", True))
+            ),
         )
         # The compatibility facade only composes ports; execution loops are owned by CandidateRuntime.
         self.upstream_adapter = upstream_adapter or UpstreamAdapter(_ssl_context)
@@ -288,6 +292,7 @@ class ArkProxyRouter:
             mark_success=self._mark_success,
             mark_aggregate_success=self._mark_aggregate_member_success,
             mark_unusable=self._mark_unusable,
+            release_probe=self.candidate_health.release_probe,
         )
         preparation = RequestPreparationPort(
             resolve_url=self._resolve_url,
@@ -323,6 +328,7 @@ class ArkProxyRouter:
             add_log=self.add_log,
             patch_stream=self.patch_stream_lifecycle,
             cancellation_requested=self._cancellation_requested,
+            downstream_write_failed=self._downstream_write_failed,
             set_response=self._set_live_response,
             close_response=self._close_live_response,
         )
@@ -547,13 +553,16 @@ class ArkProxyRouter:
         except ValueError:
             started_at_ms = 0
         duration_ms = max(item.duration_ms, int(time.time() * 1000) - started_at_ms) if started_at_ms else item.duration_ms
+        downstream_write_failed = self.observability.downstream_write_failed(request_id)
         self.patch_stream_lifecycle(
             request_id, item.attempt, item.model,
             (item.prompt_tokens, item.completion_tokens, item.total_tokens, item.cached_tokens, item.reasoning_tokens),
-            "stream_incomplete", final_status="client_disconnected", lifecycle="client_disconnected",
-            final_result="client_disconnected", chunks_received=int(self._detail_value(item.detail, "chunks_received") or 1),
+            "stream_incomplete", final_status="downstream_disconnected" if downstream_write_failed else "client_disconnected",
+            lifecycle="downstream_write_failed" if downstream_write_failed else "client_disconnected",
+            final_result="downstream_write_failed" if downstream_write_failed else "client_disconnected", chunks_received=int(self._detail_value(item.detail, "chunks_received") or 1),
             bytes_received=int(self._detail_value(item.detail, "bytes_received") or 0), duration_ms=duration_ms,
-            lock_release_reason="client_disconnect", failure_scope="request",
+            lock_release_reason="downstream_write_failed" if downstream_write_failed else "client_disconnect",
+            failure_scope="downstream" if downstream_write_failed else "request",
         )
 
     def _rewrite_log_file(self) -> None:
@@ -1415,6 +1424,9 @@ class ArkProxyRouter:
     def _cancellation_requested(self, request_id: str) -> bool:
         return self.observability.cancellation_requested(request_id)
 
+    def _downstream_write_failed(self, request_id: str) -> bool:
+        return self.observability.downstream_write_failed(request_id)
+
     def is_live_request_cancelled(self, request_id: str) -> bool:
         return self.observability.cancellation_requested(request_id)
 
@@ -1572,11 +1584,30 @@ class ArkProxyRouter:
         model = self.store.find_model(model_id)
         if not model:
             return {"ok": False, "message": "模型不存在", "code": "model_not_found"}
-        if model.disabled_by_user or (not model.usable and not model.cooldown_until):
+        if model.disabled_by_user or (
+            not model.usable
+            and not model.cooldown_until
+            and model.health_state != "breaker_open"
+        ):
             return {"ok": False, "message": "该模型为手动停用状态，请先手动启用；系统不会自动恢复手动停用模型。", "code": "manual_disabled"}
         group = self.store.find_group(model.group_id)
         if not group:
             return {"ok": False, "message": "模型所属连接组不存在，无法执行探测。", "code": "group_not_found"}
+        policy_status = self.candidate_health.policy_status(model)
+        if not policy_status["smart_breaker_effective_enabled"]:
+            disabled_by = str(policy_status["smart_breaker_disabled_by"] or "")
+            scope_labels = {
+                "global": "全局",
+                "group": "连接组",
+            }
+            scope_label = scope_labels.get(disabled_by, "当前")
+            # 旧 DOM 或直接 API 请求不能绕过关闭后的模型级熔断策略发起上游探测。
+            return {
+                "ok": False,
+                "message": f"{scope_label}智能熔断已关闭，不能执行模型重试恢复。",
+                "code": "smart_breaker_disabled",
+                **policy_status,
+            }
         before = asdict(model)
         model.health_state = "half_open_probe"
         self.store.save()
@@ -1610,7 +1641,27 @@ class ArkProxyRouter:
         aggregate = self.store.find_aggregate(member.aggregate_id)
         if not model or not group:
             return {"ok": False, "message": "成员底层模型或连接组不存在，无法执行探测。", "code": "member_target_missing"}
-        if model.disabled_by_user or not model.usable and not model.cooldown_until:
+        policy_status = self.candidate_health.policy_status(member)
+        if not policy_status["smart_breaker_effective_enabled"]:
+            disabled_by = str(policy_status["smart_breaker_disabled_by"] or "")
+            scope_labels = {
+                "global": "全局",
+                "group": "连接组",
+                "aggregate": "聚合模型",
+            }
+            scope_label = scope_labels.get(disabled_by, "当前")
+            # 旧 DOM 或直接 API 请求也不能绕过关闭后的成员级熔断策略发起上游探测。
+            return {
+                "ok": False,
+                "message": f"{scope_label}智能熔断已关闭，不能执行聚合成员重试恢复。",
+                "code": "smart_breaker_disabled",
+                **policy_status,
+            }
+        if model.disabled_by_user or (
+            not model.usable
+            and not model.cooldown_until
+            and model.health_state != "breaker_open"
+        ):
             return {"ok": False, "message": "底层模型为手动停用状态，不能自动恢复聚合成员。", "code": "underlying_manual_disabled"}
         before = asdict(member)
         member.health_state = "half_open_probe"
@@ -2217,6 +2268,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             waf_accept_policy=source.waf_accept_policy,
             waf_client_mode=source.waf_client_mode,
             reasoning_support=source.reasoning_support,
+            smart_breaker_enabled=source.smart_breaker_enabled,
             upstream_models=[dict(item) for item in source.upstream_models],
             upstream_models_fetched_at=source.upstream_models_fetched_at,
         )
@@ -2492,13 +2544,32 @@ class RouterHandler(BaseHTTPRequestHandler):
         }
 
     def _model_runtime_item(self, model: ModelConfig) -> Dict[str, Any]:
-        now = int(time.time())
-        if model.cooldown_until and model.cooldown_until > now:
-            status = "cooling"
-            reason = model.cooldown_reason or "模型正在健康冷却"
-        elif model.usable is False and model.disabled_by_user:
+        health_state = self.router.candidate_health.runtime_health_state(model)
+        policy = self.router.candidate_health.policy_status(model)
+        disabled_by = str(policy["smart_breaker_disabled_by"] or "")
+        disabled_source = {
+            "global": "全局总开关",
+            "group": "连接组",
+            "aggregate": "聚合模型",
+        }.get(disabled_by, "策略配置")
+        if health_state == "manual_disabled" or (model.usable is False and model.disabled_by_user):
             status = "manual_disabled"
             reason = "用户已停用该模型"
+        elif not policy["smart_breaker_effective_enabled"]:
+            status = "breaker_policy_disabled"
+            reason = f"熔断保护已关闭（{disabled_source}）"
+        elif health_state == "breaker_open":
+            status = "breaker_open"
+            reason = model.breaker_reason or "模型已触发智能熔断"
+        elif health_state == "half_open_probe":
+            status = "half_open_probe"
+            reason = "模型正在执行唯一恢复探测"
+        elif health_state == "cooling":
+            status = "cooling"
+            reason = model.cooldown_reason or "模型正在健康冷却"
+        elif health_state == "observing":
+            status = "observing"
+            reason = model.last_error or "模型正在观察连续失败"
         elif model.usable is False:
             status = "unavailable"
             reason = model.last_error or "模型当前不可用"
@@ -2515,35 +2586,68 @@ class RouterHandler(BaseHTTPRequestHandler):
             "derived_reason": reason,
             "usable": model.usable,
             "disabled_by_user": model.disabled_by_user,
+            "health_state": health_state,
+            "consecutive_failures": model.consecutive_failures,
             "cooldown_until": model.cooldown_until,
             "cooldown_reason": model.cooldown_reason,
+            "breaker_until": model.breaker_until,
+            "breaker_reason": model.breaker_reason,
             "last_error": model.last_error,
             "last_success_at": getattr(model, "last_success_at", ""),
             "last_failure_at": getattr(model, "last_failure_at", ""),
+            **policy,
         }
 
     def _member_runtime_item(self, member: AggregateMember) -> Dict[str, Any]:
-        now = int(time.time())
         group = self.store.find_group(member.group_id)
         model = self.store.find_model(member.model_id)
+        health_state = self.router.candidate_health.runtime_health_state(member)
+        policy = self.router.candidate_health.policy_status(member)
+        disabled_by = str(policy["smart_breaker_disabled_by"] or "")
+        disabled_source = {
+            "global": "全局总开关",
+            "group": "连接组",
+            "aggregate": "聚合模型",
+        }.get(disabled_by, "策略配置")
         if member.enabled is False:
             status = "manual_disabled"
             reason = "用户已停用该聚合成员"
-        elif member.cooldown_until and member.cooldown_until > now:
-            status = "cooling"
-            reason = member.cooldown_reason or "聚合成员因上游健康失败短期冷却"
         elif not group:
             status = "config_error"
             reason = "底层连接组缺失"
         elif not model:
             status = "config_error"
             reason = "底层真实模型缺失"
+        elif not policy["smart_breaker_effective_enabled"]:
+            status = "breaker_policy_disabled"
+            reason = f"熔断保护已关闭（{disabled_source}）"
+        elif health_state == "breaker_open":
+            status = "breaker_open"
+            reason = member.breaker_reason or "聚合成员已触发智能熔断"
+        elif health_state == "half_open_probe":
+            status = "half_open_probe"
+            reason = "聚合成员正在执行唯一恢复探测"
+        elif health_state == "cooling":
+            status = "cooling"
+            reason = member.cooldown_reason or "聚合成员因上游健康失败短期冷却"
+        elif health_state == "observing":
+            status = "observing"
+            reason = member.last_error or "聚合成员正在观察连续失败"
         elif model.usable is False and model.disabled_by_user:
             status = "underlying_model_disabled"
             reason = "底层真实模型已手动停用"
-        elif model.cooldown_until and model.cooldown_until > now:
+        elif self.router.candidate_health.runtime_health_state(model) == "breaker_open":
+            status = "underlying_model_breaker_open"
+            reason = model.breaker_reason or "底层真实模型已触发智能熔断"
+        elif self.router.candidate_health.runtime_health_state(model) == "half_open_probe":
+            status = "underlying_model_half_open_probe"
+            reason = "底层真实模型正在执行唯一恢复探测"
+        elif self.router.candidate_health.runtime_health_state(model) == "cooling":
             status = "underlying_model_cooling"
             reason = model.cooldown_reason or "底层真实模型正在冷却"
+        elif self.router.candidate_health.runtime_health_state(model) == "observing":
+            status = "underlying_model_observing"
+            reason = model.last_error or "底层真实模型正在观察连续失败"
         elif member.last_error:
             status = "warning"
             reason = member.last_error
@@ -2556,12 +2660,17 @@ class RouterHandler(BaseHTTPRequestHandler):
             "derived_status": status,
             "derived_reason": reason,
             "enabled": member.enabled,
+            "health_state": health_state,
+            "consecutive_failures": member.consecutive_failures,
             "cooldown_until": member.cooldown_until,
             "cooldown_reason": member.cooldown_reason,
+            "breaker_until": member.breaker_until,
+            "breaker_reason": member.breaker_reason,
             "last_error": member.last_error,
             "last_success_at": getattr(member, "last_success_at", ""),
             "last_failure_at": getattr(member, "last_failure_at", ""),
             "underlying_model_status": self._model_runtime_item(model)["derived_status"] if model else "missing",
+            **policy,
         }
 
     def _filtered_recent_logs(self, include_skip: bool = False) -> List[RequestLog]:

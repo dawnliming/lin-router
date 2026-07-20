@@ -21,6 +21,26 @@ const ConfigTabRuntimeView = {
         const status = controller.aggregateMemberStatus(member, Store.getModel(member.model_id));
         const next = `<span data-aggregate-member-status="${member.id}" class="pill ${status.class}" title="${Utils.escapeHtml(status.title)}">${status.text}</span>`;
         if (cell.innerHTML !== next) cell.innerHTML = next;
+        const actions = document.querySelector(`[data-member-actions="${member.id}"]`);
+        const actionButtons = actions?.querySelector('.aggregate-member-action-buttons');
+        const recover = actionButtons?.querySelector('[data-action="recover"]');
+        const healthState = member.derived_status || member.health_state || 'normal';
+        const canRecover = member.enabled !== false
+          && member.smart_breaker_effective_enabled !== false
+          && member.derived_status !== 'breaker_policy_disabled'
+          && ['cooling', 'breaker_open'].includes(healthState);
+        if (!canRecover && recover) {
+          recover.remove();
+        } else if (canRecover && !recover && actionButtons) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'btn-recover btn-sm';
+          button.dataset.action = 'recover';
+          button.dataset.memberId = member.id;
+          button.textContent = '重试恢复';
+          button.addEventListener('click', () => controller.onRecoverAggregateMember(member.id));
+          actionButtons.insertBefore(button, actionButtons.querySelector('[data-action="up"]'));
+        }
       });
     }
   },
@@ -83,18 +103,59 @@ const ConfigTabRuntimeView = {
     }
   },
 
+  healthDeadline(controller, item) {
+    if (typeof controller?.healthDeadline === 'function') {
+      return Number(controller.healthDeadline(item) || 0);
+    }
+    // 运行态模块可独立加载；兼容旧 controller stub 与旧页面加载顺序。
+    return Number(item?.health_state === 'breaker_open' ? item?.breaker_until : item?.cooldown_until || 0);
+  },
+
   updateCooldownDisplay(controller) {
     const display = document.getElementById('model-cooldown-display');
     if (display) {
       const modelId = document.getElementById('model-id')?.value;
       const m = modelId ? Store.getModel(modelId) : null;
-      if (m && m.cooldown_until && m.cooldown_until * 1000 > Date.now()) {
-        const remain = Math.max(0, Math.ceil((m.cooldown_until * 1000 - Date.now()) / 1000));
+      const healthState = m?.disabled_by_user
+        ? 'manual_disabled'
+        : (m?.derived_status || m?.health_state || 'normal');
+      const deadline = this.healthDeadline(controller, m);
+      const untilMs = deadline * 1000;
+      display.dataset.healthState = healthState;
+      display.dataset.healthDeadline = String(deadline);
+      if (deadline) {
+        const remain = Math.max(0, Math.ceil((untilMs - Date.now()) / 1000));
         const mm = Math.floor(remain / 60).toString().padStart(2, '0');
         const ss = (remain % 60).toString().padStart(2, '0');
-        display.textContent = `${Utils.formatDate(m.cooldown_until)}（还剩 ${mm}:${ss}）`;
+        display.textContent = `${Utils.formatDate(deadline)}（${remain ? `还剩 ${mm}:${ss}` : '已到期'}）`;
       } else {
         display.textContent = '-';
+      }
+      const stateEl = document.getElementById('model-health-state');
+      if (stateEl) stateEl.textContent = controller.modelHealthLabel(healthState);
+      const failuresEl = document.getElementById('model-consecutive-failures');
+      if (failuresEl) failuresEl.textContent = `${Number(m?.consecutive_failures || 0)} 次`;
+      const reasonEl = document.getElementById('model-health-reason');
+      if (reasonEl) reasonEl.textContent = m?.derived_reason || m?.breaker_reason || m?.cooldown_reason || m?.last_error || '-';
+      const row = display.closest('.form-row');
+      const recover = row?.querySelector('#model-recover');
+      const canRecover = Boolean(
+        m
+        && !m.disabled_by_user
+        && m?.smart_breaker_effective_enabled !== false
+        && m?.derived_status !== 'breaker_policy_disabled'
+        && ['cooling', 'breaker_open'].includes(healthState)
+      );
+      if (canRecover && !recover) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.id = 'model-recover';
+        button.className = 'btn-recover btn-sm';
+        button.textContent = '重试恢复';
+        button.addEventListener('click', () => controller.onRecoverModel());
+        row?.appendChild(button);
+      } else if (!canRecover && recover) {
+        recover.remove();
       }
     }
     document.querySelectorAll('[data-aggregate-member-status]').forEach(el => {
@@ -114,13 +175,13 @@ const ConfigTabRuntimeView = {
     const candidates = [];
     if (selected.type === 'model' && selected.id) {
       const model = Store.getModel(selected.id);
-      if (model) candidates.push(['model', model.id, model.cooldown_until]);
+      if (model) candidates.push(['model', model.id, this.healthDeadline(controller, model)]);
     }
     if (selected.type === 'aggregate' && selected.id) {
       Store.getAggregateMembers(selected.id).forEach(member => {
-        candidates.push(['member', member.id, member.cooldown_until]);
+        candidates.push(['member', member.id, this.healthDeadline(controller, member)]);
         const model = Store.getModel(member.model_id);
-        if (model) candidates.push(['model', model.id, model.cooldown_until]);
+        if (model) candidates.push(['model', model.id, this.healthDeadline(controller, model)]);
       });
     }
 

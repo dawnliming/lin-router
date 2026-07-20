@@ -73,7 +73,17 @@ def test_v054_live_diagnose_and_recover_contracts():
             assert status == 200
             assert runtime["live_requests"][0]["stage_label"] == "等待串行保护"
 
+            class ResponseProbe:
+                def __init__(self):
+                    self.closed = False
+
+                def close(self):
+                    self.closed = True
+
+            response_probe = ResponseProbe()
+            router._set_live_response("live-123456", response_probe)
             router._live_request_finish("live-123456")
+            assert response_probe.closed is True
             status, live_after = get_json(port, "/api/live-requests")
             assert status == 200
             assert live_after["count"] == 0
@@ -116,8 +126,9 @@ def test_v054_live_diagnose_and_recover_contracts():
             status, failed_probe = post_json(port, "/api/models/m1/recover")
             assert status == 400
             assert failed_probe["code"] == "probe_failed"
-            assert server.store.find_model("m1").cooldown_until > 0
-            assert server.store.find_model("m1").usable is False
+            assert server.store.find_model("m1").health_state == "observing"
+            assert server.store.find_model("m1").consecutive_failures == 1
+            assert server.store.find_model("m1").usable is True
             probe_log = router.logs[0]
             assert probe_log.event == "manual_probe"
             assert probe_log.group_id == "g1"

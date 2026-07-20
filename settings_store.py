@@ -18,7 +18,8 @@ DEFAULT_SETTINGS = {
     "debug_capture_enabled": False,
     "debug_capture_last_body": False,
     "normalize_tools_order": False,
-    "smart_breaker_enabled": False,
+    # 冻结 PRD 要求新安装及缺失历史字段均默认启用；显式 False 仍可持久化关闭。
+    "smart_breaker_enabled": True,
 }
 
 
@@ -59,8 +60,14 @@ class SettingsStore:
 
     def update(self, new_settings: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
+            previous = dict(self._settings)
             self._settings = {**DEFAULT_SETTINGS, **self._settings, **new_settings}
-            self.save()
+            try:
+                self.save()
+            except Exception:
+                # 页面依赖失败回滚；不能让内存值与落盘设置出现不同步。
+                self._settings = previous
+                raise
             return dict(self._settings)
 
     def to_dict(self) -> Dict[str, Any]:

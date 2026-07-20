@@ -178,6 +178,14 @@ const ConfigTab = {
           <div class="form-row" id="group-cooldown-row">
             <label>自动冷却分钟</label>
             <input id="group-cooldown" type="number" min="0" step="1" value="${g?.auto_model_cooldown_minutes ?? 5}">
+            <div class="form-hint">该项仅保留自动路由基础配置；智能熔断冷却按观察、30 秒、1 分钟、3 分钟和最高 5 分钟执行。</div>
+          </div>
+          <div class="form-row" id="group-smart-breaker-row">
+            <label class="checkbox smart-breaker-toggle">
+              <input id="group-smart-breaker-enabled" type="checkbox" ${g?.smart_breaker_enabled !== false ? 'checked' : ''}>
+              <span>智能熔断</span>
+            </label>
+            <div class="form-hint">关闭会清理该组真实模型及该组进入任意聚合成员的自动健康状态，不影响手动停用、其他连接组或其他组成员。</div>
           </div>
           <div class="form-row" id="group-stream-timeout-row">
             <label>流式空闲超时秒</label>
@@ -274,8 +282,38 @@ const ConfigTab = {
       </section>`;
   },
 
+  modelHealthLabel(state) {
+    const labels = {
+      normal: '正常',
+      observing: '观察中',
+      cooling: '冷却中',
+      breaker_open: '已熔断',
+      half_open_probe: '恢复探测中',
+      breaker_policy_disabled: '熔断保护已关闭',
+      manual_disabled: '手动停用',
+    };
+    return labels[state] || '未知状态';
+  },
+
+  healthDeadline(item) {
+    const state = item?.health_state || 'normal';
+    const until = state === 'breaker_open' ? item?.breaker_until : item?.cooldown_until;
+    return Number(until || 0);
+  },
+
   renderModelSection(sel = Store.selected) {
     const m = this._itemWithDraft(sel, sel.type === 'model' ? Store.getModel(sel.id) : null);
+    const modelHealthState = m?.disabled_by_user
+      ? 'manual_disabled'
+      : (m?.derived_status || m?.health_state || 'normal');
+    const healthDeadline = this.healthDeadline(m);
+    const canRecoverModel = Boolean(
+      m
+      && !m.disabled_by_user
+      && m?.smart_breaker_effective_enabled !== false
+      && m?.derived_status !== 'breaker_policy_disabled'
+      && ['cooling', 'breaker_open'].includes(modelHealthState)
+    );
     const groupId = m?.group_id || Store.state.groups?.[0]?.id || '';
     const group = Store.getGroup(groupId);
     const isArk = group?.provider_type === 'ark';
@@ -349,9 +387,21 @@ const ConfigTab = {
             <span>${m?.last_checked_at || '-'}</span>
           </div>
           <div class="form-row read-only">
-            <label>冷却截止</label>
-            <span id="model-cooldown-display">-</span>
-            ${m && m.cooldown_until && m.cooldown_until * 1000 > Date.now() && !m.disabled_by_user ? `<button type="button" id="model-recover" class="btn-recover btn-sm">重试恢复</button>` : ''}
+            <label>健康状态</label>
+            <span id="model-health-state">${this.modelHealthLabel(modelHealthState)}</span>
+          </div>
+          <div class="form-row read-only">
+            <label>连续失败</label>
+            <span id="model-consecutive-failures">${Number(m?.consecutive_failures || 0)} 次</span>
+          </div>
+          <div class="form-row read-only">
+            <label>${modelHealthState === 'breaker_open' ? '熔断截止' : '冷却截止'}</label>
+            <span id="model-cooldown-display" data-health-state="${modelHealthState}" data-health-deadline="${healthDeadline}">-</span>
+            ${canRecoverModel ? '<button type="button" id="model-recover" class="btn-recover btn-sm">重试恢复</button>' : ''}
+          </div>
+          <div class="form-row read-only">
+            <label>脱敏原因</label>
+            <span id="model-health-reason" class="error-text">${Utils.escapeHtml(m?.derived_reason || m?.breaker_reason || m?.cooldown_reason || m?.last_error || '-')}</span>
           </div>
           <div class="form-row read-only">
             <label>最近错误</label>
@@ -407,6 +457,13 @@ const ConfigTab = {
               <input id="aggregate-enabled" type="checkbox" ${a?.enabled !== false ? 'checked' : ''}>
               <span>启用</span>
             </label>
+          </div>
+          <div class="form-row">
+            <label class="checkbox smart-breaker-toggle">
+              <input id="aggregate-smart-breaker-enabled" type="checkbox" ${a?.smart_breaker_enabled !== false ? 'checked' : ''}>
+              <span>智能熔断</span>
+            </label>
+            <div class="form-hint">关闭只清理当前聚合成员的自动健康状态，不影响底层真实模型和其他聚合。</div>
           </div>
           <div class="form-row">
             <label>冷却分钟</label>
@@ -802,7 +859,12 @@ const ConfigTab = {
     const warningBadge = underlyingDisabled
       ? '<span class="pill warning" title="底层真实模型不可用或处于冷却">底层不可用</span>'
       : '';
-    const recoverBtn = isCooling
+    const memberHealthState = member.derived_status || member.health_state || (isCooling ? 'cooling' : 'normal');
+    const canRecoverMember = member.enabled !== false
+      && member.smart_breaker_effective_enabled !== false
+      && member.derived_status !== 'breaker_policy_disabled'
+      && ['cooling', 'breaker_open'].includes(memberHealthState);
+    const recoverBtn = canRecoverMember
       ? `<button type="button" class="btn-recover btn-sm" data-action="recover" data-member-id="${member.id}">重试恢复</button>`
       : '';
     const toggleBtn = member.enabled === false
@@ -822,7 +884,7 @@ const ConfigTab = {
         <td class="truncate-cell" title="${Utils.escapeHtml(model?.upstream_model || model?.ep_id || '-')}">${Utils.escapeHtml(model?.upstream_model || model?.ep_id || '-')}</td>
         <td class="price-group-col">${this.renderAggregatePriceGroup(model)}</td>
         <td class="tiny" data-member-status-cell="${member.id}"><span data-aggregate-member-status="${member.id}" class="pill ${status.class}" title="${Utils.escapeHtml(status.title)}">${status.text}</span></td>
-        <td class="aggregate-member-actions">
+        <td class="aggregate-member-actions" data-member-actions="${member.id}">
           <div class="aggregate-member-action-buttons">
             ${toggleBtn}
             ${recoverBtn}
@@ -845,14 +907,22 @@ const ConfigTab = {
   aggregateMemberStatus(member, model) {
     const derivedMap = {
       manual_disabled: { class: 'warning', text: '已停用', title: member.derived_reason || '该聚合成员已手动停用，不参与调度' },
+      observing: { class: 'warning', text: '观察中', title: member.derived_reason || '聚合成员正在观察连续失败' },
       cooling: { class: 'cooldown', text: '冷却中', title: member.derived_reason || member.cooldown_reason || '聚合成员正在冷却' },
+      breaker_open: { class: 'danger', text: '已熔断', title: member.derived_reason || '聚合成员已触发智能熔断' },
+      half_open_probe: { class: 'warning', text: '恢复探测中', title: member.derived_reason || '聚合成员正在执行唯一恢复探测' },
+      breaker_policy_disabled: { class: 'warning', text: '熔断保护已关闭', title: member.derived_reason || '当前范围已关闭智能熔断保护' },
       underlying_model_disabled: { class: 'warning', text: '底层模型已停用', title: member.derived_reason || '请先启用底层真实模型' },
+      underlying_model_observing: { class: 'warning', text: '底层观察中', title: member.derived_reason || '底层真实模型正在观察连续失败' },
       underlying_model_cooling: { class: 'cooldown', text: '底层模型冷却中', title: member.derived_reason || '底层真实模型正在冷却' },
+      underlying_model_breaker_open: { class: 'danger', text: '底层已熔断', title: `${member.derived_reason || '底层真实模型已触发智能熔断'}；请到真实模型配置中重试恢复。` },
+      underlying_model_half_open_probe: { class: 'warning', text: '底层恢复探测中', title: member.derived_reason || '底层真实模型正在执行唯一恢复探测' },
       config_error: { class: 'danger', text: '配置异常', title: member.derived_reason || '底层连接组或模型缺失' },
       warning: { class: 'warning', text: '最近错误', title: member.derived_reason || member.last_error || '最近发生错误' },
       healthy: { class: 'success', text: '正常', title: member.derived_reason || '该成员可参与聚合调度' },
     };
     if (member.enabled === false) return { class: 'warning', text: '已停用', title: '该聚合成员已手动停用，不参与调度' };
+    if (member.derived_status === 'breaker_policy_disabled') return derivedMap.breaker_policy_disabled;
     if (member.cooldown_until && member.cooldown_until * 1000 > Date.now()) {
       const remainSec = Math.max(0, Math.ceil((member.cooldown_until * 1000 - Date.now()) / 1000));
       const mm = Math.floor(remainSec / 60).toString().padStart(2, '0');
@@ -1281,6 +1351,7 @@ const ConfigTab = {
         auto_model_cooldown_minutes: values['group-cooldown'] ?? item.auto_model_cooldown_minutes,
         stream_idle_timeout: values['group-stream-timeout'] ?? item.stream_idle_timeout,
         waf_compatible: values['group-waf'] ?? item.waf_compatible,
+        smart_breaker_enabled: values['group-smart-breaker-enabled'] ?? item.smart_breaker_enabled,
         serial_protection: serial ? serial === 'serial' : item.serial_protection,
         waf_client_mode: values['group-waf-client-mode'] ?? item.waf_client_mode,
         waf_accept_policy: values['group-waf-policy'] ?? item.waf_accept_policy,
@@ -1312,6 +1383,7 @@ const ConfigTab = {
           ? String(values['aggregate-client-model-aliases']).split(/[\n,]+/).map(value => value.trim()).filter(Boolean)
           : item.client_model_aliases,
         enabled: values['aggregate-enabled'] ?? item.enabled,
+        smart_breaker_enabled: values['aggregate-smart-breaker-enabled'] ?? item.smart_breaker_enabled,
         cooldown_minutes: values['aggregate-cooldown'] ?? item.cooldown_minutes,
         strategy: values['aggregate-strategy'] ?? item.strategy,
       };
@@ -1356,6 +1428,7 @@ const ConfigTab = {
   onGroupWorkflowAction(...args) { return ConfigTabActions.onGroupWorkflowAction(this, ...args); },
   openQuickTest(...args) { return ConfigTabActions.openQuickTest(this, ...args); },
   copyGroupClientConfig(...args) { return ConfigTabActions.copyGroupClientConfig(this, ...args); },
+  confirmScopedSmartBreakerDisable(...args) { return ConfigTabActions.confirmScopedSmartBreakerDisable(this, ...args); },
   onGroupSubmit(...args) { return ConfigTabActions.onGroupSubmit(this, ...args); },
   onGroupDelete(...args) { return ConfigTabActions.onGroupDelete(this, ...args); },
   onAddModelToGroup(...args) { return ConfigTabActions.onAddModelToGroup(this, ...args); },

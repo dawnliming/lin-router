@@ -338,6 +338,10 @@ class ObservabilityService:
             item = self._find_stream_log(request_id, attempt, candidate_label)
             if not item:
                 return False
+            # The iterator, HTTP handler, and defensive cleanup may all race
+            # to finalize one stream. The first terminal writer wins.
+            if self.detail_value(item.detail, "stream_finalized").lower() == "true":
+                return False
             item.status = final_status
             if final_event:
                 item.event = final_event
@@ -386,6 +390,12 @@ class ObservabilityService:
             self.rewrite_log_file()
             self._record_runtime_activity(item)
             return True
+
+    def downstream_write_failed(self, request_id: str) -> bool:
+        """Return whether the downstream handler recorded a failed write."""
+        with self._logs_lock:
+            item = self._find_stream_log(request_id)
+            return bool(item and self.detail_value(item.detail, "downstream_write_failed").lower() == "true")
 
     def rewrite_log_file(self) -> None:
         with self._logs_lock:
@@ -515,13 +525,29 @@ class ObservabilityService:
         return {"ok": True, "request_id": request_id, "state": "cancellation_requested", "message": "已发送终止指令，正在释放本地请求资源。"}
 
     def finish_live_request(self, request_id: str, status: str = "done") -> None:
+        """Finalize and unregister a request, closing any still-registered response.
+
+        Most normal paths close the upstream response before reaching this method,
+        but terminal cleanup must remain safe when a preparation/fallback exception
+        bypasses that path.  Detach the response while holding the registry lock,
+        then close it outside the lock so a transport implementation cannot block
+        live-request reads or cancellation of another request.
+        """
         if not request_id:
             return
+        response = None
         with self._live_requests_lock:
             item = self._live_requests.get(request_id)
             if item:
                 item.update({"status": status, "stage": status, "stage_label": "已完成" if status == "done" else "已结束", "updated_at": time.time(), "cancellable": False, "cancellation_state": "finalized" if status == "manual_cancelled" else item.get("cancellation_state", "none")})
+                response = item.get("response")
+                item["response"] = None
             self._live_requests.pop(request_id, None)
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
 
     def live_requests_payload(self) -> Dict[str, Any]:
         now = time.time()

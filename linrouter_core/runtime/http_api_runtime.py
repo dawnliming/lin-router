@@ -279,7 +279,18 @@ def handle_get(handler: Any) -> None:
             filtered = filtered[offset:]
         if limit and limit > 0:
             filtered = filtered[:limit]
-        handler._send_json({"ok": True, "total": total, "offset": offset, "limit": limit, "logs": [asdict(item) for item in filtered]})
+        # Persisted ``streaming`` history is not evidence that a request is still
+        # active.  Return the live registry snapshot separately so the logs tab
+        # can reconcile its labels against the sole source of truth.
+        live_requests = handler.router.live_requests_payload().get("requests", [])
+        handler._send_json({
+            "ok": True,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "logs": [asdict(item) for item in filtered],
+            "live_requests": live_requests,
+        })
         return
     if parsed.path == "/api/logs/export":
         csv_text = handler.router.export_logs_csv()
@@ -384,7 +395,13 @@ def handle_post(handler: Any) -> None:
         settings_store = handler.server.settings_store  # type: ignore[attr-defined]
         if "auto_start" in new_settings:
             handler._platform().set_autostart(bool(new_settings["auto_start"]))
-        updated = settings_store.update(new_settings)
+        try:
+            updated = settings_store.update(new_settings)
+            if new_settings.get("smart_breaker_enabled") is False:
+                handler.router.candidate_health.clear_system_health_states()
+        except Exception:
+            handler._send_json({"error": {"message": "备份恢复失败，智能熔断设置未完成写入", "type": "api_error", "code": "backup_restore_failed"}}, status=500)
+            return
         if any(key in new_settings for key in ("upstream_http_client", "upstream_http2", "upstream_keepalive")):
             handler.router._refresh_upstream_client()
         handler._send_json({
@@ -422,6 +439,11 @@ def handle_post(handler: Any) -> None:
             payload["reasoning_support"] = existing.reasoning_support
         if existing and "auto_model_name" not in payload:
             payload["auto_model_name"] = existing.auto_model_name
+        if existing and "smart_breaker_enabled" not in payload:
+            payload["smart_breaker_enabled"] = existing.smart_breaker_enabled
+        if "smart_breaker_enabled" in payload and not isinstance(payload["smart_breaker_enabled"], bool):
+            handler._send_json({"error": {"message": "连接组智能熔断开关必须为布尔值", "type": "invalid_request_error", "code": "invalid_smart_breaker_enabled"}}, status=400)
+            return
         # 自动路由模型名空值按默认值处理
         auto_name = str(payload.get("auto_model_name") or "").strip() or DEFAULT_AUTO_MODEL_NAME
         # 不允许与同组模型 name/id/ep_id 冲突；仅 all-router-auto 为全局保留名
@@ -438,10 +460,21 @@ def handle_post(handler: Any) -> None:
             group.api_key = ""
         if group.provider_type == PROVIDER_ARK:
             group.api_key = ""
+        group_breaker_disabled = bool(
+            existing
+            and existing.smart_breaker_enabled
+            and not group.smart_breaker_enabled
+        )
         group_verification_changed = _connectivity_fields_changed(existing, group, _GROUP_VERIFICATION_FIELDS)
         if group_verification_changed:
             handler.store.invalidate_group_verification(group.id)
-        handler.store.upsert_group(group)
+        try:
+            handler.store.upsert_group(group)
+        except Exception:
+            handler._send_json({"error": {"message": "连接组保存失败，智能熔断开关和健康状态已回滚", "type": "api_error", "code": "config_save_failed"}}, status=500)
+            return
+        if group_breaker_disabled:
+            handler.router.candidate_health.release_group_probes(group.id)
         handler._send_json({"ok": True, "group": asdict(group)})
         return
     if parsed.path.startswith("/api/groups/") and parsed.path.endswith("/clone"):
@@ -845,14 +878,30 @@ def handle_post(handler: Any) -> None:
             "auto_start", "start_minimized", "theme", "auto_refresh_logs",
             "upstream_http_client", "upstream_http2", "upstream_keepalive",
             "debug_mode", "debug_capture_enabled", "debug_capture_last_body",
-            "normalize_tools_order",
+            "normalize_tools_order", "smart_breaker_enabled",
         }
         new_settings = {k: v for k, v in payload.items() if k in allowed}
+        if "smart_breaker_enabled" in new_settings and not isinstance(new_settings["smart_breaker_enabled"], bool):
+            handler._send_json({"error": {"message": "全局智能熔断总开关必须为布尔值", "type": "invalid_request_error", "code": "invalid_smart_breaker_enabled"}}, status=400)
+            return
         # 开机自启需要同步到 Windows 注册表
         if "auto_start" in new_settings:
             handler._platform().set_autostart(bool(new_settings["auto_start"]))
         settings_store = handler.server.settings_store  # type: ignore[attr-defined]
-        updated = settings_store.update(new_settings)
+        previous_breaker_enabled = bool(settings_store.get("smart_breaker_enabled", True))
+        try:
+            updated = settings_store.update(new_settings)
+            if new_settings.get("smart_breaker_enabled") is False:
+                # 关闭是立即生效的运行时策略切换；清理失败时回滚设置，避免
+                # 出现“开关已关闭但旧熔断状态仍残留”的半完成状态。
+                try:
+                    handler.router.candidate_health.clear_system_health_states()
+                except Exception:
+                    settings_store.update({"smart_breaker_enabled": previous_breaker_enabled})
+                    raise
+        except Exception:
+            handler._send_json({"error": {"message": "设置保存失败，智能熔断开关已回滚", "type": "api_error", "code": "settings_save_failed"}}, status=500)
+            return
         # 上游客户端相关设置变更后，立即刷新客户端实例
         if any(k in new_settings for k in ("upstream_http_client", "upstream_http2", "upstream_keepalive")):
             handler.router._refresh_upstream_client()
@@ -872,13 +921,20 @@ def handle_post(handler: Any) -> None:
             handler._send_json({"ok": False, "message": "聚合模型名不能为空"}, status=400)
             return
         aggregate_id = str(payload.get("id") or "").strip() or uuid.uuid4().hex
+        if "smart_breaker_enabled" in payload and not isinstance(payload["smart_breaker_enabled"], bool):
+            handler._send_json({"error": {"message": "聚合模型智能熔断开关必须为布尔值", "type": "invalid_request_error", "code": "invalid_smart_breaker_enabled"}}, status=400)
+            return
         existing = handler.store.find_aggregate(aggregate_id)
         merged: Dict[str, Any] = asdict(existing) if existing else {}
         merged.update(payload)
         merged["id"] = aggregate_id
         merged["name"] = name
         aggregate = AggregateModel.from_dict(merged)
-        ok, msg = handler.store.upsert_aggregate(aggregate)
+        try:
+            ok, msg = handler.store.upsert_aggregate(aggregate)
+        except Exception:
+            handler._send_json({"error": {"message": "聚合模型保存失败，智能熔断开关和成员健康状态已回滚", "type": "api_error", "code": "config_save_failed"}}, status=500)
+            return
         if not ok:
             handler._send_json({"ok": False, "message": msg}, status=400)
             return

@@ -131,6 +131,23 @@ class ConfigStore:
         # 清理 orphan 成员
         if self._cleanup_orphan_members():
             changed = True
+        # 已显式关闭局部策略的旧配置不能带着历史健康字段继续运行；
+        # 缺失字段会在 from_dict 中按 true 加载，不会触发这条兼容清理。
+        _snapshots, disabled_scope_changed = self._clear_health_states_locked(
+            lambda item: (
+                isinstance(item, ModelConfig)
+                and not bool(getattr(self.find_group(item.group_id), "smart_breaker_enabled", True))
+            )
+            or (
+                isinstance(item, AggregateMember)
+                and (
+                    not bool(getattr(self.find_group(item.group_id), "smart_breaker_enabled", True))
+                    or not bool(getattr(self.find_aggregate(item.aggregate_id), "smart_breaker_enabled", True))
+                )
+            )
+        )
+        if disabled_scope_changed:
+            changed = True
         if changed:
             self.save()
 
@@ -165,6 +182,120 @@ class ConfigStore:
                 and member.model_id in model_ids
             ]
             return len(self.aggregate_members) != before
+
+    @staticmethod
+    def _clear_health_item(item: ModelConfig | AggregateMember) -> bool:
+        """清理系统健康字段，同时保留模型/成员的手动停用状态。"""
+        before = (
+            item.health_state,
+            item.consecutive_failures,
+            item.last_failure_at,
+            item.breaker_until,
+            item.breaker_reason,
+            item.cooldown_until,
+            item.cooldown_reason,
+            item.last_error,
+            item.last_checked_at,
+            getattr(item, "usable", None),
+        )
+        item.consecutive_failures = 0
+        item.last_failure_at = 0
+        item.breaker_until = 0
+        item.breaker_reason = ""
+        item.cooldown_until = 0
+        item.cooldown_reason = ""
+        item.last_error = ""
+        item.last_checked_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        if isinstance(item, ModelConfig):
+            item.health_state = "manual_disabled" if item.disabled_by_user else "normal"
+            if not item.disabled_by_user:
+                item.usable = True
+        else:
+            item.health_state = "normal"
+        after = (
+            item.health_state,
+            item.consecutive_failures,
+            item.last_failure_at,
+            item.breaker_until,
+            item.breaker_reason,
+            item.cooldown_until,
+            item.cooldown_reason,
+            item.last_error,
+            item.last_checked_at,
+            getattr(item, "usable", None),
+        )
+        return before != after
+
+    @staticmethod
+    def _restore_health_item(item: ModelConfig | AggregateMember, snapshot: Dict[str, Any]) -> None:
+        for key, value in snapshot.items():
+            if hasattr(item, key):
+                setattr(item, key, value)
+
+    def _clear_health_states_locked(self, predicate: Any) -> Tuple[List[Tuple[Any, Dict[str, Any]]], bool]:
+        snapshots: List[Tuple[Any, Dict[str, Any]]] = []
+        changed = False
+        for item in [*self.models, *self.aggregate_members]:
+            if not predicate(item):
+                continue
+            snapshot = asdict(item)
+            snapshots.append((item, snapshot))
+            changed = self._clear_health_item(item) or changed
+        return snapshots, changed
+
+    def _restore_health_snapshots(self, snapshots: List[Tuple[Any, Dict[str, Any]]]) -> None:
+        for item, snapshot in snapshots:
+            self._restore_health_item(item, snapshot)
+
+    def _save_health_scope_locked(self, snapshots: List[Tuple[Any, Dict[str, Any]]], changed: bool) -> bool:
+        if not changed:
+            return False
+        try:
+            self.save()
+        except Exception:
+            self._restore_health_snapshots(snapshots)
+            raise
+        return True
+
+    def clear_system_health_states(self) -> bool:
+        """原子清理全部系统健康状态；手动停用字段保持不变。"""
+        with self._lock:
+            snapshots, changed = self._clear_health_states_locked(lambda _item: True)
+            return self._save_health_scope_locked(snapshots, changed)
+
+    def clear_group_health_states(self, group_id: str) -> bool:
+        """只清理连接组模型及其聚合成员的系统健康状态。"""
+        with self._lock:
+            snapshots, changed = self._clear_health_states_locked(
+                lambda item: item.group_id == group_id
+            )
+            return self._save_health_scope_locked(snapshots, changed)
+
+    def clear_aggregate_health_states(self, aggregate_id: str) -> bool:
+        """只清理当前聚合成员的系统健康状态，不触碰底层真实模型。"""
+        with self._lock:
+            snapshots, changed = self._clear_health_states_locked(
+                lambda item: isinstance(item, AggregateMember) and item.aggregate_id == aggregate_id
+            )
+            return self._save_health_scope_locked(snapshots, changed)
+
+    def clear_disabled_scope_health_states(self) -> bool:
+        """加载/导入时修复已关闭局部策略遗留的系统健康字段。"""
+        with self._lock:
+            snapshots, changed = self._clear_health_states_locked(
+                lambda item: (
+                    isinstance(item, ModelConfig)
+                    and not bool(getattr(self.find_group(item.group_id), "smart_breaker_enabled", True))
+                )
+                or (
+                    isinstance(item, AggregateMember)
+                    and (
+                        not bool(getattr(self.find_group(item.group_id), "smart_breaker_enabled", True))
+                        or not bool(getattr(self.find_aggregate(item.aggregate_id), "smart_breaker_enabled", True))
+                    )
+                )
+            )
+            return self._save_health_scope_locked(snapshots, changed)
 
     def find_aggregate(self, aggregate_id: str) -> Optional[AggregateModel]:
         return next((a for a in self.aggregate_models if a.id == aggregate_id), None)
@@ -261,17 +392,31 @@ class ConfigStore:
             now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
             aggregate.updated_at = now
             existing = self.find_aggregate(aggregate.id)
-            if existing:
-                aggregate.created_at = existing.created_at or now
-                for idx, item in enumerate(self.aggregate_models):
-                    if item.id == aggregate.id:
-                        self.aggregate_models[idx] = aggregate
-                        break
-            else:
-                aggregate.created_at = now
-                self.aggregate_models.append(aggregate)
-                self.aggregate_member_revisions.setdefault(aggregate.id, 0)
-            self.save()
+            previous_aggregates = list(self.aggregate_models)
+            previous_revisions = dict(self.aggregate_member_revisions)
+            health_snapshots: List[Tuple[Any, Dict[str, Any]]] = []
+            if existing and existing.smart_breaker_enabled and not aggregate.smart_breaker_enabled:
+                # 聚合关闭只清理当前聚合成员，绝不触碰其底层真实模型或其他聚合。
+                health_snapshots, _changed = self._clear_health_states_locked(
+                    lambda item: isinstance(item, AggregateMember) and item.aggregate_id == aggregate.id
+                )
+            try:
+                if existing:
+                    aggregate.created_at = existing.created_at or now
+                    for idx, item in enumerate(self.aggregate_models):
+                        if item.id == aggregate.id:
+                            self.aggregate_models[idx] = aggregate
+                            break
+                else:
+                    aggregate.created_at = now
+                    self.aggregate_models.append(aggregate)
+                    self.aggregate_member_revisions.setdefault(aggregate.id, 0)
+                self.save()
+            except Exception:
+                self.aggregate_models = previous_aggregates
+                self.aggregate_member_revisions = previous_revisions
+                self._restore_health_snapshots(health_snapshots)
+                raise
             return True, ""
 
     def remove_aggregate(self, aggregate_id: str) -> Tuple[bool, int]:
@@ -999,19 +1144,20 @@ class ConfigStore:
             now = int(time.time())
             changed = False
             for model in self.models:
-                if model.cooldown_until and model.cooldown_until <= now:
+                if model.health_state == "cooling" and model.cooldown_until and model.cooldown_until <= now:
+                    # 冷却到期只回到观察态；熔断到期必须由运行时领取半开探测租约，不能在刷新中放行。
                     model.cooldown_until = 0
                     model.cooldown_reason = ""
+                    model.health_state = "observing" if model.consecutive_failures else "normal"
                     if not model.disabled_by_user:
                         model.usable = True
-                    model.last_error = ""
                     model.last_checked_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
                     changed = True
             for member in self.aggregate_members:
-                if member.cooldown_until and member.cooldown_until <= now:
+                if member.health_state == "cooling" and member.cooldown_until and member.cooldown_until <= now:
                     member.cooldown_until = 0
                     member.cooldown_reason = ""
-                    member.last_error = ""
+                    member.health_state = "observing" if member.consecutive_failures else "normal"
                     member.last_checked_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
                     changed = True
             if changed:
@@ -1020,18 +1166,30 @@ class ConfigStore:
 
     def upsert_group(self, group: ConnectionGroup) -> None:
         with self._lock:
+            existing = self.find_group(group.id)
             if not group.route_key:
-                existing = self.find_group(group.id)
                 group.route_key = existing.route_key if existing and existing.route_key else new_route_key()
             if not group.provider_type:
                 group.provider_type = PROVIDER_ARK
-            for idx, item in enumerate(self.groups):
-                if item.id == group.id:
-                    self.groups[idx] = group
-                    self.save()
-                    return
-            self.groups.append(group)
-            self.save()
+            previous_groups = list(self.groups)
+            health_snapshots: List[Tuple[Any, Dict[str, Any]]] = []
+            if existing and existing.smart_breaker_enabled and not group.smart_breaker_enabled:
+                # 关闭组策略会清理该组模型，以及该组模型在任意聚合内的成员状态。
+                health_snapshots, _changed = self._clear_health_states_locked(
+                    lambda item: item.group_id == group.id
+                )
+            try:
+                for idx, item in enumerate(self.groups):
+                    if item.id == group.id:
+                        self.groups[idx] = group
+                        self.save()
+                        return
+                self.groups.append(group)
+                self.save()
+            except Exception:
+                self.groups = previous_groups
+                self._restore_health_snapshots(health_snapshots)
+                raise
 
     def upsert_model(self, model: ModelConfig) -> None:
         with self._lock:

@@ -167,6 +167,7 @@ const ConfigTabForm = {
       base_url: document.getElementById('group-base')?.value.trim() || '',
       ark_api_key: mode === 'ark' ? key : '',
       api_key: mode === 'proxy' ? key : '',
+      smart_breaker_enabled: document.getElementById('group-smart-breaker-enabled')?.checked !== false,
       serial_protection: mode === 'relay'
         && document.querySelector('input[name="group-request-concurrency"]:checked')?.value === 'serial',
     };

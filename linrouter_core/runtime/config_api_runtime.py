@@ -99,6 +99,8 @@ def import_config_payload(store: Any, payload: Any) -> Dict[str, Any]:
             _replace_or_append(store.aggregate_members, member)
         store._cleanup_orphan_members()
         store.save()
+        # 导入的局部关闭策略不得保留旧 breaker/cooldown，避免首次请求读到陈旧状态。
+        store.clear_disabled_scope_health_states()
     return _import_response(store, aggregate_skip_reasons)
 
 
@@ -152,11 +154,13 @@ def import_backup_payload(store: Any, payload: Any) -> tuple[Dict[str, Any], Dic
         store.aggregate_models = new_aggregates
         store.aggregate_members = new_members
         store.save()
+        # 备份可能携带已关闭局部策略；仅清理对应范围，底层模型与其他聚合保持隔离。
+        store.clear_disabled_scope_health_states()
     allowed = {
         "auto_start", "start_minimized", "theme", "auto_refresh_logs",
         "upstream_http_client", "upstream_http2", "upstream_keepalive",
         "debug_mode", "debug_capture_enabled", "debug_capture_last_body",
-        "normalize_tools_order",
+        "normalize_tools_order", "smart_breaker_enabled",
     }
     new_settings = {key: value for key, value in settings_raw.items() if key in allowed}
     return _backup_import_response(store), new_settings

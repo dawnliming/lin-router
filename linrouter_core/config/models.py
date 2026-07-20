@@ -34,6 +34,8 @@ class ConnectionGroup:
     waf_accept_policy: str = "default"
     waf_client_mode: str = "always"
     reasoning_support: str = "unknown"
+    # 连接组策略只控制智能熔断，不改变模型手动启停或其他路由策略。
+    smart_breaker_enabled: bool = True
     upstream_models: List[Dict[str, Any]] = field(default_factory=list)
     upstream_models_fetched_at: str = ""
 
@@ -55,6 +57,7 @@ class ConnectionGroup:
             waf_accept_policy=str(data.get("waf_accept_policy") or "default"),
             waf_client_mode=str(data.get("waf_client_mode") or "always").lower(),
             reasoning_support=str(data.get("reasoning_support") or "unknown").lower(),
+            smart_breaker_enabled=bool(data.get("smart_breaker_enabled", True)),
             upstream_models=[item for item in data.get("upstream_models", []) if isinstance(item, dict)] if isinstance(data.get("upstream_models", []), list) else [],
             upstream_models_fetched_at=str(data.get("upstream_models_fetched_at") or ""),
         )
@@ -120,6 +123,8 @@ class AggregateModel:
     route_key: str = ""
     client_model_aliases: List[str] = field(default_factory=list)
     enabled: bool = True
+    # 聚合开关只控制当前聚合的成员级熔断，不覆盖成员底层连接组策略。
+    smart_breaker_enabled: bool = True
     strategy: str = "priority"
     cooldown_minutes: int = DEFAULT_AUTO_MODEL_COOLDOWN_MINUTES
     created_at: str = ""
@@ -145,6 +150,7 @@ class AggregateModel:
             route_key=str(data.get("route_key") or "").strip(),
             client_model_aliases=cls._normalize_client_model_aliases(data.get("client_model_aliases")),
             enabled=bool(data.get("enabled", True)),
+            smart_breaker_enabled=bool(data.get("smart_breaker_enabled", True)),
             strategy=cls.normalize_strategy(data.get("strategy")),
             cooldown_minutes=int(data.get("cooldown_minutes") or DEFAULT_AUTO_MODEL_COOLDOWN_MINUTES),
             created_at=str(data.get("created_at") or now),

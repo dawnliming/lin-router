@@ -50,6 +50,30 @@ const ConfigTabActions = {
     return Utils.copy(text).then(ok => ok ? Toast.success('客户端配置已复制') : Toast.error('复制失败'));
   },
 
+  async confirmScopedSmartBreakerDisable(controller, type, id) {
+    const inputId = type === 'group'
+      ? 'group-smart-breaker-enabled'
+      : 'aggregate-smart-breaker-enabled';
+    const input = document.getElementById(inputId);
+    const stored = type === 'group' ? Store.getGroup(id) : Store.getAggregate(id);
+    const wasEnabled = stored?.smart_breaker_enabled !== false;
+    if (input?.checked !== false || !wasEnabled) return true;
+
+    const isGroup = type === 'group';
+    const confirmed = await Modal.confirm({
+      title: isGroup ? '关闭连接组智能熔断' : '关闭聚合成员级智能熔断',
+      message: isGroup
+        ? '关闭后会清理该连接组真实模型，以及该组模型在任意聚合成员中的自动健康状态；不会影响手动停用、其他连接组或其他组成员。是否继续？'
+        : '关闭后只会清理当前聚合成员的自动健康状态；不会影响底层真实模型和其他聚合。是否继续？',
+      confirmText: '确定关闭',
+      confirmClass: 'btn-danger',
+    });
+    if (confirmed) return true;
+    input.checked = true;
+    controller.captureDraft();
+    return false;
+  },
+
   async onGroupSubmit(controller, e) {
     e.preventDefault();
     const validation = controller.validateGroupForm({ focus: true });
@@ -64,6 +88,7 @@ const ConfigTabActions = {
       controller.render();
       return;
     }
+    if (!await controller.confirmScopedSmartBreakerDisable('group', id)) return;
     const mode = document.getElementById('group-provider').value;
     const key = document.getElementById('group-key').value.trim();
     const payload = {
@@ -75,6 +100,7 @@ const ConfigTabActions = {
       auto_model_name: document.getElementById('group-auto-model-name').value.trim(),
       auto_model_cooldown_minutes: Number(document.getElementById('group-cooldown').value || 0),
       stream_idle_timeout: Math.max(0, Math.min(600, Number(document.getElementById('group-stream-timeout').value || 0))),
+      smart_breaker_enabled: document.getElementById('group-smart-breaker-enabled')?.checked !== false,
       waf_client_mode: mode === 'relay' && document.getElementById('group-waf').checked
         ? (document.getElementById('group-waf-client-mode')?.value || 'always')
         : 'always',
@@ -103,6 +129,10 @@ const ConfigTabActions = {
         Toast.success('连接组已保存，请按状态提示完成下一步');
       }
     } catch (err) {
+      const previousEnabled = Store.getGroup(id)?.smart_breaker_enabled !== false;
+      const breakerInput = document.getElementById('group-smart-breaker-enabled');
+      if (breakerInput) breakerInput.checked = previousEnabled;
+      controller.captureDraft();
       controller.setSaveStatus('error', '保存失败：' + err.message);
       Toast.error('保存失败：' + err.message);
     }
@@ -257,11 +287,13 @@ const ConfigTabActions = {
       controller.render();
       return;
     }
+    if (!await controller.confirmScopedSmartBreakerDisable('aggregate', id)) return;
     const payload = {
       name: document.getElementById('aggregate-name').value.trim(),
       display_name: document.getElementById('aggregate-display-name').value.trim(),
       client_model_aliases: document.getElementById('aggregate-client-model-aliases').value.split(/[\n,]+/).map(value => value.trim()).filter(Boolean),
       enabled: document.getElementById('aggregate-enabled').checked,
+      smart_breaker_enabled: document.getElementById('aggregate-smart-breaker-enabled')?.checked !== false,
       cooldown_minutes: Math.max(0, Number(document.getElementById('aggregate-cooldown').value || 0)),
       strategy: 'priority',
     };
@@ -272,7 +304,18 @@ const ConfigTabActions = {
       await Store.load();
       controller.clearDraft({ type: 'aggregate', id: id || null });
       controller.setSaveStatus('saved');
+      const stillViewingSavedAggregate = Tabs.current === 'config'
+        && Store.selected.type === 'aggregate'
+        && Store.selected.id === id;
+      if (stillViewingSavedAggregate) {
+        // Store.load 只更新数据；重新渲染当前表单才能同步移除已关闭策略下的恢复按钮。
+        controller.render();
+      }
     } catch (err) {
+      const previousEnabled = Store.getAggregate(id)?.smart_breaker_enabled !== false;
+      const breakerInput = document.getElementById('aggregate-smart-breaker-enabled');
+      if (breakerInput) breakerInput.checked = previousEnabled;
+      controller.captureDraft();
       controller.setSaveStatus('error', '保存失败：' + err.message);
       Toast.error('保存失败：' + err.message);
     }

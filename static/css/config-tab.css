@@ -201,6 +201,11 @@ input[aria-invalid="true"] { border-color: var(--danger); }
   width: auto;
 }
 
+/* 整个勾选字段右对齐，保留复选框位于“智能熔断”文字左侧。 */
+.form-row > .checkbox.smart-breaker-toggle {
+  justify-content: flex-end;
+}
+
 .form-hint {
   font-size: 12px;
   color: var(--text-tertiary);

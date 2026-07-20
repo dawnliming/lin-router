@@ -41,10 +41,11 @@ class ExecutionPolicyService:
             return CandidateErrorClassification(True, False, "server_error", f"server_error_{status_code}", "upstream")
         if status_code == 429:
             if self._is_rate_limited(status_code, raw):
-                return CandidateErrorClassification(True, False, "rate_limit", "rate_limit", "upstream")
+                # 短时限流可由上游自行恢复，不能污染连续失败窗口。
+                return CandidateErrorClassification(False, False, "rate_limit", "rate_limit", "upstream")
             if self._is_quota_exhausted(status_code, raw):
                 return CandidateErrorClassification(True, False, "quota_exhausted", "quota_exhausted", "upstream")
-            return CandidateErrorClassification(True, False, "rate_limit", "rate_limit_429", "upstream")
+            return CandidateErrorClassification(False, False, "rate_limit", "rate_limit_429", "upstream")
         if self._is_waf_blocked_error(status_code, raw):
             return CandidateErrorClassification(False, True, "waf_blocked", "waf_blocked", "candidate")
         if self._is_request_level_error(status_code, raw):

@@ -272,7 +272,7 @@ const LogsTab = {
         this.total = filtered.length;
         this.syncPageToTotal();
         const offset = this.page * this.pageSize;
-        Store.update({ logs: filtered.slice(offset, offset + this.pageSize) });
+        Store.update({ logs: filtered.slice(offset, offset + this.pageSize), live_requests: all.live_requests || [] });
       } else {
         const selected = Store.selected || {};
         const params = {
@@ -287,7 +287,7 @@ const LogsTab = {
         this._allCurrentOnlyLogs = null;
         this.total = Number(data.total || 0);
         if (this.syncPageToTotal()) return this._manualRefresh(silent);
-        Store.update({ logs: data.logs || [] });
+        Store.update({ logs: data.logs || [], live_requests: data.live_requests || [] });
       }
       this.renderRows(true);
       this.renderPagination();
@@ -420,6 +420,12 @@ const LogsTab = {
       || parsed.first_complete_frame_ms !== undefined;
   },
 
+  isLiveRequest(item) {
+    const requestId = String(item?.request_id || '');
+    if (!requestId) return false;
+    return (Store.state.live_requests || []).some(request => String(request?.request_id || '') === requestId);
+  },
+
   streamTerminalLabel(item, parsed) {
     const finalResult = String(parsed.final_result || parsed.lifecycle || '').toLowerCase();
     const event = String(item?.event || '').toLowerCase();
@@ -442,7 +448,7 @@ const LogsTab = {
     if (event === 'stream_timeout') return '流式超时';
     if (['request_cancelled', 'stream_disconnected_before_completion', 'client_disconnected'].includes(event)) return '客户端断开';
     if (event === 'stream_done' || event === 'stream_finalized') return '流式完成';
-    return '流式进行中';
+    return this.isLiveRequest(item) ? '流式进行中' : '流式已中断（未记录终态）';
   },
 
   finalLifecycle(parsed) {
@@ -533,7 +539,7 @@ const LogsTab = {
     return warnings.length ? `<span class="pill warning">${Utils.escapeHtml(warnings.join(' / '))}</span>` : '-';
   },
 
-  statusLabel(status) {
+  statusLabel(status, item = null) {
     const value = String(status || '');
     const map = {
       probe_ok: '探测成功',
@@ -542,7 +548,7 @@ const LogsTab = {
       protocol: '协议错误',
       timeout: '请求超时',
       busy: '候选忙',
-      streaming: '流式中',
+      streaming: item && !this.isLiveRequest(item) ? '流式已中断' : '流式中',
       stream_failed: '流式失败',
       stream_incomplete: '流式不完整',
       client_disconnected: '客户端断开',
@@ -745,7 +751,7 @@ const LogsTab = {
         <td class="tiny">${Utils.escapeHtml(item.time)}</td>
         <td class="tiny">${Utils.escapeHtml(this.groupName(item))}</td>
         <td>${Utils.escapeHtml(item.model || '-')}</td>
-        <td><span class="pill ${this.statusClass(item.status, item)}">${Utils.escapeHtml(this.statusLabel(item.status))}</span></td>
+        <td><span class="pill ${this.statusClass(item.status, item)}">${Utils.escapeHtml(this.statusLabel(item.status, item))}</span></td>
         <td class="tiny log-multiline">${Utils.escapeHtml(this.eventSummary(item))}</td>
         <td class="tiny">${Number(item.attempt || 0) || 1}</td>
         <td class="tiny log-multiline">${Utils.escapeHtml(this.durationSummary(item))}</td>
@@ -782,7 +788,9 @@ const LogsTab = {
       if (parsed.final_result === 'stream_incomplete') return '上游返回流式不完整终态';
       if (parsed.final_result === 'stream_idle_timeout') return '上游流式响应空闲超时';
       if (parsed.final_result === 'client_disconnected') return '客户端已断开连接';
-      return '首完整帧成功，流式响应仍在进行';
+      return this.isLiveRequest(item)
+        ? '首完整帧成功，流式响应仍在进行'
+        : '首完整帧成功，流式记录已中断（未记录终态）';
     }
     if (event === 'stream_interrupted') return '服务重启时未收到流终态，已标记为中断';
     if (event === 'stream_done' || event === 'stream_finalized') return '流式响应已完成';

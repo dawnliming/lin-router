@@ -347,6 +347,9 @@ class CandidateRuntime:
 
     def _finalize_cancelled(self, request_id: str, path: str, requested_label: str, *, group: Any = None, candidate: Any = None, attempt: int = 0, lock_released: bool = False) -> None:
         """Write one cancellation audit record without touching candidate health/fallback."""
+        # 取消是请求本地事件，不得计入失败；但必须释放半开租约，避免
+        # 后续请求永久看到 half_open_probe。
+        self.candidate_state.release_probe(candidate)
         self.observability.add_log(
             path, candidate.label if candidate is not None else requested_label, "cancelled",
             "lifecycle=manual_cancelled; final_result=manual_cancelled; failure_scope=client_cancelled; "
@@ -395,6 +398,15 @@ class CandidateRuntime:
                 state.aggregate_cooldown_seconds(aggregate_model),
                 reason,
             )
+            # 聚合成员失败同时代表一次底层真实模型的上游失败；成员级策略
+            # 可以被聚合开关关闭，但底层模型仍必须按所属连接组策略保护。
+            if candidate.idx is not None:
+                state.set_cooldown(
+                    candidate.idx,
+                    error,
+                    self.policy.auto_cooldown_seconds(group),
+                    reason,
+                )
             return True
         if auto_fallback:
             if candidate.group.provider_type == PROVIDER_RELAY and candidate.idx is not None:
@@ -510,6 +522,7 @@ class CandidateRuntime:
                 if aggregate_suffix:
                     skip_detail += "; " + aggregate_suffix
                 self.observability.add_log(path, candidate.label, "skip", skip_detail, group=group, request_id=request_id, attempt=attempt, event="skip")
+                state.release_probe(candidate)
                 continue
             payload_for_upstream = payload
             tools_normalized = False
@@ -523,6 +536,8 @@ class CandidateRuntime:
                 self.observability.update_live_request(request_id, stage="waiting_serial_protection", stage_label="等待串行保护")
             acquired, lock_wait_ms = self.concurrency.acquire(upstream_lock, request_id=request_id)
             if not acquired:
+                # 未取得串行保护锁不会实际执行探测；立即归还半开租约。
+                state.release_probe(candidate)
                 if self.observability.cancellation_requested(request_id):
                     self._finalize_cancelled(
                         request_id, path, requested_label, group=group, candidate=candidate, attempt=attempt,
@@ -632,6 +647,13 @@ class CandidateRuntime:
                     if cooldown_applied:
                         cooldown_seconds = state.aggregate_cooldown_seconds(aggregate_model)
                         state.set_aggregate_member_cooldown(candidate.aggregate_member_id, raw or str(err), cooldown_seconds, classification.log_reason)
+                        if candidate.idx is not None:
+                            state.set_cooldown(
+                                candidate.idx,
+                                raw or str(err),
+                                self.policy.auto_cooldown_seconds(group),
+                                classification.log_reason,
+                            )
                     failure_scope = classification.failure_scope
                     fallback_chain.append({
                         "member_id": candidate.aggregate_member_id,
@@ -752,6 +774,13 @@ class CandidateRuntime:
                 if is_aggregate_candidate and aggregate_model and candidate.aggregate_member_id:
                     cooldown_seconds = state.aggregate_cooldown_seconds(aggregate_model)
                     state.set_aggregate_member_cooldown(candidate.aggregate_member_id, str(err), cooldown_seconds, classification.log_reason)
+                    if candidate.idx is not None:
+                        state.set_cooldown(
+                            candidate.idx,
+                            str(err),
+                            self.policy.auto_cooldown_seconds(group),
+                            classification.log_reason,
+                        )
                     failure_scope = classification.failure_scope
                     fallback_chain.append({
                         "member_id": candidate.aggregate_member_id,
@@ -806,6 +835,7 @@ class CandidateRuntime:
                 continue
             finally:
                 self.concurrency.release(upstream_lock)
+                state.release_probe(candidate)
 
         if aggregate_model:
             self.observability.finish_live_request(request_id, "error")
@@ -948,6 +978,7 @@ class CandidateRuntime:
                 if aggregate_suffix:
                     skip_detail += "; " + aggregate_suffix
                 self.observability.add_log(path, candidate.label, "skip", skip_detail, group=group, request_id=request_id, attempt=attempt, event="skip")
+                state.release_probe(candidate)
                 continue
             payload_for_upstream = payload
             tools_normalized = False
@@ -962,6 +993,8 @@ class CandidateRuntime:
                 self.observability.update_live_request(request_id, stage="waiting_serial_protection", stage_label="等待串行保护")
             acquired, lock_wait_ms = self.concurrency.acquire(upstream_lock, request_id=request_id)
             if not acquired:
+                # 未取得串行保护锁不会实际执行探测；立即归还半开租约。
+                state.release_probe(candidate)
                 if self.observability.cancellation_requested(request_id):
                     self._finalize_cancelled(request_id, path, requested_label, group=group, candidate=candidate, attempt=attempt)
                     error_body = json.dumps({"error": {"message": "请求已由用户终止", "type": "request_cancelled", "code": "manual_cancelled", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
@@ -1089,6 +1122,11 @@ class CandidateRuntime:
                             lifecycle_result = "manual_cancelled"
                             lifecycle_scope = "client_cancelled"
                             usage_source = "stream_incomplete"
+                        elif self.observability.downstream_write_failed(request_id):
+                            lifecycle_status = "downstream_disconnected"
+                            lifecycle_result = "downstream_write_failed"
+                            lifecycle_scope = "downstream"
+                            usage_source = "stream_incomplete"
                         elif opaque_state["timeout"]:
                             lifecycle_status = "timeout"
                             lifecycle_result = "stream_idle_timeout"
@@ -1134,6 +1172,7 @@ class CandidateRuntime:
                         self.observability.finish_live_request(request_id, "done" if lifecycle_result == "stream_done" else ("manual_cancelled" if lifecycle_result == "manual_cancelled" else "ended"))
                         self.concurrency.mark_stream_active(candidate, -1)
                         self.concurrency.release(upstream_lock)
+                        state.release_probe(candidate)
 
                     def opaque_iterator() -> Iterator[bytes]:
                         nonlocal opaque_chunks, opaque_bytes, opaque_release_reason
@@ -1271,6 +1310,11 @@ class CandidateRuntime:
                         lifecycle_status = "cancelled"
                         lifecycle_result = "manual_cancelled"
                         lifecycle_scope = "client_cancelled"
+                    elif self.observability.downstream_write_failed(request_id):
+                        usage_source = "stream_incomplete"
+                        lifecycle_status = "downstream_disconnected"
+                        lifecycle_result = "downstream_write_failed"
+                        lifecycle_scope = "downstream"
                     elif stream_state["timeout"]:
                         usage_source = "stream_incomplete"
                         lifecycle_status = "timeout"
@@ -1362,12 +1406,11 @@ class CandidateRuntime:
                     self.observability.finish_live_request(request_id, "done" if stream_state["lifecycle"] == "stream_done" else ("manual_cancelled" if lifecycle_result == "manual_cancelled" else "ended"))
                     self.concurrency.mark_stream_active(candidate, -1)
                     self.concurrency.release(upstream_lock)
+                    state.release_probe(candidate)
 
                 def iterator() -> Iterator[bytes]:
                     nonlocal usage_total, usage_present, chunks_received, bytes_received, release_reason, saw_non_delimited_frame
                     try:
-                        if first_completion_signal:
-                            finalize_stream()
                         yield first_chunk
                         if first_completion_signal:
                             return
@@ -1410,7 +1453,6 @@ class CandidateRuntime:
                             if completion_signal:
                                 mark_stream_terminal(completion_signal)
                                 release_reason = completion_signal
-                                finalize_stream()
                             yield chunk
                             if completion_signal:
                                 break
@@ -1446,10 +1488,18 @@ class CandidateRuntime:
                 if resp:
                     self.observability.close_live_response(request_id, resp)
                 self.concurrency.release(upstream_lock)
+                state.release_probe(candidate)
                 # 聚合成员在首包前 stream 超时：cooldown 聚合成员并继续 fallback
                 if is_aggregate_candidate and aggregate_model and candidate.aggregate_member_id:
                     cooldown_seconds = state.aggregate_cooldown_seconds(aggregate_model)
                     state.set_aggregate_member_cooldown(candidate.aggregate_member_id, "stream_idle_timeout", cooldown_seconds, "stream_idle_timeout")
+                    if candidate.idx is not None:
+                        state.set_cooldown(
+                            candidate.idx,
+                            "stream_idle_timeout",
+                            self.policy.auto_cooldown_seconds(group),
+                            "stream_idle_timeout",
+                        )
                     fallback_chain.append({
                         "member_id": candidate.aggregate_member_id,
                         "group": group.name,
@@ -1490,6 +1540,7 @@ class CandidateRuntime:
                 if resp:
                     self.observability.close_live_response(request_id, resp)
                 self.concurrency.release(upstream_lock)
+                state.release_probe(candidate)
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 if stream_metrics["upstream_request_started_ms"] >= 0 and stream_metrics["upstream_headers_ms"] < 0:
                     stream_metrics["upstream_headers_ms"] = _elapsed_ms(stream_started_at)
@@ -1508,6 +1559,13 @@ class CandidateRuntime:
                     if cooldown_applied:
                         cooldown_seconds = state.aggregate_cooldown_seconds(aggregate_model)
                         state.set_aggregate_member_cooldown(candidate.aggregate_member_id, raw or str(err), cooldown_seconds, classification.log_reason)
+                        if candidate.idx is not None:
+                            state.set_cooldown(
+                                candidate.idx,
+                                raw or str(err),
+                                self.policy.auto_cooldown_seconds(group),
+                                classification.log_reason,
+                            )
                     failure_scope = classification.failure_scope
                     fallback_chain.append({
                         "member_id": candidate.aggregate_member_id,
@@ -1601,6 +1659,7 @@ class CandidateRuntime:
                 if resp:
                     self.observability.close_live_response(request_id, resp)
                 self.concurrency.release(upstream_lock)
+                state.release_probe(candidate)
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 last_error = err
                 classification = self.policy.classify_candidate_error(None, str(err), "network")
@@ -1623,6 +1682,13 @@ class CandidateRuntime:
                 if is_aggregate_candidate and aggregate_model and candidate.aggregate_member_id:
                     cooldown_seconds = state.aggregate_cooldown_seconds(aggregate_model)
                     state.set_aggregate_member_cooldown(candidate.aggregate_member_id, str(err), cooldown_seconds, failure_reason)
+                    if candidate.idx is not None:
+                        state.set_cooldown(
+                            candidate.idx,
+                            str(err),
+                            self.policy.auto_cooldown_seconds(group),
+                            failure_reason,
+                        )
                     failure_scope = classification.failure_scope
                     fallback_chain.append({
                         "member_id": candidate.aggregate_member_id,

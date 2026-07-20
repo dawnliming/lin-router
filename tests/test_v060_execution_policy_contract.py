@@ -28,7 +28,7 @@ def test_i3_policy_classification_preserves_all_five_fields() -> None:
         (None, "network", "network"): (True, False, "network", "network", "upstream"),
         (None, "timeout", "stream_timeout"): (True, False, "stream_timeout", "stream_timeout", "upstream"),
         (503, "failure", "http"): (True, False, "server_error", "server_error_503", "upstream"),
-        (429, "rate", "http"): (True, False, "rate_limit", "rate_limit", "upstream"),
+        (429, "rate", "http"): (False, False, "rate_limit", "rate_limit", "upstream"),
         (429, "quota", "http"): (True, False, "quota_exhausted", "quota_exhausted", "upstream"),
         (403, "Your request was blocked", "http"): (False, True, "waf_blocked", "waf_blocked", "candidate"),
         (401, "unauthorized", "http"): (False, True, "auth_error", "auth_error", "candidate"),

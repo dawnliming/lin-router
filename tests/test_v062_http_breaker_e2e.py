@@ -229,25 +229,25 @@ def test_breaker_opens_for_explicit_non_stream_http_5xx_then_manual_recover(tmp_
     with LocalMockUpstream() as upstream:
         router, context = _router(tmp_path, upstream, breaker=True)
 
-        for expected_count in range(1, 4):
+        for expected_count in range(1, 8):
             error = _assert_all_models_failed(lambda: router.call("/v1/chat/completions", _payload("explicit-model"), context))
             assert error.error_code == "all_models_failed"
             assert upstream.call_count == expected_count
 
         model = router.store.models[0]
         assert model.health_state == "breaker_open"
-        assert model.consecutive_failures == 3
+        assert model.consecutive_failures == 7
         assert model.breaker_until > int(time.time())
 
         no_candidate = _assert_all_models_failed(lambda: router.call("/v1/chat/completions", _payload("explicit-model"), context))
         assert no_candidate.error_code == "no_usable_models"
-        assert upstream.call_count == 3
+        assert upstream.call_count == 7
         _assert_no_live_requests(router)
 
         upstream.set_response("upstream-one", 200, _ok_body())
         recovered = router.recover_model(model.id)
         assert recovered["ok"] is True
-        assert upstream.call_count == 4
+        assert upstream.call_count == 8
         assert model.health_state == "normal"
         assert model.consecutive_failures == 0
         assert model.breaker_until == 0
@@ -255,23 +255,23 @@ def test_breaker_opens_for_explicit_non_stream_http_5xx_then_manual_recover(tmp_
         _assert_no_live_requests(router)
 
 
-def test_breaker_opens_for_explicit_stream_http_5xx_and_skips_fourth(tmp_path: Any) -> None:
+def test_breaker_opens_for_explicit_stream_http_5xx_and_skips_eighth(tmp_path: Any) -> None:
     with LocalMockUpstream() as upstream:
         router, context = _router(tmp_path, upstream, breaker=True)
 
-        for expected_count in range(1, 4):
+        for expected_count in range(1, 8):
             error = _assert_all_models_failed(lambda: router.stream("/v1/chat/completions", _payload("explicit-model", stream=True), context))
             assert error.error_code == "all_models_failed"
             assert upstream.call_count == expected_count
 
         model = router.store.models[0]
         assert model.health_state == "breaker_open"
-        assert model.consecutive_failures == 3
+        assert model.consecutive_failures == 7
         assert model.breaker_until > int(time.time())
 
         no_candidate = _assert_all_models_failed(lambda: router.stream("/v1/chat/completions", _payload("explicit-model", stream=True), context))
         assert no_candidate.error_code == "no_usable_models"
-        assert upstream.call_count == 3
+        assert upstream.call_count == 7
         _assert_no_live_requests(router)
 
 
@@ -364,7 +364,7 @@ def test_auto_and_aggregate_http_fallback_keep_existing_health_paths(tmp_path: A
         status, _headers, _data = router.call("/v1/chat/completions", _payload("lin-router-auto"), context)
         assert status == 200
         assert [call["model"] for call in upstream.calls] == ["upstream-one", "upstream-two"]
-        assert router.store.models[0].health_state == "cooling"
+        assert router.store.models[0].health_state == "observing"
         assert router.store.models[0].consecutive_failures == 1
         assert router.store.models[1].health_state == "normal"
         _assert_no_live_requests(router)
@@ -379,6 +379,6 @@ def test_auto_and_aggregate_http_fallback_keep_existing_health_paths(tmp_path: A
         assert [call["model"] for call in upstream.calls] == ["upstream-one", "upstream-two"]
         first_member = router.store.find_aggregate_member("am1")
         second_member = router.store.find_aggregate_member("am2")
-        assert first_member is not None and first_member.health_state == "cooling" and first_member.consecutive_failures == 1
+        assert first_member is not None and first_member.health_state == "observing" and first_member.consecutive_failures == 1
         assert second_member is not None and second_member.health_state == "normal" and second_member.consecutive_failures == 0
         _assert_no_live_requests(router)

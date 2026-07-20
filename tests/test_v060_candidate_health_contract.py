@@ -45,7 +45,8 @@ def test_candidate_health_preserves_manual_member_disable_and_reload(tmp_path) -
     reloaded = ConfigStore(path)
     cooling = reloaded.find_aggregate_member("am1")
     disabled = reloaded.find_aggregate_member("am2")
-    assert cooling is not None and cooling.cooldown_reason == "network"
+    assert cooling is not None and cooling.health_state == "observing"
+    assert cooling.consecutive_failures == 1
     assert disabled is not None and disabled.enabled is False
 
 
@@ -56,27 +57,26 @@ def test_candidate_health_writes_model_states_without_second_copy(tmp_path) -> N
     router._set_success(1)
     router._set_unusable(1, "quota exhausted")
     reloaded = ConfigStore(path)
-    assert reloaded.models[0].usable is False
-    assert reloaded.models[0].cooldown_reason == "network"
+    assert reloaded.models[0].usable is True
+    assert reloaded.models[0].health_state == "observing"
+    assert reloaded.models[0].consecutive_failures == 1
     assert reloaded.models[1].usable is False
     assert reloaded.models[1].cooldown_until == 0
 
 
-def test_breaker_is_disabled_by_default_and_records_only_when_enabled(tmp_path) -> None:
+def test_breaker_is_enabled_by_default_and_opens_after_seven_failures(tmp_path) -> None:
     router, path = _router(tmp_path)
     for _ in range(3):
         router._set_cooldown(0, "upstream unavailable", 0, "network")
     assert router.store.models[0].breaker_until == 0
-    assert router.store.models[0].consecutive_failures == 0
+    assert router.store.models[0].consecutive_failures == 3
+    assert router.store.models[0].health_state == "observing"
 
-    settings = SettingsStore(path)
-    settings.update({"smart_breaker_enabled": True})
-    router = ArkProxyRouter(ConfigStore(path), settings, tmp_path / "logs-2.jsonl")
-    for _ in range(3):
+    for _ in range(4):
         router._set_cooldown(0, "upstream unavailable", 0, "network")
     reloaded = ConfigStore(path)
     assert reloaded.models[0].health_state == "breaker_open"
-    assert reloaded.models[0].consecutive_failures == 3
+    assert reloaded.models[0].consecutive_failures == 7
     assert reloaded.models[0].breaker_until > 0
 
     router._set_success(0)
@@ -93,10 +93,11 @@ def test_expired_breaker_remains_out_of_automatic_selection_until_manual_probe(t
     router = ArkProxyRouter(ConfigStore(path), settings, tmp_path / "logs-breaker.jsonl")
     model = router.store.models[0]
     model.usable = True
+    model.health_state = "breaker_open"
     model.breaker_until = int(time.time()) - 1
 
-    assert list(router._iter_upstream_candidates(None, "g1"))[0].label == "second"
-    assert model.health_state == "breaker_open"
+    assert list(router._iter_upstream_candidates(None, "g1"))[0].label == "first"
+    assert router.candidate_health.runtime_health_state(model) == "half_open_probe"
 
 
 def test_disabled_breaker_does_not_filter_persisted_open_state(tmp_path) -> None:
@@ -107,6 +108,7 @@ def test_disabled_breaker_does_not_filter_persisted_open_state(tmp_path) -> None
     model.breaker_until = int(time.time()) + 60
     model.cooldown_until = int(time.time()) + 60
 
+    router.candidate_health.clear_system_health_states()
     assert [candidate.label for candidate in router._iter_upstream_candidates("first", "g1")] == ["first"]
     assert model.health_state == "normal"
     assert model.breaker_until == 0
@@ -131,6 +133,7 @@ def test_aggregate_reports_open_underlying_breaker_and_clears_it_when_disabled(t
     assert reason == "underlying_model_breaker_open"
 
     settings.update({"smart_breaker_enabled": False})
+    router.candidate_health.clear_system_health_states()
     reason, _message, _group, _model = router.candidate_health.aggregate_member_skip_reason(member)
     assert reason == ""
     assert model.health_state == "normal"
@@ -151,7 +154,7 @@ def test_manual_probe_rejections_and_busy_restore_prior_health_without_counting(
         router._manual_probe_candidate = lambda _candidate, current_reason=reason: (False, current_reason, "probe rejected")
         result = router.recover_model(model.id)
         assert result["ok"] is False
-        assert model.health_state == "cooling"
+        assert model.health_state == "observing"
         assert model.consecutive_failures == 1
         assert model.breaker_until == 0
         assert [candidate.label for candidate in router._iter_upstream_candidates("first", "g1")] == ["first"]
@@ -160,7 +163,7 @@ def test_manual_probe_rejections_and_busy_restore_prior_health_without_counting(
     router._manual_probe_candidate = lambda _candidate: (False, "waf_blocked", "probe rejected")
     result = router.recover_aggregate_member(member.id)
     assert result["ok"] is False
-    assert member.health_state == "cooling"
+    assert member.health_state == "observing"
     assert member.consecutive_failures == 1
     assert member.breaker_until == 0
 
@@ -173,13 +176,13 @@ def test_aggregate_member_breaker_isolated_and_reset_on_success(tmp_path) -> Non
     member = router.store.find_aggregate_member("am1")
     assert member is not None
 
-    for _ in range(3):
+    for _ in range(7):
         router._set_aggregate_member_cooldown(member.id, "upstream unavailable", 0, "network")
 
     broken = ConfigStore(path).find_aggregate_member(member.id)
     assert broken is not None
     assert broken.health_state == "breaker_open"
-    assert broken.consecutive_failures == 3
+    assert broken.consecutive_failures == 7
     assert broken.breaker_until > 0
     assert list(router._iter_aggregate_candidates(router.store.find_aggregate("a1"))) == []
 

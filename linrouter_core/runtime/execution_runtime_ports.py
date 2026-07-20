@@ -17,12 +17,12 @@ class ExecutionFaults:
 
 
 class CandidateStatePort:
-    def __init__(self, *, refresh: Callable[[], None], find_group: Callable[[str], Any], route_group_id: Callable[[Any], str | None], resolve_aggregate: Callable[[str | None, Any], Any], supports_requested_model: Callable[..., bool], iter_candidates: Callable[..., Iterator[Any]], iter_aggregate: Callable[..., Iterator[Any]], aggregate_cooldown_seconds: Callable[[Any], int], set_aggregate_cooldown: Callable[..., None], set_cooldown: Callable[..., None], record_qualified_failure: Callable[..., bool], set_unusable: Callable[..., None], mark_success: Callable[[Any], None], mark_aggregate_success: Callable[[str], None], mark_unusable: Callable[..., None]) -> None:
+    def __init__(self, *, refresh: Callable[[], None], find_group: Callable[[str], Any], route_group_id: Callable[[Any], str | None], resolve_aggregate: Callable[[str | None, Any], Any], supports_requested_model: Callable[..., bool], iter_candidates: Callable[..., Iterator[Any]], iter_aggregate: Callable[..., Iterator[Any]], aggregate_cooldown_seconds: Callable[[Any], int], set_aggregate_cooldown: Callable[..., None], set_cooldown: Callable[..., None], record_qualified_failure: Callable[..., bool], set_unusable: Callable[..., None], mark_success: Callable[[Any], None], mark_aggregate_success: Callable[[str], None], mark_unusable: Callable[..., None], release_probe: Callable[[Any], None]) -> None:
         self._refresh = refresh; self._find_group = find_group; self._route_group_id = route_group_id
         self._resolve_aggregate = resolve_aggregate; self._supports_requested_model = supports_requested_model; self._iter_candidates = iter_candidates; self._iter_aggregate = iter_aggregate
         self._aggregate_cooldown_seconds = aggregate_cooldown_seconds; self._set_aggregate_cooldown = set_aggregate_cooldown
         self._set_cooldown = set_cooldown; self._record_qualified_failure = record_qualified_failure; self._set_unusable = set_unusable; self._mark_success = mark_success
-        self._mark_aggregate_success = mark_aggregate_success; self._mark_unusable = mark_unusable
+        self._mark_aggregate_success = mark_aggregate_success; self._mark_unusable = mark_unusable; self._release_probe = release_probe
     def refresh_expired_cooldowns(self) -> None: self._refresh()
     def find_group(self, group_id: str) -> Any: return self._find_group(group_id)
     def route_group_id(self, route: Any) -> str | None: return self._route_group_id(route)
@@ -38,6 +38,7 @@ class CandidateStatePort:
     def mark_success(self, candidate: Any) -> None: self._mark_success(candidate)
     def mark_aggregate_member_success(self, member_id: str) -> None: self._mark_aggregate_success(member_id)
     def mark_unusable(self, candidate: Any, error: str) -> None: self._mark_unusable(candidate, error)
+    def release_probe(self, candidate: Any) -> None: self._release_probe(candidate)
 
 
 class RequestPreparationPort:
@@ -94,9 +95,9 @@ class StreamLifecyclePort:
 
 
 class ObservabilityPort:
-    def __init__(self, *, start: Callable[..., None], update: Callable[..., None], finish: Callable[..., None], add_log: Callable[..., None], patch_stream: Callable[..., bool], cancellation_requested: Callable[[str], bool], set_response: Callable[[str, Any], None], close_response: Callable[..., bool]) -> None:
+    def __init__(self, *, start: Callable[..., None], update: Callable[..., None], finish: Callable[..., None], add_log: Callable[..., None], patch_stream: Callable[..., bool], cancellation_requested: Callable[[str], bool], downstream_write_failed: Callable[[str], bool], set_response: Callable[[str, Any], None], close_response: Callable[..., bool]) -> None:
         self._start = start; self._update = update; self._finish = finish; self._add_log = add_log; self._patch_stream = patch_stream
-        self._cancellation_requested = cancellation_requested; self._set_response = set_response; self._close_response = close_response
+        self._cancellation_requested = cancellation_requested; self._downstream_write_failed = downstream_write_failed; self._set_response = set_response; self._close_response = close_response
     def start_live_request(self, *args: Any, **kwargs: Any) -> None: self._start(*args, **kwargs)
 
     def update_live_request(self, *args: Any, **kwargs: Any) -> None: self._update(*args, **kwargs)
@@ -104,6 +105,7 @@ class ObservabilityPort:
     def add_log(self, *args: Any, **kwargs: Any) -> None: self._add_log(*args, **kwargs)
     def patch_stream_lifecycle(self, *args: Any, **kwargs: Any) -> bool: return self._patch_stream(*args, **kwargs)
     def cancellation_requested(self, request_id: str) -> bool: return self._cancellation_requested(request_id)
+    def downstream_write_failed(self, request_id: str) -> bool: return self._downstream_write_failed(request_id)
     def set_live_response(self, request_id: str, response: Any) -> None: self._set_response(request_id, response)
     def close_live_response(self, request_id: str, response: Any = None) -> bool: return self._close_response(request_id, response)
 

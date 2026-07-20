@@ -56,6 +56,11 @@ assert(logs.diagnosisFor(structuredAuth, logs.parseDetail(structuredAuth.detail)
 
 const initialStream = { ...historicalAuth, status: 'streaming', detail: 'stream_started_at_ms=1; final_result=streaming' };
 assert(logs.rowKey(initialStream) === logs.rowKey(historicalAuth), 'stream lifecycle update must keep row identity');
+assert(logs.formatDetailPreview(initialStream) === '首完整帧成功，流式记录已中断（未记录终态）', 'persisted streaming history must not be previewed as active');
+const activeStream = { ...initialStream, request_id: 'request-live' };
+context.Store.state.live_requests = [{ request_id: 'request-live' }];
+assert(logs.formatDetailPreview(activeStream) === '首完整帧成功，流式响应仍在进行', 'only a live request may be previewed as active');
+context.Store.state.live_requests = [];
 const recoveredStream = { ...historicalAuth, status: 'interrupted', event: 'stream_interrupted', detail: 'stream_started_at_ms=1; stream_finalized=true; lifecycle=stream_interrupted_after_restart; final_result=interrupted; recovery=recovered_after_restart' };
 assert(logs.streamTerminalLabel(recoveredStream, logs.parseDetail(recoveredStream.detail)) === '服务重启后中断', 'recovered stream must not be shown as in progress');
 assert(logs.eventSummary(recoveredStream).includes('服务重启后中断'), 'recovered stream summary must be terminal');

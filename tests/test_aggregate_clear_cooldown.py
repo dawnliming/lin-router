@@ -156,9 +156,10 @@ def test_clear_cooldown_restores_member():
             assert getattr(err, "error_code", "") == "aggregate_members_unavailable", f"期望 aggregate_members_unavailable，实际 {err}"
 
         member = store.find_aggregate_member(member_id)
-        assert member.cooldown_until > int(time.time()), "成员应处于 cooldown"
+        assert member.health_state == "observing", "成员应处于观察态"
+        assert member.consecutive_failures == 1
         assert member.last_error != "", "成员应有 last_error"
-        assert member.cooldown_reason != "", "成员应有 cooldown_reason"
+        assert member.cooldown_reason == "", "观察态不应保留冷却原因"
 
         # 调用清冷却 API
         now_str = router._now()

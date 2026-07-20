@@ -329,7 +329,7 @@ def test_response_failed_and_incomplete_have_distinct_stream_lifecycles() -> Non
                 assert f"lifecycle={lifecycle}" in log.detail
                 assert log.failure_scope == "upstream"
                 assert log.cooldown_applied is True
-                assert router.store.models[0].health_state == "cooling"
+                assert router.store.models[0].health_state == "observing"
                 assert router.store.models[0].consecutive_failures == expected_failures
                 assert router.live_requests_payload()["count"] == 0
 
@@ -383,7 +383,7 @@ def test_post_first_byte_idle_timeout_is_not_recorded_as_client_disconnect() -> 
             assert "lifecycle=stream_idle_timeout" in log.detail
             assert "lifecycle=client_disconnected" not in log.detail
             assert log.cooldown_applied is True
-            assert router.store.models[0].health_state == "cooling"
+            assert router.store.models[0].health_state == "observing"
             assert router.store.models[0].consecutive_failures == 1
     finally:
         IdleAfterFirstChunkHandler.release.set()
@@ -432,7 +432,7 @@ def test_post_first_byte_network_error_counts_as_upstream_failure() -> None:
         assert "completion_signal=network_error" in log.detail
         assert log.failure_scope == "upstream"
         assert log.cooldown_applied is True
-        assert router.store.models[0].health_state == "cooling"
+        assert router.store.models[0].health_state == "observing"
         assert router.store.models[0].consecutive_failures == 1
         assert router.live_requests_payload()["count"] == 0
 
