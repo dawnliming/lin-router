@@ -25,6 +25,15 @@ def diagnose_logs(logs: List[RequestLog], sanitize_detail: Callable[[str], str])
     elif "stream_incomplete" in text:
         title, severity, root_cause, scope = "上游流式响应不完整", "warning", "stream_incomplete", "upstream"
         suggestion = "上游已明确返回不完整终态；已保留已收到的流内容，不会混入其他候选。"
+    elif "aggregate_first_frame_timeout" in text:
+        title, severity, root_cause, scope = "聚合首帧总预算耗尽", "error", "aggregate_first_frame_timeout", "upstream"
+        suggestion = "聚合候选在首个完整 SSE 帧前已耗尽总等待预算；本次未继续发起新的上游请求。"
+    elif "first_frame_timeout" in text:
+        title, severity, root_cause, scope = "首个完整 SSE 帧超时", "error", "first_frame_timeout", "upstream"
+        suggestion = "候选在首帧前超时，系统只会在尚未下发内容时切换其他候选。"
+    elif "connect_timeout" in text:
+        title, severity, root_cause, scope = "上游连接或响应头超时", "error", "connect_timeout", "upstream"
+        suggestion = "候选未及时建立连接或返回响应头，系统已按上游健康失败处理。"
     elif "stream_idle_timeout" in text:
         title, severity, root_cause, scope = "上游流式响应空闲超时", "error", "stream_idle_timeout", "upstream"
         suggestion = "建议稍后重试，或对冷却中的单个模型/成员执行“重试恢复”。"
@@ -33,6 +42,11 @@ def diagnose_logs(logs: List[RequestLog], sanitize_detail: Callable[[str], str])
         title, severity, root_cause, scope = "上游请求超时", "error", "upstream_timeout", "upstream"
         suggestion = "如果该候选已进入冷却，可单点重试恢复；如果频繁出现，建议降低优先级或检查中转站。"
         actions.append({"type": "recover", "label": "重试恢复冷却对象"})
+    elif "risk_isolated=true" in text:
+        title, severity, root_cause, scope = "检测到上游风控拦截，已隔离凭证", "warning", "risk_isolated", "candidate"
+        cooldown_applied = False
+        suggestion = "该凭证下的同一上游候选已暂停自动请求；请检查账号状态、渠道权限、频率限制和风控通知，不要连续重试。"
+        actions.append({"type": "risk_recover", "label": "查看风控恢复指引"})
     elif "waf_blocked" in text or "request_level" in text or "upstream_request_rejected" in text:
         title, severity, root_cause, scope = "请求级错误 / 上游拒绝请求", "warning", "request_level_error", "request"
         cooldown_applied = False

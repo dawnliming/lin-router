@@ -64,25 +64,24 @@ def test_candidate_health_writes_model_states_without_second_copy(tmp_path) -> N
     assert reloaded.models[1].cooldown_until == 0
 
 
-def test_breaker_is_enabled_by_default_and_opens_after_seven_failures(tmp_path) -> None:
+def test_breaker_is_enabled_by_default_and_opens_after_three_of_five_failures(tmp_path) -> None:
     router, path = _router(tmp_path)
-    for _ in range(3):
-        router._set_cooldown(0, "upstream unavailable", 0, "network")
-    assert router.store.models[0].breaker_until == 0
-    assert router.store.models[0].consecutive_failures == 3
-    assert router.store.models[0].health_state == "observing"
-
-    for _ in range(4):
-        router._set_cooldown(0, "upstream unavailable", 0, "network")
+    router._set_cooldown(0, "upstream unavailable", 0, "network")
+    router._set_success(0)
+    router._set_cooldown(0, "upstream unavailable", 0, "network")
+    router._set_success(0)
+    router._set_cooldown(0, "upstream unavailable", 0, "network")
     reloaded = ConfigStore(path)
     assert reloaded.models[0].health_state == "breaker_open"
-    assert reloaded.models[0].consecutive_failures == 7
+    assert reloaded.models[0].consecutive_failures == 3
+    assert reloaded.models[0].breaker_level == 1
     assert reloaded.models[0].breaker_until > 0
 
     router._set_success(0)
     recovered = ConfigStore(path).models[0]
     assert recovered.health_state == "normal"
-    assert recovered.consecutive_failures == 0
+    assert recovered.consecutive_failures == 2
+    assert recovered.breaker_level == 1
     assert recovered.breaker_until == 0
 
 
@@ -176,13 +175,13 @@ def test_aggregate_member_breaker_isolated_and_reset_on_success(tmp_path) -> Non
     member = router.store.find_aggregate_member("am1")
     assert member is not None
 
-    for _ in range(7):
+    for _ in range(3):
         router._set_aggregate_member_cooldown(member.id, "upstream unavailable", 0, "network")
 
     broken = ConfigStore(path).find_aggregate_member(member.id)
     assert broken is not None
     assert broken.health_state == "breaker_open"
-    assert broken.consecutive_failures == 7
+    assert broken.consecutive_failures == 3
     assert broken.breaker_until > 0
     assert list(router._iter_aggregate_candidates(router.store.find_aggregate("a1"))) == []
 
@@ -190,5 +189,6 @@ def test_aggregate_member_breaker_isolated_and_reset_on_success(tmp_path) -> Non
     recovered = ConfigStore(path).find_aggregate_member(member.id)
     assert recovered is not None
     assert recovered.health_state == "normal"
-    assert recovered.consecutive_failures == 0
+    assert recovered.consecutive_failures == 3
+    assert recovered.breaker_level == 1
     assert recovered.breaker_until == 0

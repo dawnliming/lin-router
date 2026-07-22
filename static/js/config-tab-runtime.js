@@ -13,7 +13,13 @@ const ConfigTabRuntimeView = {
   },
 
   patchVisibleRuntimeStatus(controller) {
-    const selected = Store.selected;
+    const selected = Store.selected || {};
+    if (selected.type === 'group' && selected.id) {
+      this.patchGroupRiskAlert(controller, selected.id);
+    }
+    if (selected.type === 'model' && selected.id) {
+      this.patchModelRiskAlert(controller, Store.getModel(selected.id));
+    }
     if (selected.type === 'aggregate') {
       Store.getAggregateMembers(selected.id).forEach(member => {
         const cell = document.querySelector(`[data-member-status-cell="${member.id}"]`);
@@ -43,6 +49,79 @@ const ConfigTabRuntimeView = {
         }
       });
     }
+  },
+
+  /**
+   * 连接组风险提醒与模型详情一样做局部 patch，避免运行态刷新覆盖未保存表单。
+   */
+  patchGroupRiskAlert(controller, groupId) {
+    const panel = document.getElementById('panel-config');
+    const advanced = document.getElementById('group-advanced-card');
+    if (!panel || !advanced || typeof controller.groupRiskSummary !== 'function') return;
+    const summary = controller.groupRiskSummary(groupId);
+    const existing = panel.querySelector('[data-group-risk-alert]');
+    const html = typeof controller.renderGroupRiskAlert === 'function'
+      ? controller.renderGroupRiskAlert(summary)
+      : '';
+    if (existing) {
+      existing.outerHTML = html;
+    } else if (html) {
+      advanced.insertAdjacentHTML('beforebegin', html);
+    }
+    const alert = panel.querySelector('[data-group-risk-alert]');
+    const diagnosis = alert?.querySelector('[data-group-action="view-risk-diagnosis"]');
+    if (diagnosis) {
+      diagnosis.onclick = () => controller.onOpenRiskDiagnosis();
+    }
+  },
+
+  /**
+   * 运行态轮询不能整页重绘，否则会丢失自动保存草稿；这里仅增删风险提示节点。
+   */
+  patchModelRiskAlert(controller, model) {
+    const stateLabel = document.getElementById('model-health-state');
+    const card = stateLabel?.closest?.('.form-card');
+    if (!card) return;
+    const existing = card.querySelector('[data-model-risk-alert]');
+    if (!model?.risk_isolated) {
+      existing?.remove();
+      return;
+    }
+    const affected = Number(model.risk_affected_models || 0);
+    const until = typeof controller.formatRiskUntil === 'function'
+      ? controller.formatRiskUntil(model.risk_until)
+      : Utils.formatDate(Number(model.risk_until || 0));
+    const message = `检测到上游风控拦截，影响 ${affected} 个同凭证模型；已隔离至 ${until}，流量会转向其他候选。`;
+    if (existing) {
+      const content = existing.querySelector('[data-model-risk-message]');
+      if (content) content.textContent = message;
+      return;
+    }
+    const alert = document.createElement('div');
+    alert.className = 'form-row read-only';
+    alert.dataset.modelRiskAlert = '';
+    const label = document.createElement('label');
+    label.textContent = '上游风控保护';
+    const content = document.createElement('span');
+    content.className = 'error-text';
+    content.dataset.modelRiskMessage = '';
+    content.textContent = message;
+    const actions = document.createElement('div');
+    actions.className = 'form-actions';
+    const diagnose = document.createElement('button');
+    diagnose.type = 'button';
+    diagnose.className = 'btn-secondary btn-sm';
+    diagnose.textContent = '查看诊断';
+    diagnose.addEventListener('click', () => controller.onOpenRiskDiagnosis());
+    const recover = document.createElement('button');
+    recover.type = 'button';
+    recover.className = 'btn-danger btn-sm';
+    recover.textContent = '我已检查账号，手动恢复';
+    recover.addEventListener('click', () => controller.onReleaseModelRiskIsolation());
+    actions.append(diagnose, recover);
+    alert.append(label, content, actions);
+    const footer = card.querySelector('.form-actions-split');
+    card.insertBefore(alert, footer || null);
   },
 
   async refreshRuntimeNow(controller) {
@@ -108,6 +187,7 @@ const ConfigTabRuntimeView = {
       return Number(controller.healthDeadline(item) || 0);
     }
     // 运行态模块可独立加载；兼容旧 controller stub 与旧页面加载顺序。
+    if (item?.risk_isolated && Number(item?.risk_until || 0) > 0) return Number(item.risk_until);
     return Number(item?.health_state === 'breaker_open' ? item?.breaker_until : item?.cooldown_until || 0);
   },
 
@@ -134,10 +214,17 @@ const ConfigTabRuntimeView = {
       const stateEl = document.getElementById('model-health-state');
       if (stateEl) stateEl.textContent = controller.modelHealthLabel(healthState);
       const failuresEl = document.getElementById('model-consecutive-failures');
-      if (failuresEl) failuresEl.textContent = `${Number(m?.consecutive_failures || 0)} 次`;
+      const attemptFailures = (m?.attempt_window || []).filter(result => result === 'qualified_failure').length;
+      if (failuresEl) failuresEl.textContent = `${attemptFailures} / 5`;
       const reasonEl = document.getElementById('model-health-reason');
       if (reasonEl) reasonEl.textContent = m?.derived_reason || m?.breaker_reason || m?.cooldown_reason || m?.last_error || '-';
       const row = display.closest('.form-row');
+      const deadlineLabel = row?.querySelector('label');
+      if (deadlineLabel) {
+        deadlineLabel.textContent = healthState === 'risk_isolated'
+          ? '风险隔离截止'
+          : (healthState === 'breaker_open' ? '熔断截止' : '冷却截止');
+      }
       const recover = row?.querySelector('#model-recover');
       const canRecover = Boolean(
         m

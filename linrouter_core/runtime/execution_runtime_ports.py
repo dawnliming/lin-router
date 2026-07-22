@@ -5,6 +5,7 @@ these explicit ports individually; it never receives the compatibility router.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
@@ -52,9 +53,37 @@ class RequestPreparationPort:
     def body_for_upstream(self, *args: Any) -> Tuple[bytes, str]: return self._body_for(*args)
     def headers_for(self, *args: Any, **kwargs: Any) -> Dict[str, str]: return self._headers_for(*args, **kwargs)
     def aggregate_log_suffix(self, **kwargs: Any) -> str: return self._aggregate_log_suffix(**kwargs)
-    def debug_detail(self, *args: Any, **kwargs: Any) -> str: return self._debug_detail(*args, **kwargs)
+    @staticmethod
+    def _safe_observability_payload(payload: Any) -> Dict[str, Any]:
+        """删除仅供本地路由选择的会话字段，避免进入任意诊断持久化路径。"""
+        safe_payload = dict(payload) if isinstance(payload, dict) else {}
+        safe_payload.pop("session_id", None)
+        return safe_payload
+
+    @classmethod
+    def _safe_observability_body(cls, payload: Any) -> bytes:
+        return json.dumps(
+            cls._safe_observability_payload(payload),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    def debug_detail(self, *args: Any, **kwargs: Any) -> str:
+        safe_args = list(args)
+        if len(safe_args) >= 6:
+            safe_payload = self._safe_observability_payload(safe_args[5])
+            safe_args[4] = self._safe_observability_body(safe_payload)
+            safe_args[5] = safe_payload
+        return self._debug_detail(*safe_args, **kwargs)
     def short_error(self, error: str) -> str: return self._short_error(error)
-    def payload_fingerprint(self, *args: Any, **kwargs: Any) -> str: return self._fingerprint(*args, **kwargs)
+    def payload_fingerprint(self, *args: Any, **kwargs: Any) -> str:
+        safe_args = list(args)
+        if safe_args:
+            safe_payload = self._safe_observability_payload(safe_args[0])
+            safe_args[0] = safe_payload
+            if len(safe_args) >= 2:
+                safe_args[1] = self._safe_observability_body(safe_payload)
+        return self._fingerprint(*safe_args, **kwargs)
 
 
 class ConcurrencyPort:
@@ -95,9 +124,9 @@ class StreamLifecyclePort:
 
 
 class ObservabilityPort:
-    def __init__(self, *, start: Callable[..., None], update: Callable[..., None], finish: Callable[..., None], add_log: Callable[..., None], patch_stream: Callable[..., bool], cancellation_requested: Callable[[str], bool], downstream_write_failed: Callable[[str], bool], set_response: Callable[[str, Any], None], close_response: Callable[..., bool]) -> None:
+    def __init__(self, *, start: Callable[..., None], update: Callable[..., None], finish: Callable[..., None], add_log: Callable[..., None], patch_stream: Callable[..., bool], cancellation_requested: Callable[[str], bool], downstream_write_failed: Callable[[str], bool], downstream_failure_category: Callable[[str], str], set_response: Callable[[str, Any], None], close_response: Callable[..., bool]) -> None:
         self._start = start; self._update = update; self._finish = finish; self._add_log = add_log; self._patch_stream = patch_stream
-        self._cancellation_requested = cancellation_requested; self._downstream_write_failed = downstream_write_failed; self._set_response = set_response; self._close_response = close_response
+        self._cancellation_requested = cancellation_requested; self._downstream_write_failed = downstream_write_failed; self._downstream_failure_category = downstream_failure_category; self._set_response = set_response; self._close_response = close_response
     def start_live_request(self, *args: Any, **kwargs: Any) -> None: self._start(*args, **kwargs)
 
     def update_live_request(self, *args: Any, **kwargs: Any) -> None: self._update(*args, **kwargs)
@@ -106,6 +135,7 @@ class ObservabilityPort:
     def patch_stream_lifecycle(self, *args: Any, **kwargs: Any) -> bool: return self._patch_stream(*args, **kwargs)
     def cancellation_requested(self, request_id: str) -> bool: return self._cancellation_requested(request_id)
     def downstream_write_failed(self, request_id: str) -> bool: return self._downstream_write_failed(request_id)
+    def downstream_failure_category(self, request_id: str) -> str: return self._downstream_failure_category(request_id)
     def set_live_response(self, request_id: str, response: Any) -> None: self._set_response(request_id, response)
     def close_live_response(self, request_id: str, response: Any = None) -> bool: return self._close_response(request_id, response)
 

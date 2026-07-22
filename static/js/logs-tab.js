@@ -488,8 +488,10 @@ const LogsTab = {
       parsed.type,
       parsed.category,
       parsed.failure_reason,
+      parsed.failure_category,
       parsed.fallback_reason,
       parsed.waf_blocked,
+      parsed.risk_isolated,
       this.finalLifecycle(parsed),
     ];
     return fields.filter(value => value !== undefined && value !== null).join(' ').toLowerCase();
@@ -861,7 +863,8 @@ const LogsTab = {
       underlying_model_disabled: '底层模型停用，配置过滤',
       underlying_model_cooling: '底层模型冷却中，健康过滤',
       underlying_model_missing: '底层模型不存在，配置异常',
-      underlying_group_missing: '底层连接组不存在，配置异常'
+      underlying_group_missing: '底层连接组不存在，配置异常',
+      risk_isolated: '检测到上游风控拦截，当前凭证已隔离'
     };
     return map[reason] || reason || '-';
   },
@@ -870,6 +873,9 @@ const LogsTab = {
     const reason = parsed.fallback_reason || parsed.skip_reason || parsed.reason || '';
     if (reason === 'large_task_in_progress') return '候选正在处理大上下文请求，调度切换';
     if (reason === 'candidate_busy') return '候选忙/等待锁超时，调度切换';
+    if (reason === 'risk_isolated') return '检测到上游风控拦截，当前凭证已隔离并跳过';
+    if (reason === 'aggregate_first_frame_timeout') return '聚合首帧总预算耗尽，停止继续切换';
+    if (reason === 'first_frame_timeout') return '等待首个完整 SSE 帧超时，首帧前可切换';
     if (reason === 'stream_idle_timeout') return '上游流式空闲超时，健康失败';
     if (String(item.event || '') === 'serial_protection_timeout') return '串行保护候选忙，调度切换';
     if (String(item.event || '') === 'waf_lock_timeout') return '候选忙/等待锁超时，调度切换（旧版）';
@@ -914,13 +920,18 @@ const LogsTab = {
   },
 
   renderWafHint(parsed, diagnosis = null) {
-    if (parsed.waf_blocked !== 'true' || diagnosis?.title === '请求成功' || diagnosis?.title === '请求级错误 / 上游拒绝') return '';
-    const message = '上游中转站拦截了本次请求。';
-    const suggestion = parsed.suggestion || '';
+    if (parsed.waf_blocked !== 'true' || diagnosis?.title === '请求成功') return '';
+    const isolated = parsed.risk_isolated === 'true';
+    const message = isolated
+      ? '检测到上游风控拦截，当前凭证下的候选已暂停自动请求。'
+      : '上游中转站拦截了本次请求。';
+    const suggestion = isolated
+      ? '不要连续重试；请检查中转后台账号状态、渠道权限、频率限制和风控通知。'
+      : (parsed.suggestion || '');
     const wafOn = parsed.waf_compatible === 'true';
-    const typeClass = wafOn ? 'log-waf-hint-open' : 'log-waf-hint-closed';
-    const icon = wafOn ? '⚠️' : '🛡️';
-    const title = wafOn ? 'WAF 已开启但仍被拦截' : 'WAF 兼容未开启';
+    const typeClass = isolated ? 'log-waf-hint-open' : (wafOn ? 'log-waf-hint-open' : 'log-waf-hint-closed');
+    const icon = isolated ? '⚠️' : (wafOn ? '⚠️' : '🛡️');
+    const title = isolated ? '检测到上游风控拦截，已隔离凭证' : (wafOn ? 'WAF 已开启但仍被拦截' : 'WAF 兼容未开启');
     return `
       <div class="log-waf-hint ${typeClass}">
         <div class="log-waf-hint-title">${icon} ${Utils.escapeHtml(title)}</div>
@@ -948,6 +959,18 @@ const LogsTab = {
     }
     if (lifecycle === 'interrupted' || lifecycle === 'stream_interrupted_after_restart') {
       return { className: 'info', title: '服务重启后流已中断', scope: 'process_restart', cooldown: '否', suggestion: '重启前未收到流终态，记录已安全恢复为中断状态；不会被当作实时请求或成功响应。' };
+    }
+    if (text.includes('aggregate_first_frame_timeout')) {
+      return { className: 'danger', title: '聚合首帧总预算耗尽', scope: 'upstream', cooldown: '否', suggestion: '聚合候选在首个完整 SSE 帧前耗尽总预算，系统没有继续发起新的上游请求。' };
+    }
+    if (text.includes('first_frame_timeout')) {
+      return { className: 'danger', title: '首个完整 SSE 帧超时', scope: 'upstream', cooldown: item.cooldown_applied ? '是' : '可能', suggestion: '候选在首帧前超时；尚未下发内容时系统才会切换其他候选。' };
+    }
+    if (text.includes('connect_timeout')) {
+      return { className: 'danger', title: '上游连接或响应头超时', scope: 'upstream', cooldown: item.cooldown_applied ? '是' : '可能', suggestion: '候选未及时建立连接或返回响应头，系统已按健康失败处理。' };
+    }
+    if (text.includes('risk_isolated=true')) {
+      return { className: 'warning', title: '检测到上游风控拦截，已隔离凭证', scope: 'candidate', cooldown: '否', suggestion: '该凭证下同一上游候选已暂停自动请求；请检查账号状态、渠道权限、频率限制和风控通知，不要连续重试。' };
     }
     if (lifecycle === 'stream_idle_timeout' || String(item.event || '') === 'stream_timeout') {
       return { className: 'danger', title: '上游流式响应空闲超时', scope: 'upstream', cooldown: item.cooldown_applied ? '是' : '可能', suggestion: '建议稍后重试，或对冷却中的单个模型/成员点击“重试恢复”。' };
@@ -1024,9 +1047,13 @@ const LogsTab = {
     if (this.isSuccessfulRecord(item, parsed)) return '请求成功';
     const text = `${item.status || ''} ${item.event || ''} ${item.failure_scope || ''} ${item.detail || ''}`.toLowerCase();
     if (text.includes('serial_protection_wait_timeout') || text.includes('waf_lock_wait_timeout') || text.includes('candidate_busy') || text.includes('large_task_in_progress')) return '该连接组已开启串行保护，候选忙后已尝试切换';
+    if (text.includes('aggregate_first_frame_timeout')) return '聚合首帧总预算已耗尽，未继续发起新的上游请求';
+    if (text.includes('first_frame_timeout')) return '等待首个完整 SSE 事件超时，首帧前已按规则切换';
+    if (text.includes('connect_timeout')) return '上游连接或响应头超时';
     if (text.includes('stream_idle_timeout')) return '上游流式响应长时间无数据，已判定为空闲超时';
     if (text.includes('read_timeout') || (text.includes('timeout') && !text.includes('waf_lock') && !text.includes('serial_protection'))) return '上游响应超时';
     if (this.isCurrentAuthFailure(item, parsed)) return '上游鉴权失败，请检查 API Key 或权限';
+    if (text.includes('risk_isolated=true')) return '检测到上游风控拦截，当前凭证已暂停自动请求';
     if (text.includes('waf_blocked')) return '上游中转站的 WAF 拦截了请求';
     if (text.includes('rate_limit') || text.includes('429')) return '上游触发限流，请稍后重试';
     if (text.includes('request_level') || text.includes('upstream_request_rejected')) return '请求参数或内容策略被上游拒绝';

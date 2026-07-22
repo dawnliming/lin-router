@@ -34,6 +34,22 @@ const ConfigTabForm = {
     controller._draftBaselines?.delete(key);
   },
 
+  restoreFailedAutoSaveBaseline(controller, selection, savingRevision) {
+    const selected = Store.selected;
+    const hasNewerEdit = (controller._autoSaveRevision || 0) > Number(savingRevision || 0);
+    if (
+      hasNewerEdit
+      || selected?.type !== selection?.type
+      || selected?.id !== selection?.id
+    ) return false;
+
+    // 同一 generation 的自动保存失败时，Store 仍是最后一次成功持久化的完整基线。
+    // 清理失败草稿后重渲染，避免残留字段与服务端基线混合显示。
+    this.clearDraft(controller, selection);
+    controller.render();
+    return true;
+  },
+
   sameFormValues(left, right) {
     const leftKeys = Object.keys(left || {});
     const rightKeys = Object.keys(right || {});
@@ -78,6 +94,11 @@ const ConfigTabForm = {
     return g.ark_api_key || '';
   },
 
+  groupKeyConfigured(controller, group, provider) {
+    if (provider === 'proxy') return Boolean(group?.api_key_configured || group?.api_key);
+    return Boolean(group?.ark_api_key_configured || group?.ark_api_key);
+  },
+
   syncUIFromState(controller) {
     const sel = Store.selected;
     if (sel.type === 'aggregate') controller.syncAggregateUI();
@@ -88,6 +109,7 @@ const ConfigTabForm = {
   syncAggregateUI(controller) {
     // 聚合模型表单无需动态切换，定时刷新成员状态由 Store 订阅触发 re-render 完成
     controller.updateAggregateCooldownDisplay();
+    this.syncRoutingPolicyUI(controller, 'aggregate');
   },
 
   updateAggregateCooldownDisplay(controller) {
@@ -125,6 +147,7 @@ const ConfigTabForm = {
       else if (mode === 'relay') hint.textContent = '中转站：组内只保存 Base URL；每个模型通道单独保存 API Key 和上游模型。';
       else hint.textContent = '通用代理：组内保存 Base URL 和上游 API Key；未配置的具体模型保持原样透传。';
     }
+    this.syncRoutingPolicyUI(controller, 'group');
   },
 
   updateDefaultRelayBaseUrlHint(controller) {
@@ -190,7 +213,7 @@ const ConfigTabForm = {
   },
 
   bindGroupWorkflowActions(controller, panel) {
-    panel?.querySelectorAll('#group-workflow-card [data-group-action]').forEach(btn => {
+    panel?.querySelectorAll('#group-workflow-card [data-group-action], [data-group-risk-alert] [data-group-action]').forEach(btn => {
       btn.addEventListener('click', () => controller.onGroupWorkflowAction(btn.dataset.groupAction, btn.dataset.modelId));
     });
   },
@@ -208,12 +231,54 @@ const ConfigTabForm = {
   bindAutoSave(controller, form) {
     if (!form) return;
     form.querySelectorAll('input, select, textarea').forEach(el => {
-      // 失焦/变更只保存进程内草稿，正式保存统一由显式 submit 触发。
-      if (el.id === 'aggregate-stats-limit' || el.dataset.transientControl === 'true') return;
-      ['input', 'change', 'blur'].forEach(event => {
-        el.addEventListener(event, () => this.captureDraft(controller, form));
+      // 新建对象仍要求显式保存，避免用户输入名称时提前创建半成品配置。
+      if (
+        el.id === 'aggregate-stats-limit'
+        || el.dataset.transientControl === 'true'
+        || el.id.endsWith('-routing-policy')
+      ) return;
+      // 文本编辑结束后再提交，避免输入中把半成品写入服务端。
+      const event = ['select-one', 'checkbox', 'radio'].includes(el.type) ? 'change' : 'blur';
+      el.addEventListener(event, () => {
+        this.captureDraft(controller, form);
+        this.scheduleAutoSave(controller, form);
       });
     });
+  },
+
+  scheduleAutoSave(controller, form, preserveRevision = false) {
+    const selection = Store.selected;
+    // 未持久化对象缺少稳定 ID，不能自动创建；其余编辑使用 500ms 合并保存。
+    if (!selection?.id) return;
+    if (!preserveRevision) controller._autoSaveRevision = (controller._autoSaveRevision || 0) + 1;
+    // 保存中的新编辑仍要递增 generation；finally 会据此重新安排下一次合并保存。
+    if (controller._autoSaveInFlight) return;
+    clearTimeout(controller._autoSaveTimer);
+    controller._autoSaveTimer = setTimeout(() => this.flushAutoSave(controller, form, selection), 500);
+    controller.setSaveStatus('draft');
+  },
+
+  async flushAutoSave(controller, form, selection) {
+    if (
+      controller._autoSaveInFlight
+      || !form?.isConnected
+      || Store.selected.type !== selection.type
+      || Store.selected.id !== selection.id
+    ) return;
+    controller._autoSaveInFlight = true;
+    controller._autoSaveSavingRevision = controller._autoSaveRevision || 0;
+    const event = { preventDefault() {}, autoSave: true };
+    try {
+      if (selection.type === 'group') await controller.onGroupSubmit(event);
+      else if (selection.type === 'model') await controller.onModelSubmit(event);
+      else if (selection.type === 'aggregate') await controller.onAggregateSubmit(event);
+    } finally {
+      controller._autoSaveInFlight = false;
+      // 保存期间继续输入时，保留最新草稿并发起下一次合并保存。
+      if ((controller._autoSaveRevision || 0) > (controller._autoSaveSavingRevision || 0)) {
+        this.scheduleAutoSave(controller, document.querySelector('#panel-config .config-form'), true);
+      }
+    }
   },
 
   _captureFormValues(controller, form = document.getElementById('panel-config')) {
@@ -277,11 +342,13 @@ const ConfigTabForm = {
     const name = document.getElementById('group-name')?.value.trim() || '';
     const baseUrl = document.getElementById('group-base')?.value.trim() || '';
     const key = document.getElementById('group-key')?.value.trim() || '';
+    const stored = Store.getGroup(document.getElementById('group-id')?.value || '');
+    const hasStoredKey = this.groupKeyConfigured(controller, stored, mode);
     const errors = [];
     if (!name) errors.push(['group-name', '请填写连接组名称。']);
     if (!baseUrl) errors.push(['group-base', '请填写 Base URL，例如 https://example.com/v1。']);
     else if (!ConnectionStatus.isValidBaseUrl(baseUrl)) errors.push(['group-base', 'Base URL 格式不正确，请使用 http:// 或 https:// 地址。']);
-    if (['ark', 'proxy'].includes(mode) && !key) errors.push(['group-key', '请填写上游 API Key 后再保存。']);
+    if (['ark', 'proxy'].includes(mode) && !key && !hasStoredKey) errors.push(['group-key', '请填写上游 API Key 后再保存。']);
     errors.forEach(([id, message]) => controller.setFieldError(id, message));
     if (focus && errors.length) document.getElementById(errors[0][0])?.focus();
     return { ok: !errors.length, message: errors[0]?.[1] || '' };
@@ -296,13 +363,25 @@ const ConfigTabForm = {
       ? 'model-upstream' : 'model-ep';
     const upstream = document.getElementById(upstreamId)?.value.trim() || '';
     const relayKey = document.getElementById('model-key')?.value.trim() || '';
+    const stored = Store.getModel(document.getElementById('model-id')?.value || '');
+    const hasStoredKey = Boolean(stored?.api_key_configured || stored?.api_key);
     const errors = [];
     if (!name) errors.push(['model-name', '请填写模型名称。']);
     if (!upstream) errors.push([upstreamId, group?.provider_type === 'ark' ? '请填写上游模型或 EP ID。' : '请填写上游模型名称。']);
-    if (group?.provider_type === 'relay' && !relayKey) errors.push(['model-key', '请填写中转站 API Key。']);
+    if (group?.provider_type === 'relay' && !relayKey && !hasStoredKey) errors.push(['model-key', '请填写中转站 API Key。']);
     errors.forEach(([id, message]) => controller.setFieldError(id, message));
     if (focus && errors.length) document.getElementById(errors[0][0])?.focus();
     return { ok: !errors.length, message: errors[0]?.[1] || '' };
+  },
+
+  validateAggregateForm(controller, { focus = false } = {}) {
+    const form = document.getElementById('aggregate-form');
+    controller.clearFieldErrors(form);
+    const name = document.getElementById('aggregate-name')?.value.trim() || '';
+    if (name) return { ok: true, message: '' };
+    controller.setFieldError('aggregate-name', '请填写聚合模型名。');
+    if (focus) document.getElementById('aggregate-name')?.focus();
+    return { ok: false, message: '请填写聚合模型名。' };
   },
 
   autoSaveGroup(controller) {
@@ -315,5 +394,18 @@ const ConfigTabForm = {
 
   autoSaveAggregate(controller) {
     controller.captureDraft(document.getElementById('aggregate-form'));
-  }
+  },
+
+  routingPolicyFromForm(controller, prefix) {
+    return document.getElementById(`${prefix}-routing-policy`)?.value || 'smart_breaker';
+  },
+
+  syncRoutingPolicyUI(controller, prefix) {
+    const policy = this.routingPolicyFromForm(controller, prefix);
+    // 固定冷却沿用历史分钟字段；页面只展示一个明确的数据来源。
+    document.getElementById(`${prefix}-cooldown-row`)?.classList.toggle(
+      'hidden',
+      policy !== 'fixed_cooldown',
+    );
+  },
 };

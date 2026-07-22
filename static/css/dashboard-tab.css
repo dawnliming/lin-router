@@ -39,6 +39,44 @@
   flex: 0 0 auto;
 }
 
+/* 风控隔离只展示安全运行态，不展示 host、凭证、摘要或上游拦截正文。 */
+.dashboard-risk-alert {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--warning-border);
+  border-left: 3px solid var(--warning);
+  border-radius: var(--radius-overlay);
+  background: var(--bg-primary);
+}
+
+.dashboard-risk-alert h3 {
+  margin: 0 0 var(--space-1);
+  font-size: 18px;
+  line-height: 28px;
+}
+
+.dashboard-risk-alert p {
+  max-width: 800px;
+  margin: var(--space-1) 0 0;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.dashboard-risk-eyebrow {
+  margin-bottom: var(--space-1);
+  color: var(--warning);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.dashboard-risk-alert .dashboard-flow-actions {
+  flex: 0 0 auto;
+  margin-top: 0;
+}
+
 .dashboard-hero-operational {
   align-items: stretch;
 }

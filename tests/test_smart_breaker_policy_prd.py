@@ -79,56 +79,62 @@ def test_missing_setting_defaults_to_enabled_and_explicit_false_is_preserved(tmp
 
 
 def test_model_and_member_use_prd_failure_ladder(tmp_path) -> None:
+    """PRD v1.0：最近 5 次窗口中 3 次合格失败开熔断；阶梯 60/180/300s，封顶 600s。
+
+    success 不清空窗口；5 次保留成功才归零等级。model 与 member 作用域独立，不串写。
+    """
     router, _settings = _router(tmp_path)
     member = router.store.find_aggregate_member("am1")
     assert member is not None
 
-    for expected_count in range(1, 4):
+    # 第 1、2 次合格失败：仍在观察态，未触发熔断。
+    for qualified_failures in range(1, 3):
         router._set_cooldown(0, "upstream unavailable", 0, "server_error_503")
         router._set_aggregate_member_cooldown(member.id, "upstream unavailable", 0, "server_error_503")
         model = router.store.models[0]
         assert model.health_state == "observing"
-        assert model.consecutive_failures == expected_count
+        assert model.consecutive_failures == qualified_failures
         assert model.cooldown_until == 0
         assert member.health_state == "observing"
-        assert member.consecutive_failures == expected_count
+        assert member.consecutive_failures == qualified_failures
         assert member.cooldown_until == 0
 
-    for expected_count, expected_state, expected_seconds in (
-        (4, "cooling", 30),
-        (5, "cooling", 60),
-        (6, "cooling", 180),
-        (7, "breaker_open", 300),
-    ):
-        before = int(time.time())
-        router._set_cooldown(0, "upstream unavailable", 0, "server_error_503")
-        router._set_aggregate_member_cooldown(member.id, "upstream unavailable", 0, "server_error_503")
-        model = router.store.models[0]
-        assert model.consecutive_failures == expected_count
-        assert model.health_state == expected_state
-        assert member.consecutive_failures == expected_count
-        assert member.health_state == expected_state
-        deadline = model.breaker_until if expected_state == "breaker_open" else model.cooldown_until
-        member_deadline = member.breaker_until if expected_state == "breaker_open" else member.cooldown_until
-        assert before + expected_seconds <= deadline <= before + expected_seconds + 1
-        assert before + expected_seconds <= member_deadline <= before + expected_seconds + 1
+    # 第 3 次合格失败：3/5 触发熔断，breaker_level=1，冷却 60 秒。
+    before = int(time.time())
+    router._set_cooldown(0, "upstream unavailable", 0, "server_error_503")
+    router._set_aggregate_member_cooldown(member.id, "upstream unavailable", 0, "server_error_503")
+    model = router.store.models[0]
+    assert model.health_state == "breaker_open"
+    assert model.breaker_level == 1
+    assert before + 60 <= model.breaker_until <= before + 61
+    assert member.health_state == "breaker_open"
+    assert member.breaker_level == 1
+    assert before + 60 <= member.breaker_until <= before + 61
+
+    # model 和 member 作用域独立：只写 model 不影响 member 的失败计数。
+    model_before = model.consecutive_failures
+    member_before = member.consecutive_failures
+    router._set_cooldown(0, "upstream unavailable", 0, "server_error_503")
+    assert router.store.models[0].consecutive_failures == model_before + 1
+    assert router.store.find_aggregate_member("am1").consecutive_failures == member_before
 
 
 def test_expired_cooling_observes_and_expired_breaker_requires_single_probe(tmp_path) -> None:
     router, _settings = _router(tmp_path)
     model = router.store.models[0]
     model.health_state = "cooling"
-    model.consecutive_failures = 4
+    model.consecutive_failures = 2
     model.cooldown_until = int(time.time()) - 1
     router.store.save()
 
     router.store.refresh_expired_cooldowns()
     assert model.health_state == "observing"
-    assert model.consecutive_failures == 4
+    assert model.consecutive_failures == 2
     assert model.cooldown_until == 0
 
     model.health_state = "breaker_open"
-    model.consecutive_failures = 7
+    model.consecutive_failures = 3
+    model.breaker_level = 1
     model.breaker_until = int(time.time()) - 1
     router.store.save()
 
@@ -153,11 +159,12 @@ def test_disabling_breaker_clears_system_health_but_keeps_manual_disable(tmp_pat
     model.disabled_by_user = True
     model.usable = False
     model.health_state = "breaker_open"
-    model.consecutive_failures = 7
-    model.breaker_until = int(time.time()) + 300
+    model.consecutive_failures = 3
+    model.breaker_level = 1
+    model.breaker_until = int(time.time()) + 60
     model.last_error = "redacted_sha256:1234567890abcdef,bytes:8"
     member.health_state = "cooling"
-    member.consecutive_failures = 4
+    member.consecutive_failures = 2
     member.cooldown_until = int(time.time()) + 30
     member.last_error = "redacted_sha256:abcdef1234567890,bytes:8"
     router.store.save()
@@ -179,8 +186,11 @@ def test_disabling_breaker_clears_system_health_but_keeps_manual_disable(tmp_pat
 
 
 def _open_breaker(router, *, model_index: int = 0, member_id: str | None = None) -> None:
-    """通过真实失败累计进入 breaker，禁止测试直接伪造 usable 状态。"""
-    for _ in range(7):
+    """通过真实失败累计进入 breaker，禁止测试直接伪造 usable 状态。
+
+    PRD v1.0 将熔断从连续 7 次改为 3/5 窗口：3 次合格失败即开熔断。
+    """
+    for _ in range(3):
         router._set_cooldown(model_index, "upstream unavailable", 0, "server_error_503")
         if member_id:
             router._set_aggregate_member_cooldown(
@@ -225,7 +235,8 @@ def test_member_and_underlying_breaker_projection_never_reports_healthy(tmp_path
 
     assert member_item["derived_status"] == "breaker_open"
     assert member_item["derived_status"] != "healthy"
-    assert member_item["consecutive_failures"] == 7
+    # PRD v1.0：3/5 窗口语义下，3 次合格失败即开熔断。
+    assert member_item["consecutive_failures"] == 3
     assert member_item["breaker_until"] == member.breaker_until
     assert model_item["derived_status"] == "breaker_open"
     assert model_item["usable"] is False

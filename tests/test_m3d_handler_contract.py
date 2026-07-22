@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import inspect
 import io
 import subprocess
@@ -18,7 +19,6 @@ from linrouter_core.runtime.handler_runtime import handle_proxy_request
 ROOT = Path(__file__).resolve().parent.parent
 FROZEN_METHODS = {
     "_require_route_context",
-    "finalize_stream_if_needed",
 }
 TARGET_MARKER = '        if parsed.path.startswith("/v1/") or parsed.path.startswith("/chat/"):'
 
@@ -43,6 +43,75 @@ def _post_non_target_parts(source: str) -> tuple[str, str]:
     target = post.index(TARGET_MARKER, start)
     end = post.index('        self._send_json({"error": {"message": "资源不存在"', target)
     return post[start:target], post[end:]
+
+
+def _method_node(source: str, name: str) -> ast.FunctionDef:
+    tree = ast.parse(source)
+    for class_node in tree.body:
+        if not isinstance(class_node, ast.ClassDef):
+            continue
+        for node in class_node.body:
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node
+    raise AssertionError(f"missing method: {name}")
+
+
+def _finalize_failure_scope_expression(source: str) -> ast.expr:
+    method = _method_node(source, "finalize_stream_if_needed")
+    for node in ast.walk(method):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (isinstance(node.func, ast.Attribute) and node.func.attr == "patch_stream_lifecycle"):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "failure_scope":
+                return keyword.value
+    raise AssertionError("finalize_stream_if_needed must set failure_scope")
+
+
+class _NormalizeFinalizeDownstreamP0Ast(ast.NodeTransformer):
+    """仅归一 P0-4 明确授权的下游交付终态字段，其余方法结构继续冻结。"""
+
+    _FINALIZE_VALUES = {
+        "final_status": "client_disconnected",
+        "lifecycle": "client_disconnected",
+        "final_result": "client_disconnected",
+        "lock_release_reason": "client_disconnect",
+        "failure_scope": "request",
+    }
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        node = self.generic_visit(node)
+        if node.name != "finalize_stream_if_needed":
+            return node
+        body: list[ast.stmt] = []
+        for statement in node.body:
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
+                target = statement.targets[0].id
+                if target in {
+                    "downstream_failure_category",
+                    "downstream_write_failed",
+                    "downstream_result",
+                }:
+                    continue
+            body.append(statement)
+        node.body = body
+        return node
+
+    def visit_Call(self, node: ast.Call) -> ast.Call:
+        node = self.generic_visit(node)
+        if not (isinstance(node.func, ast.Attribute) and node.func.attr == "patch_stream_lifecycle"):
+            return node
+        for keyword in node.keywords:
+            if keyword.arg in self._FINALIZE_VALUES:
+                keyword.value = ast.Constant(value=self._FINALIZE_VALUES[keyword.arg])
+        return node
+
+
+def _normalized_finalize_method(source: str) -> str:
+    method = copy.deepcopy(_method_node(source, "finalize_stream_if_needed"))
+    normalized = _NormalizeFinalizeDownstreamP0Ast().visit(method)
+    return ast.dump(ast.fix_missing_locations(normalized), include_attributes=False)
 
 
 class FakeIterator:
@@ -115,6 +184,16 @@ def test_m3d_frozen_methods_and_non_target_post_branches_match_m3c_baseline() ->
     )
     current = (ROOT / "app.py").read_text(encoding="utf-8")
     assert _methods(baseline, FROZEN_METHODS) == _methods(current, FROZEN_METHODS)
+
+    # P0-4 的唯一冻结豁免：已提交 SSE 后，明确下游写失败归属 downstream。
+    assert _normalized_finalize_method(baseline) == _normalized_finalize_method(current)
+    baseline_scope = _finalize_failure_scope_expression(baseline)
+    current_scope = _finalize_failure_scope_expression(current)
+    assert isinstance(baseline_scope, ast.Constant) and baseline_scope.value == "request"
+    assert isinstance(current_scope, ast.IfExp)
+    assert isinstance(current_scope.test, ast.Name) and current_scope.test.id == "downstream_write_failed"
+    assert isinstance(current_scope.body, ast.Constant) and current_scope.body.value == "downstream"
+    assert isinstance(current_scope.orelse, ast.Constant) and current_scope.orelse.value == "request"
 
 
 class _NormalizeMovedProxyAst(ast.NodeTransformer):

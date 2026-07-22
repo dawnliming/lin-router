@@ -225,53 +225,60 @@ def test_breaker_disabled_explicit_http_5xx_never_opens(tmp_path: Any) -> None:
         _assert_no_live_requests(router)
 
 
-def test_breaker_opens_for_explicit_non_stream_http_5xx_then_manual_recover(tmp_path: Any) -> None:
+def test_breaker_opens_after_three_of_five_explicit_non_stream_http_5xx_then_manual_recover(tmp_path: Any) -> None:
     with LocalMockUpstream() as upstream:
         router, context = _router(tmp_path, upstream, breaker=True)
 
-        for expected_count in range(1, 8):
+        for expected_count in range(1, 4):
             error = _assert_all_models_failed(lambda: router.call("/v1/chat/completions", _payload("explicit-model"), context))
             assert error.error_code == "all_models_failed"
             assert upstream.call_count == expected_count
 
         model = router.store.models[0]
         assert model.health_state == "breaker_open"
-        assert model.consecutive_failures == 7
+        assert model.consecutive_failures == 3
+        assert model.attempt_window == ["qualified_failure"] * 3
+        assert model.breaker_level == 1
         assert model.breaker_until > int(time.time())
 
         no_candidate = _assert_all_models_failed(lambda: router.call("/v1/chat/completions", _payload("explicit-model"), context))
         assert no_candidate.error_code == "no_usable_models"
-        assert upstream.call_count == 7
+        assert upstream.call_count == 3
         _assert_no_live_requests(router)
 
         upstream.set_response("upstream-one", 200, _ok_body())
         recovered = router.recover_model(model.id)
         assert recovered["ok"] is True
-        assert upstream.call_count == 8
+        assert upstream.call_count == 4
         assert model.health_state == "normal"
-        assert model.consecutive_failures == 0
+        # 半开成功只恢复可路由状态；窗口历史和等级要等待五次连续成功后再清零。
+        assert model.consecutive_failures == 3
+        assert model.attempt_window == ["qualified_failure"] * 3 + ["success"]
+        assert model.breaker_level == 1
         assert model.breaker_until == 0
         assert model.usable is True
         _assert_no_live_requests(router)
 
 
-def test_breaker_opens_for_explicit_stream_http_5xx_and_skips_eighth(tmp_path: Any) -> None:
+def test_breaker_opens_after_three_of_five_explicit_stream_http_5xx_and_skips_fourth(tmp_path: Any) -> None:
     with LocalMockUpstream() as upstream:
         router, context = _router(tmp_path, upstream, breaker=True)
 
-        for expected_count in range(1, 8):
+        for expected_count in range(1, 4):
             error = _assert_all_models_failed(lambda: router.stream("/v1/chat/completions", _payload("explicit-model", stream=True), context))
             assert error.error_code == "all_models_failed"
             assert upstream.call_count == expected_count
 
         model = router.store.models[0]
         assert model.health_state == "breaker_open"
-        assert model.consecutive_failures == 7
+        assert model.consecutive_failures == 3
+        assert model.attempt_window == ["qualified_failure"] * 3
+        assert model.breaker_level == 1
         assert model.breaker_until > int(time.time())
 
         no_candidate = _assert_all_models_failed(lambda: router.stream("/v1/chat/completions", _payload("explicit-model", stream=True), context))
         assert no_candidate.error_code == "no_usable_models"
-        assert upstream.call_count == 7
+        assert upstream.call_count == 3
         _assert_no_live_requests(router)
 
 
@@ -281,11 +288,10 @@ def test_breaker_opens_for_explicit_stream_http_5xx_and_skips_eighth(tmp_path: A
         (400, _error_body("invalid_request_error", "bad request")),
         (401, _error_body("authentication_error", "unauthorized")),
         (403, _error_body("permission_error", "forbidden")),
-        (403, _error_body("permission_error", "your request was blocked by WAF")),
     ],
-    ids=["400", "401", "403", "waf"],
+    ids=["400", "401", "403"],
 )
-def test_request_level_and_waf_http_failures_do_not_count_toward_breaker(tmp_path: Any, status: int, body: bytes) -> None:
+def test_request_level_http_failures_do_not_count_toward_breaker(tmp_path: Any, status: int, body: bytes) -> None:
     with LocalMockUpstream() as upstream:
         upstream.set_default(status, body)
         router, context = _router(tmp_path, upstream, breaker=True)
@@ -296,6 +302,28 @@ def test_request_level_and_waf_http_failures_do_not_count_toward_breaker(tmp_pat
 
         assert upstream.call_count == 3
         _assert_clean_breaker(router)
+        _assert_no_live_requests(router)
+
+
+def test_waf_http_failures_enter_risk_isolation_without_polluting_breaker(tmp_path: Any) -> None:
+    with LocalMockUpstream() as upstream:
+        upstream.set_default(403, _error_body("permission_error", "your request was blocked by WAF"))
+        router, context = _router(tmp_path, upstream, breaker=True)
+
+        for _ in range(2):
+            response_status, _headers, _data = router.call("/v1/chat/completions", _payload("explicit-model"), context)
+            assert response_status == 403
+
+        model = router.store.models[0]
+        risk = router.candidate_health.risk_status_for_model(model)
+        assert upstream.call_count == 2
+        assert risk["risk_isolated"] is True
+        assert model.attempt_window == []
+        _assert_clean_breaker(router)
+
+        blocked = _assert_all_models_failed(lambda: router.call("/v1/chat/completions", _payload("explicit-model"), context))
+        assert blocked.error_code == "no_usable_models"
+        assert upstream.call_count == 2
         _assert_no_live_requests(router)
 
 

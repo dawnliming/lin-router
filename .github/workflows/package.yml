@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to build, for example v0.6.3.
+        description: Existing release tag to build, for example v0.6.4.
         required: true
         type: string
   push:

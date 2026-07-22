@@ -2,6 +2,10 @@
 lin-router-config.json
 lin-router-settings.json
 lin-router-logs.jsonl
+lin-router-risk-index.json
+lin-router-risk-index.json.tmp
+*.risk-index.json
+*.risk-index.json.tmp
 *config-test*.json
 *.tmp.json
 

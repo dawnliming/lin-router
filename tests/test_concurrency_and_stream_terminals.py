@@ -337,7 +337,9 @@ def test_response_failed_and_incomplete_have_distinct_stream_lifecycles() -> Non
             assert status == 200
             assert b"response.completed" in b"".join(stream)
             assert router.store.models[0].health_state == "normal"
-            assert router.store.models[0].consecutive_failures == 0
+            # 成功只追加匿名窗口，不会抹掉此前的合格失败。
+            assert router.store.models[0].consecutive_failures == 2
+            assert router.store.models[0].attempt_window == ["qualified_failure", "qualified_failure", "success"]
             assert router.store.models[0].usable is True
     finally:
         upstream.shutdown()

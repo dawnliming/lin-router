@@ -16,7 +16,7 @@ BUILD_DMG=0
 BUILD_INSTALLER=0
 SIGN_WINDOWS=0
 COPY_TO_DESKTOP=0
-APP_VERSION="0.6.3"
+APP_VERSION="0.6.4"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

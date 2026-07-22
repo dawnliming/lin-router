@@ -28,6 +28,8 @@ from linrouter_core.runtime.config_api_runtime import (
     export_config_payload,
     import_backup_payload,
     import_config_payload,
+    normalize_aggregate_routing_policy_item,
+    normalize_group_routing_policy_item,
 )
 from linrouter_core.runtime.handler_runtime import handle_proxy_request
 
@@ -36,8 +38,90 @@ _GROUP_VERIFICATION_FIELDS = ("provider_type", "base_url", "ark_api_key", "api_k
 _MODEL_VERIFICATION_FIELDS = ("group_id", "ep_id", "upstream_model", "api_key")
 
 
+def _public_state_item(item: Any, credential_fields: tuple[str, ...]) -> Dict[str, Any]:
+    """生成状态 API 的安全配置投影，不把上游凭证带到浏览器。"""
+    payload = asdict(item)
+    for field in credential_fields:
+        # 前端只需要知道是否已保存，用该标记支持“留空不修改”，而不是读取明文。
+        payload[f"{field}_configured"] = bool(payload.get(field))
+        payload.pop(field, None)
+    return payload
+
+
+def _preserve_existing_credential(payload: Dict[str, Any], existing: Any, field: str) -> None:
+    """兼容旧表单的空字段：已有凭证只能由非空的新值替换。"""
+    if existing is not None and not str(payload.get(field) or "").strip():
+        payload.pop(field, None)
+
+
 def _connectivity_fields_changed(before: Any, after: Any, fields: tuple[str, ...]) -> bool:
     return bool(before) and any(str(getattr(before, field, "") or "") != str(getattr(after, field, "") or "") for field in fields)
+
+
+def _strict_routing_policy_input(
+    payload: Dict[str, Any],
+    existing: Any,
+    normalize: Any,
+) -> Dict[str, Any]:
+    """HTTP 写路径严格校验策略字段，同时保留未提交字段的已有值。"""
+    candidate = asdict(existing) if existing is not None else {}
+    candidate.update(payload)
+    # 旧 boolean 是独立兼容输入；不能被已有 canonical 字段伪造为冲突。
+    if "routing_policy" not in payload and "smart_breaker_enabled" in payload:
+        candidate.pop("routing_policy", None)
+    normalized = normalize(candidate)
+    result = dict(payload)
+    result["routing_policy"] = normalized["routing_policy"]
+    result.pop("fixed_cooldown_minutes", None)
+    result.pop("smart_breaker_enabled", None)
+    return result
+
+
+def _invalidate_affinity_scopes(handler: Any, *scopes: str) -> None:
+    """仅在成功持久化后清理受影响的内存会话绑定，兼容轻量 HTTP 测试替身。"""
+    runtime = getattr(getattr(handler, "router", None), "runtime", None)
+    affinity = getattr(runtime, "session_affinity", None)
+    invalidate_scope = getattr(affinity, "invalidate_scope", None)
+    if not callable(invalidate_scope):
+        return
+    for scope in dict.fromkeys(scope for scope in scopes if scope):
+        invalidate_scope(scope)
+
+
+def _affected_aggregate_ids(
+    store: Any,
+    *,
+    group_ids: tuple[str, ...] = (),
+    model_ids: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """返回当前配置中引用指定组或模型的聚合 ID，供成功写入后失效粘性 scope。"""
+    group_id_set = {group_id for group_id in group_ids if group_id}
+    model_id_set = {model_id for model_id in model_ids if model_id}
+    return tuple(sorted({
+        member.aggregate_id
+        for member in store.aggregate_members
+        if member.group_id in group_id_set or member.model_id in model_id_set
+    }))
+
+
+def _invalidate_configuration_affinity(
+    handler: Any,
+    *,
+    group_ids: tuple[str, ...] = (),
+    model_ids: tuple[str, ...] = (),
+    aggregate_ids: tuple[str, ...] = (),
+) -> None:
+    """成功持久化后按直接组和受影响聚合精确失效，不在失败或预览路径调用。"""
+    related_aggregates = _affected_aggregate_ids(
+        handler.store,
+        group_ids=group_ids,
+        model_ids=model_ids,
+    )
+    _invalidate_affinity_scopes(
+        handler,
+        *(f"group:{group_id}" for group_id in group_ids if group_id),
+        *(f"aggregate:{aggregate_id}" for aggregate_id in (*aggregate_ids, *related_aggregates) if aggregate_id),
+    )
 
 
 def handle_get(handler: Any) -> None:
@@ -114,8 +198,14 @@ def handle_get(handler: Any) -> None:
                 }
                 for group in handler.store.groups
             },
-            "groups": [asdict(g) for g in handler.store.groups],
-            "models": [asdict(m) for m in handler.store.models],
+            "groups": [
+                _public_state_item(group, ("ark_api_key", "api_key"))
+                for group in handler.store.groups
+            ],
+            "models": [
+                _public_state_item(model, ("api_key",))
+                for model in handler.store.models
+            ],
             "aggregate_models": [asdict(m) for m in handler.store.aggregate_models],
             "aggregate_members": [asdict(m) for m in handler.store.aggregate_members],
             "aggregate_member_revisions": dict(handler.store.aggregate_member_revisions),
@@ -374,8 +464,18 @@ def handle_post(handler: Any) -> None:
             except Exception as e:
                 handler._send_json({"error": {"message": f"配置文件无效：{e}", "type": "invalid_request_error", "code": "invalid_config_file"}}, status=400)
                 return
+        previous_scopes = tuple(
+            [f"group:{group.id}" for group in handler.store.groups]
+            + [f"aggregate:{aggregate.id}" for aggregate in handler.store.aggregate_models]
+        )
         try:
-            handler._send_json(import_config_payload(handler.store, payload))
+            result = import_config_payload(handler.store, payload)
+            current_scopes = tuple(
+                [f"group:{group.id}" for group in handler.store.groups]
+                + [f"aggregate:{aggregate.id}" for aggregate in handler.store.aggregate_models]
+            )
+            _invalidate_affinity_scopes(handler, *previous_scopes, *current_scopes)
+            handler._send_json(result)
         except ConfigApiError as error:
             handler._send_json(error.response(), status=400)
         return
@@ -387,6 +487,10 @@ def handle_post(handler: Any) -> None:
             except Exception as e:
                 handler._send_json({"error": {"message": f"备份文件无效：{e}", "type": "invalid_request_error", "code": "invalid_backup_file"}}, status=400)
                 return
+        previous_scopes = tuple(
+            [f"group:{group.id}" for group in handler.store.groups]
+            + [f"aggregate:{aggregate.id}" for aggregate in handler.store.aggregate_models]
+        )
         try:
             response, new_settings = import_backup_payload(handler.store, payload)
         except ConfigApiError as error:
@@ -404,6 +508,11 @@ def handle_post(handler: Any) -> None:
             return
         if any(key in new_settings for key in ("upstream_http_client", "upstream_http2", "upstream_keepalive")):
             handler.router._refresh_upstream_client()
+        current_scopes = tuple(
+            [f"group:{group.id}" for group in handler.store.groups]
+            + [f"aggregate:{aggregate.id}" for aggregate in handler.store.aggregate_models]
+        )
+        _invalidate_affinity_scopes(handler, *previous_scopes, *current_scopes)
         handler._send_json({
             **response,
             "settings": {**updated, "auto_start": handler._platform().is_autostart_enabled()},
@@ -411,10 +520,26 @@ def handle_post(handler: Any) -> None:
         return
     if parsed.path == "/api/groups":
         payload = handler._read_json()
+        if not isinstance(payload, dict):
+            handler._send_json({"error": {"message": "请求参数无效", "type": "invalid_request_error", "code": "invalid_payload"}}, status=400)
+            return
         if not payload.get("name"):
             handler._send_json({"error": {"message": "缺少连接组名称", "type": "invalid_request_error", "code": "missing_group_name"}}, status=400)
             return
         existing = handler.store.find_group(str(payload.get("id") or ""))
+        # /api/state 不再下发明文 API Key。已有配置收到空字段时视为未修改，
+        # 以兼容旧管理台和未填写密钥的普通配置保存。
+        _preserve_existing_credential(payload, existing, "ark_api_key")
+        _preserve_existing_credential(payload, existing, "api_key")
+        try:
+            payload = _strict_routing_policy_input(
+                payload,
+                existing,
+                normalize_group_routing_policy_item,
+            )
+        except ConfigApiError as error:
+            handler._send_json(error.response(), status=400)
+            return
         if existing and not payload.get("route_key"):
             payload["route_key"] = existing.route_key
         if not payload.get("provider_type"):
@@ -439,11 +564,7 @@ def handle_post(handler: Any) -> None:
             payload["reasoning_support"] = existing.reasoning_support
         if existing and "auto_model_name" not in payload:
             payload["auto_model_name"] = existing.auto_model_name
-        if existing and "smart_breaker_enabled" not in payload:
-            payload["smart_breaker_enabled"] = existing.smart_breaker_enabled
-        if "smart_breaker_enabled" in payload and not isinstance(payload["smart_breaker_enabled"], bool):
-            handler._send_json({"error": {"message": "连接组智能熔断开关必须为布尔值", "type": "invalid_request_error", "code": "invalid_smart_breaker_enabled"}}, status=400)
-            return
+
         # 自动路由模型名空值按默认值处理
         auto_name = str(payload.get("auto_model_name") or "").strip() or DEFAULT_AUTO_MODEL_NAME
         # 不允许与同组模型 name/id/ep_id 冲突；仅 all-router-auto 为全局保留名
@@ -475,6 +596,7 @@ def handle_post(handler: Any) -> None:
             return
         if group_breaker_disabled:
             handler.router.candidate_health.release_group_probes(group.id)
+        _invalidate_configuration_affinity(handler, group_ids=(group.id,))
         handler._send_json({"ok": True, "group": asdict(group)})
         return
     if parsed.path.startswith("/api/groups/") and parsed.path.endswith("/clone"):
@@ -495,6 +617,8 @@ def handle_post(handler: Any) -> None:
             handler._send_json({"error": {"message": "连接组不存在", "type": "invalid_request_error", "code": "group_not_found"}}, status=400)
             return
         existing = handler.store.find_model(str(payload.get("id") or ""))
+        # 同上：编辑模型时，空 API Key 不能覆盖已保存的中转站凭证。
+        _preserve_existing_credential(payload, existing, "api_key")
         merged: Dict[str, Any] = asdict(existing) if existing else {}
         merged.update(payload)
         model = ModelConfig.from_dict(merged)
@@ -527,6 +651,11 @@ def handle_post(handler: Any) -> None:
             group.upstream_models = []
             group.upstream_models_fetched_at = ""
             handler.store.upsert_group(group)
+        _invalidate_configuration_affinity(
+            handler,
+            group_ids=tuple({group.id, existing.group_id if existing else group.id}),
+            model_ids=(model.id,),
+        )
         handler._send_json({"ok": True, "model": asdict(model)})
         return
     if parsed.path == "/api/models/batch":
@@ -686,6 +815,8 @@ def handle_post(handler: Any) -> None:
                 usable=p["usable"],
             ))
             added += 1
+        if added:
+            _invalidate_configuration_affinity(handler, group_ids=(group_id,))
         handler._send_json({"ok": True, "added": added, "skipped": skipped})
         return
     if parsed.path == "/api/models/fetch-upstream":
@@ -753,6 +884,11 @@ def handle_post(handler: Any) -> None:
             model.last_error = ""
             model.last_checked_at = handler.router._now()
         handler.store.save()
+        _invalidate_configuration_affinity(
+            handler,
+            group_ids=(model.group_id,),
+            model_ids=(model.id,),
+        )
         handler._send_json({"ok": True, "usable": model.usable, "disabled_by_user": model.disabled_by_user})
         return
     if parsed.path.endswith("/usable") and parsed.path.startswith("/api/models/"):
@@ -771,6 +907,11 @@ def handle_post(handler: Any) -> None:
             model.last_error = ""
         model.last_checked_at = handler.router._now()
         handler.store.save()
+        _invalidate_configuration_affinity(
+            handler,
+            group_ids=(model.group_id,),
+            model_ids=(model.id,),
+        )
         handler._send_json({"ok": True, "usable": model.usable, "disabled_by_user": model.disabled_by_user})
         return
     if parsed.path == "/api/models/usable/all":
@@ -789,6 +930,12 @@ def handle_post(handler: Any) -> None:
                     model.last_error = ""
             if changed:
                 handler.store.save()
+        if changed:
+            _invalidate_configuration_affinity(
+                handler,
+                group_ids=tuple(group.id for group in handler.store.groups),
+                model_ids=tuple(model.id for model in handler.store.models),
+            )
         handler._send_json({"ok": True, "changed": changed})
         return
     if parsed.path.endswith("/toggle") and parsed.path.startswith("/api/groups/"):
@@ -797,6 +944,7 @@ def handle_post(handler: Any) -> None:
         if not changed:
             handler._send_json({"error": {"message": "连接组不存在或为空", "type": "invalid_request_error", "code": "group_not_found_or_empty"}}, status=400)
             return
+        _invalidate_configuration_affinity(handler, group_ids=(group_id,))
         handler._send_json({"ok": True})
         return
     if parsed.path.endswith("/usable") and parsed.path.startswith("/api/groups/"):
@@ -822,6 +970,8 @@ def handle_post(handler: Any) -> None:
                     model.last_error = ""
             if changed:
                 handler.store.save()
+        if changed:
+            _invalidate_configuration_affinity(handler, group_ids=(group_id,))
         handler._send_json({"ok": True, "changed": changed})
         return
     if parsed.path.endswith("/move") and parsed.path.startswith("/api/models/"):
@@ -831,6 +981,13 @@ def handle_post(handler: Any) -> None:
         if not moved:
             handler._send_json({"error": {"message": "移动失败", "type": "invalid_request_error", "code": "move_failed"}}, status=400)
             return
+        model = handler.store.find_model(model_id)
+        if model:
+            _invalidate_configuration_affinity(
+                handler,
+                group_ids=(model.group_id,),
+                model_ids=(model.id,),
+            )
         handler._send_json({"ok": True})
         return
     if parsed.path.startswith("/api/groups/") and parsed.path.endswith("/delete-preview"):
@@ -843,9 +1000,32 @@ def handle_post(handler: Any) -> None:
         payload = handler._model_delete_preview(model_id)
         handler._send_json(payload, status=200 if payload.get("ok") else 404)
         return
+    if parsed.path.startswith("/api/models/") and parsed.path.endswith("/risk-recover"):
+        model_id = parsed.path.split("/")[3]
+        payload_in = handler._read_json()
+        payload = handler.router.release_model_risk_isolation(
+            model_id,
+            confirmed=payload_in.get("confirmed") is True,
+        )
+        model = handler.store.find_model(model_id)
+        if payload.get("ok") and model:
+            _invalidate_configuration_affinity(
+                handler,
+                group_ids=(model.group_id,),
+                model_ids=(model.id,),
+            )
+        handler._send_json(payload, status=200 if payload.get("ok") else 400)
+        return
     if parsed.path.startswith("/api/models/") and parsed.path.endswith("/recover"):
         model_id = parsed.path.split("/")[3]
         payload = handler.router.recover_model(model_id)
+        model = handler.store.find_model(model_id)
+        if payload.get("ok") and model:
+            _invalidate_configuration_affinity(
+                handler,
+                group_ids=(model.group_id,),
+                model_ids=(model.id,),
+            )
         handler._send_json(payload, status=200 if payload.get("ok") else 400)
         return
     if parsed.path.startswith("/api/aggregate-members/") and parsed.path.endswith("/sort-preview"):
@@ -918,13 +1098,19 @@ def handle_post(handler: Any) -> None:
             return
         name = str(payload.get("name") or "").strip()
         if not name:
-            handler._send_json({"ok": False, "message": "聚合模型名不能为空"}, status=400)
+            handler._send_json({"error": {"message": "聚合模型名不能为空", "type": "invalid_request_error", "code": "missing_aggregate_name"}}, status=400)
             return
         aggregate_id = str(payload.get("id") or "").strip() or uuid.uuid4().hex
-        if "smart_breaker_enabled" in payload and not isinstance(payload["smart_breaker_enabled"], bool):
-            handler._send_json({"error": {"message": "聚合模型智能熔断开关必须为布尔值", "type": "invalid_request_error", "code": "invalid_smart_breaker_enabled"}}, status=400)
-            return
         existing = handler.store.find_aggregate(aggregate_id)
+        try:
+            payload = _strict_routing_policy_input(
+                payload,
+                existing,
+                normalize_aggregate_routing_policy_item,
+            )
+        except ConfigApiError as error:
+            handler._send_json(error.response(), status=400)
+            return
         merged: Dict[str, Any] = asdict(existing) if existing else {}
         merged.update(payload)
         merged["id"] = aggregate_id
@@ -936,8 +1122,9 @@ def handle_post(handler: Any) -> None:
             handler._send_json({"error": {"message": "聚合模型保存失败，智能熔断开关和成员健康状态已回滚", "type": "api_error", "code": "config_save_failed"}}, status=500)
             return
         if not ok:
-            handler._send_json({"ok": False, "message": msg}, status=400)
+            handler._send_json({"error": {"message": msg, "type": "invalid_request_error", "code": "invalid_aggregate"}}, status=400)
             return
+        _invalidate_configuration_affinity(handler, aggregate_ids=(aggregate.id,))
         handler._send_json({"ok": True, "aggregate_model": asdict(aggregate)})
         return
     if parsed.path.startswith("/api/aggregates/") and parsed.path.endswith("/members/batch"):
@@ -971,6 +1158,8 @@ def handle_post(handler: Any) -> None:
             status = 400
         else:
             status = 200
+        if batch_result.get("ok") and batch_result.get("added_count"):
+            _invalidate_configuration_affinity(handler, aggregate_ids=(aggregate_id,))
         handler._send_json(batch_result, status=status)
         return
     if parsed.path.startswith("/api/aggregates/") and parsed.path.endswith("/members/batch-update"):
@@ -998,6 +1187,8 @@ def handle_post(handler: Any) -> None:
             expected_revision=expected_revision,
         )
         if batch_result.get("ok"):
+            if batch_result.get("changed_count"):
+                _invalidate_configuration_affinity(handler, aggregate_ids=(parts[3],))
             handler._send_json(batch_result)
             return
         code = str(batch_result.get("code") or "")
@@ -1066,6 +1257,8 @@ def handle_post(handler: Any) -> None:
             expected_revision=expected_revision,
         )
         if batch_result.get("ok"):
+            if batch_result.get("deleted_count"):
+                _invalidate_configuration_affinity(handler, aggregate_ids=(parts[3],))
             handler._send_json(batch_result)
             return
         code = str(batch_result.get("code") or "")
@@ -1102,6 +1295,7 @@ def handle_post(handler: Any) -> None:
             handler._send_json({"error": {"message": message, "type": error_type, "code": code, "revision": revision}}, status=status)
             return
         members = sorted(handler.store.get_aggregate_members(aggregate_id), key=lambda member: member.priority)
+        _invalidate_configuration_affinity(handler, aggregate_ids=(aggregate_id,))
         handler._send_json({"ok": True, "revision": revision, "members": [asdict(member) for member in members]})
         return
     if parsed.path.startswith("/api/aggregates/") and parsed.path.endswith("/members"):
@@ -1115,7 +1309,7 @@ def handle_post(handler: Any) -> None:
             handler._send_json({"error": {"message": "请求参数无效", "type": "invalid_request_error", "code": "invalid_payload"}}, status=400)
             return
         if not handler.store.find_aggregate(aggregate_id):
-            handler._send_json({"ok": False, "message": "聚合模型不存在"}, status=404)
+            handler._send_json({"error": {"message": "聚合模型不存在", "type": "invalid_request_error", "code": "aggregate_not_found"}}, status=404)
             return
         member_id = str(payload.get("id") or "").strip() or uuid.uuid4().hex
         existing_member = handler.store.find_aggregate_member(member_id)
@@ -1123,7 +1317,7 @@ def handle_post(handler: Any) -> None:
         group_id = str(payload.get("group_id") or (existing_member.group_id if existing_member else "")).strip()
         model_id = str(payload.get("model_id") or (existing_member.model_id if existing_member else "")).strip()
         if not group_id or not model_id:
-            handler._send_json({"ok": False, "message": "连接组和模型不能为空"}, status=400)
+            handler._send_json({"error": {"message": "连接组和模型不能为空", "type": "invalid_request_error", "code": "missing_aggregate_member_reference"}}, status=400)
             return
         member_merged: Dict[str, Any] = asdict(existing_member) if existing_member else {}
         member_merged.update(payload)
@@ -1134,7 +1328,7 @@ def handle_post(handler: Any) -> None:
         member = AggregateMember.from_dict(member_merged)
         ok, msg = handler.store.upsert_aggregate_member(member)
         if not ok:
-            handler._send_json({"ok": False, "message": msg}, status=400)
+            handler._send_json({"error": {"message": msg, "type": "invalid_request_error", "code": "invalid_aggregate_member"}}, status=400)
             return
         if bool(payload.get("clear_cooldown")):
             handler.store.clear_aggregate_member_cooldown(member.id, handler.router._now())
@@ -1142,6 +1336,7 @@ def handle_post(handler: Any) -> None:
         direction = str(payload.get("direction") or "").strip()
         if direction:
             handler.store.move_aggregate_member(member.id, direction)
+        _invalidate_configuration_affinity(handler, aggregate_ids=(aggregate_id,))
         handler._send_json({"ok": True, "member": asdict(handler.store.find_aggregate_member(member.id) or member)})
         return
     if parsed.path.startswith("/api/aggregate-members/") and parsed.path.endswith("/clear-cooldown"):
@@ -1153,11 +1348,15 @@ def handle_post(handler: Any) -> None:
                 handler._send_json({"error": {"message": "成员不存在", "type": "invalid_request_error", "code": "aggregate_member_not_found"}}, status=404)
                 return
             handler.store.clear_aggregate_member_cooldown(member_id, handler.router._now())
+            _invalidate_configuration_affinity(handler, aggregate_ids=(member.aggregate_id,))
             handler._send_json({"ok": True, "member": asdict(handler.store.find_aggregate_member(member.id) or member)})
             return
     if parsed.path.startswith("/api/aggregate-members/") and parsed.path.endswith("/recover"):
         member_id = parsed.path.split("/")[3]
         payload = handler.router.recover_aggregate_member(member_id)
+        member = handler.store.find_aggregate_member(member_id)
+        if payload.get("ok") and member:
+            _invalidate_configuration_affinity(handler, aggregate_ids=(member.aggregate_id,))
         handler._send_json(payload, status=200 if payload.get("ok") else 400)
         return
     if parsed.path == "/api/test":
@@ -1253,16 +1452,30 @@ def handle_delete(handler: Any) -> None:
     parsed = urlparse(handler.path)
     if parsed.path.startswith("/api/groups/"):
         group_id = parsed.path.split("/")[3]
+        aggregate_ids = _affected_aggregate_ids(handler.store, group_ids=(group_id,))
         # 统一使用 store.remove_group()，确保级联删除组下模型及引用该组的聚合成员
         group_removed, removed_models, removed_members = handler.store.remove_group(group_id)
         if not group_removed:
             handler._send_json({"error": {"message": "连接组不存在", "type": "invalid_request_error", "code": "group_not_found"}}, status=404)
             return
+        _invalidate_configuration_affinity(
+            handler,
+            group_ids=(group_id,),
+            aggregate_ids=aggregate_ids,
+        )
         handler._send_json({"ok": True, "removed_models": removed_models, "removed_members": removed_members})
         return
     if parsed.path.startswith("/api/models/"):
         model_id = parsed.path.split("/")[3]
+        model = handler.store.find_model(model_id)
+        aggregate_ids = _affected_aggregate_ids(handler.store, model_ids=(model_id,))
         if handler.store.remove_model(model_id):
+            _invalidate_configuration_affinity(
+                handler,
+                group_ids=(model.group_id,) if model else (),
+                model_ids=(model_id,),
+                aggregate_ids=aggregate_ids,
+            )
             handler._send_json({"ok": True})
         else:
             handler._send_json({"error": {"message": "模型不存在", "type": "invalid_request_error", "code": "model_not_found"}}, status=404)
@@ -1273,11 +1486,17 @@ def handle_delete(handler: Any) -> None:
         if not removed_model:
             handler._send_json({"error": {"message": "聚合模型不存在", "type": "invalid_request_error", "code": "aggregate_not_found"}}, status=404)
             return
+        _invalidate_configuration_affinity(handler, aggregate_ids=(aggregate_id,))
         handler._send_json({"ok": True, "removed_members": removed_members})
         return
     if parsed.path.startswith("/api/aggregate-members/"):
         member_id = parsed.path.split("/")[3]
+        member = handler.store.find_aggregate_member(member_id)
         if handler.store.remove_aggregate_member(member_id):
+            _invalidate_configuration_affinity(
+                handler,
+                aggregate_ids=(member.aggregate_id,) if member else (),
+            )
             handler._send_json({"ok": True})
         else:
             handler._send_json({"error": {"message": "聚合成员不存在", "type": "invalid_request_error", "code": "aggregate_member_not_found"}}, status=404)

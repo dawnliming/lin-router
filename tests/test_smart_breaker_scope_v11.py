@@ -153,17 +153,22 @@ def test_scope_fields_default_true_and_explicit_false_round_trip(tmp_path: Path)
     assert settings.get("smart_breaker_enabled") is True
 
     payload = json.loads(config_path.read_text(encoding="utf-8"))
-    assert payload["groups"][0]["smart_breaker_enabled"] is False
-    assert payload["aggregate_models"][0]["smart_breaker_enabled"] is False
+    assert payload["groups"][0]["routing_policy"] == "cooldown_off"
+    assert payload["aggregate_models"][0]["routing_policy"] == "cooldown_off"
+    assert "smart_breaker_enabled" not in payload["groups"][0]
+    assert "smart_breaker_enabled" not in payload["aggregate_models"][0]
 
 
 
-def test_effective_policy_matrix_respects_global_group_and_aggregate(tmp_path: Path) -> None:
+def test_effective_policy_matrix_only_reports_disabled_source_for_smart_breaker(tmp_path: Path) -> None:
     router, settings, _config_path = _router(tmp_path)
     model = router.store.find_model("m-a")
     member = router.store.find_aggregate_member("member-x-a")
     assert model is not None and member is not None
 
+    router.store.find_aggregate("agg-x").routing_policy = "cooldown_off"
+    router.store.find_group("g-a").routing_policy = "sticky_route"
+    # 非智能熔断策略不应被投影为“熔断保护已关闭”。
     assert router.candidate_health.policy_status(model) == {
         "smart_breaker_effective_enabled": True,
         "smart_breaker_disabled_by": "",
@@ -173,23 +178,8 @@ def test_effective_policy_matrix_respects_global_group_and_aggregate(tmp_path: P
         "smart_breaker_disabled_by": "",
     }
 
-    router.store.find_aggregate("agg-x").smart_breaker_enabled = False
-    assert router.candidate_health.policy_status(model)["smart_breaker_effective_enabled"] is True
-    assert router.candidate_health.policy_status(member) == {
-        "smart_breaker_effective_enabled": False,
-        "smart_breaker_disabled_by": "aggregate",
-    }
-
-    router.store.find_group("g-a").smart_breaker_enabled = False
-    assert router.candidate_health.policy_status(model) == {
-        "smart_breaker_effective_enabled": False,
-        "smart_breaker_disabled_by": "group",
-    }
-    assert router.candidate_health.policy_status(member) == {
-        "smart_breaker_effective_enabled": False,
-        "smart_breaker_disabled_by": "group",
-    }
-
+    router.store.find_group("g-a").routing_policy = "smart_breaker"
+    router.store.find_aggregate("agg-x").routing_policy = "smart_breaker"
     settings.update({"smart_breaker_enabled": False})
     assert router.candidate_health.policy_status(model) == {
         "smart_breaker_effective_enabled": False,
@@ -354,19 +344,16 @@ def test_disabled_aggregate_member_recover_api_rejects_without_manual_probe(tmp_
 
         status, payload = _post_json(port, "/api/aggregate-members/member-x-a/recover")
 
-        assert status == 400
-        assert payload["ok"] is False
-        assert payload["code"] == "smart_breaker_disabled"
-        assert payload["smart_breaker_effective_enabled"] is False
-        assert payload["smart_breaker_disabled_by"] == "aggregate"
-        assert probe_calls == []
-        assert len(server.router.logs) == log_count
+        assert status == 200
+        assert payload["ok"] is True
+        assert len(probe_calls) == 1
+        assert len(server.router.logs) > log_count
     finally:
         server.shutdown()
         server.server_close()
 
 
-@pytest.mark.parametrize("disabled_by", ["global", "group"])
+@pytest.mark.parametrize("disabled_by", ["global"])
 def test_disabled_model_recover_api_rejects_without_manual_probe(
     tmp_path: Path,
     disabled_by: str,
@@ -436,17 +423,17 @@ def test_runtime_projection_exposes_scope_disabled_source(tmp_path: Path) -> Non
     member = router.store.find_aggregate_member("member-x-a")
     assert model is not None and member is not None
 
-    router.store.find_aggregate("agg-x").smart_breaker_enabled = False
+    router.store.find_aggregate("agg-x").routing_policy = "cooldown_off"
     member_item = handler._member_runtime_item(member)
-    assert member_item["derived_status"] == "breaker_policy_disabled"
-    assert member_item["smart_breaker_effective_enabled"] is False
-    assert member_item["smart_breaker_disabled_by"] == "aggregate"
+    assert member_item["derived_status"] == "healthy"
+    assert member_item["smart_breaker_effective_enabled"] is True
+    assert member_item["smart_breaker_disabled_by"] == ""
 
-    router.store.find_group("g-a").smart_breaker_enabled = False
+    router.store.find_group("g-a").routing_policy = "sticky_route"
     model_item = handler._model_runtime_item(model)
-    assert model_item["derived_status"] == "breaker_policy_disabled"
-    assert model_item["smart_breaker_effective_enabled"] is False
-    assert model_item["smart_breaker_disabled_by"] == "group"
+    assert model_item["derived_status"] == "healthy"
+    assert model_item["smart_breaker_effective_enabled"] is True
+    assert model_item["smart_breaker_disabled_by"] == ""
 
 
 
@@ -461,32 +448,16 @@ def test_scope_fields_are_included_in_frontend_forms_and_api_contract() -> None:
     http_api = (root / "linrouter_core/runtime/http_api_runtime.py").read_text(encoding="utf-8")
     app_py = (root / "app.py").read_text(encoding="utf-8")
 
-    # 三个表单均处于明确的全局、连接组或聚合上下文中，开关名称统一保持简洁。
-    assert config_js.count("<span>智能熔断</span>") >= 2
-    assert "对此连接组启用智能熔断" not in config_js
-    assert "对此聚合模型启用成员级智能熔断" not in config_js
-    assert "group-smart-breaker-enabled" in config_js
-    assert "aggregate-smart-breaker-enabled" in config_js
-    assert config_js.count("checkbox smart-breaker-toggle") == 2
-    assert (
-        ".form-row > .checkbox.smart-breaker-toggle {\n"
-        "  justify-content: flex-end;\n"
-        "}"
-    ) in config_css
-    assert "smart_breaker_enabled" in form_js
-    assert "smart_breaker_enabled" in actions_js
+    # canonical routing_policy 替代旧范围布尔开关；策略切换在 selector change 时立即确认。
+    assert config_js.count('id="group-routing-policy"') == 1
+    assert config_js.count('id="aggregate-routing-policy"') == 1
+    assert "group-smart-breaker-enabled" not in config_js
+    assert "aggregate-smart-breaker-enabled" not in config_js
+    assert "fixed-cooldown-minutes" not in config_js
+    assert "fixed_cooldown_minutes" not in actions_js
+    assert "onRoutingPolicyChange" in actions_js
     assert "Modal.confirm" in actions_js
-    assert "stillViewingSavedAggregate" in actions_js
-    assert "同步移除已关闭策略下的恢复按钮" in actions_js
-    assert "data-member-actions" in config_js
-    assert "if (!canRecover && recover)" in runtime_js
-    assert "controller.onRecoverAggregateMember(member.id)" in runtime_js
-    assert "m?.smart_breaker_effective_enabled !== false" in config_js
-    assert "m?.derived_status !== 'breaker_policy_disabled'" in config_js
-    assert "m?.smart_breaker_effective_enabled !== false" in runtime_js
-    assert "m?.derived_status !== 'breaker_policy_disabled'" in runtime_js
-    assert "smart_breaker_enabled" in http_api
+    assert "el.id.endsWith('-routing-policy')" in form_js
+    assert "routing_policy" in http_api
     assert '"code": "smart_breaker_disabled"' in app_py
-    assert "不能执行模型重试恢复" in app_py
     assert "<span>智能熔断</span>" in settings_js
-    assert "全局智能熔断总开关" not in settings_js

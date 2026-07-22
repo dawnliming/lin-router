@@ -200,4 +200,4 @@ def test_v055_frontend_onboarding_contracts():
     assert "快速测试" in test_js
     assert "请回复：连接成功" in test_js
     assert "'/v1/chat/completions'" in test_js
-    assert "v0.6.3" in settings_js
+    assert "v0.6.4" in settings_js

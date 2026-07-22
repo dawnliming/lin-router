@@ -20,6 +20,52 @@ const ConfigTabActions = {
     }
   },
 
+  /**
+   * 风控隔离解除不探测上游；二次确认只允许用户在明确知情后恢复后续请求资格。
+   */
+  async onReleaseModelRiskIsolation(controller) {
+    const id = document.getElementById('model-id')?.value;
+    const model = id ? Store.getModel(id) : null;
+    if (!id || !model?.risk_isolated) return;
+    const confirmed = await Modal.confirm({
+      title: '确认解除上游风控隔离',
+      message: '系统检测到上游风控拦截，当前凭证已暂停自动请求。请确认已检查账号状态、渠道权限和风控通知。解除后后续请求会再次访问上游；频繁解除可能扩大账号风险。',
+      confirmText: '我已检查账号，解除隔离',
+      confirmClass: 'btn-danger',
+    });
+    if (!confirmed) return;
+    try {
+      const result = await API.releaseModelRiskIsolation(id);
+      await Store.load();
+      if (Tabs.current === 'config' && Store.selected.type === 'model' && Store.selected.id === id) controller.render();
+      Toast.success(result.message || '已解除上游风控隔离');
+    } catch (err) {
+      Toast.error('解除风控隔离失败：' + err.message);
+    }
+  },
+
+  /**
+   * 风控诊断仅筛选当前本地模型的脱敏请求日志，不向页面传递 host、摘要或上游正文。
+   */
+  onOpenRiskDiagnosis(controller) {
+    const currentModelId = document.getElementById('model-id')?.value || '';
+    const currentGroupId = document.getElementById('group-id')?.value || '';
+    const model = Store.getModel(currentModelId)
+      || (Store.state.models || []).find(item => item.group_id === currentGroupId && item.risk_isolated)
+      || (Store.state.models || []).find(item => item.risk_isolated);
+    if (!model) {
+      Toast.warning('当前没有可查看的上游风控隔离诊断');
+      return;
+    }
+    Store.select('model', model.id);
+    LogsTab.filters = { ...LogsTab.filters, group: model.group_id, status: '' };
+    LogsTab.currentOnly = true;
+    LogsTab._currentOnlySelectionKey = '';
+    LogsTab.page = 0;
+    LogsTab._openDetailKey = '';
+    Tabs.switch('logs');
+  },
+
   onGroupWorkflowAction(controller, action, modelId) {
     const groupId = document.getElementById('group-id')?.value;
     if (action === 'focus-required') {
@@ -34,6 +80,7 @@ const ConfigTabActions = {
     }
     if (action === 'test-model') return controller.openQuickTest(modelId);
     if (action === 'copy-client') return controller.copyGroupClientConfig(groupId, modelId);
+    if (action === 'view-risk-diagnosis') return controller.onOpenRiskDiagnosis();
   },
 
   openQuickTest(controller, modelId) {
@@ -50,35 +97,52 @@ const ConfigTabActions = {
     return Utils.copy(text).then(ok => ok ? Toast.success('客户端配置已复制') : Toast.error('复制失败'));
   },
 
-  async confirmScopedSmartBreakerDisable(controller, type, id) {
-    const inputId = type === 'group'
-      ? 'group-smart-breaker-enabled'
-      : 'aggregate-smart-breaker-enabled';
-    const input = document.getElementById(inputId);
-    const stored = type === 'group' ? Store.getGroup(id) : Store.getAggregate(id);
-    const wasEnabled = stored?.smart_breaker_enabled !== false;
-    if (input?.checked !== false || !wasEnabled) return true;
+  /**
+   * 策略切换会清理该作用域运行态，必须在 selector 变更时确认，不能延后给自动保存。
+   */
+  async onRoutingPolicyChange(controller, type) {
+    const prefix = type === 'group' ? 'group' : 'aggregate';
+    const policyInput = document.getElementById(`${prefix}-routing-policy`);
+    const stored = type === 'group'
+      ? Store.getGroup(document.getElementById('group-id')?.value)
+      : Store.getAggregate(document.getElementById('aggregate-id')?.value);
+    const previousPolicy = stored?.routing_policy || 'smart_breaker';
+    const nextPolicy = policyInput?.value || previousPolicy;
+    if (nextPolicy === previousPolicy) {
+      controller.syncRoutingPolicyUI(type);
+      return;
+    }
 
-    const isGroup = type === 'group';
     const confirmed = await Modal.confirm({
-      title: isGroup ? '关闭连接组智能熔断' : '关闭聚合成员级智能熔断',
-      message: isGroup
-        ? '关闭后会清理该连接组真实模型，以及该组模型在任意聚合成员中的自动健康状态；不会影响手动停用、其他连接组或其他组成员。是否继续？'
-        : '关闭后只会清理当前聚合成员的自动健康状态；不会影响底层真实模型和其他聚合。是否继续？',
-      confirmText: '确定关闭',
+      title: type === 'group' ? '确认切换连接组路由策略' : '确认切换聚合路由策略',
+      message: type === 'group'
+        ? '切换策略会清理该连接组的自动健康状态及关联聚合成员状态；不会影响手动停用或其他连接组。确认继续？'
+        : '切换策略会清理当前聚合成员的自动健康状态；不会影响底层真实模型或其他聚合。确认继续？',
+      confirmText: '确认切换',
       confirmClass: 'btn-danger',
     });
-    if (confirmed) return true;
-    input.checked = true;
+    if (!confirmed) {
+      policyInput.value = previousPolicy;
+      controller.syncRoutingPolicyUI(type);
+      controller.captureDraft();
+      return;
+    }
+    controller.syncRoutingPolicyUI(type);
     controller.captureDraft();
-    return false;
+    controller.scheduleAutoSave(document.querySelector('#panel-config .config-form'));
   },
 
   async onGroupSubmit(controller, e) {
     e.preventDefault();
-    const validation = controller.validateGroupForm({ focus: true });
+    const autoSave = e?.autoSave === true;
+    const validation = controller.validateGroupForm({ focus: !autoSave });
     if (!validation.ok) {
-      Toast.warning(validation.message);
+      if (autoSave) {
+        controller.captureDraft();
+        controller.setSaveStatus('error', '草稿未保存：请修正字段');
+      } else {
+        Toast.warning(validation.message);
+      }
       return;
     }
     const id = document.getElementById('group-id').value;
@@ -88,19 +152,16 @@ const ConfigTabActions = {
       controller.render();
       return;
     }
-    if (!await controller.confirmScopedSmartBreakerDisable('group', id)) return;
     const mode = document.getElementById('group-provider').value;
     const key = document.getElementById('group-key').value.trim();
     const payload = {
       name: document.getElementById('group-name').value.trim(),
       provider_type: mode,
       base_url: document.getElementById('group-base').value.trim(),
-      ark_api_key: mode === 'ark' ? key : '',
-      api_key: mode === 'proxy' ? key : '',
       auto_model_name: document.getElementById('group-auto-model-name').value.trim(),
       auto_model_cooldown_minutes: Number(document.getElementById('group-cooldown').value || 0),
       stream_idle_timeout: Math.max(0, Math.min(600, Number(document.getElementById('group-stream-timeout').value || 0))),
-      smart_breaker_enabled: document.getElementById('group-smart-breaker-enabled')?.checked !== false,
+      routing_policy: document.getElementById('group-routing-policy')?.value || 'smart_breaker',
       waf_client_mode: mode === 'relay' && document.getElementById('group-waf').checked
         ? (document.getElementById('group-waf-client-mode')?.value || 'always')
         : 'always',
@@ -111,6 +172,9 @@ const ConfigTabActions = {
         ? (document.getElementById('group-waf-policy')?.value || 'default')
         : 'default',
     };
+    // 状态 API 不再返回明文凭证；留空表示保持已有配置，只有输入新值才替换。
+    if (mode === 'ark' && key) Object.assign(payload, { ark_api_key: key });
+    if (mode === 'proxy' && key) Object.assign(payload, { api_key: key });
     try {
       controller.setSaveStatus('saving');
       const result = id ? await API.saveGroup(id, payload) : await API.createGroup(payload);
@@ -125,16 +189,17 @@ const ConfigTabActions = {
         && Store.selected.type === 'group'
         && Store.selected.id === savedGroupId;
       if (stillViewingSavedGroup) {
-        controller.render();
-        Toast.success('连接组已保存，请按状态提示完成下一步');
+        if (!autoSave) {
+          controller.render();
+          Toast.success('连接组已保存，请按状态提示完成下一步');
+        }
       }
     } catch (err) {
-      const previousEnabled = Store.getGroup(id)?.smart_breaker_enabled !== false;
-      const breakerInput = document.getElementById('group-smart-breaker-enabled');
-      if (breakerInput) breakerInput.checked = previousEnabled;
-      controller.captureDraft();
+      const rolledBack = autoSave && Boolean(id)
+        && controller.restoreFailedAutoSaveBaseline({ type: 'group', id }, controller._autoSaveSavingRevision);
+      if (!rolledBack) controller.captureDraft();
       controller.setSaveStatus('error', '保存失败：' + err.message);
-      Toast.error('保存失败：' + err.message);
+      if (!autoSave) Toast.error('保存失败：' + err.message);
     }
   },
 
@@ -198,9 +263,15 @@ const ConfigTabActions = {
 
   async onModelSubmit(controller, e) {
     e.preventDefault();
-    const validation = controller.validateModelForm({ focus: true });
+    const autoSave = e?.autoSave === true;
+    const validation = controller.validateModelForm({ focus: !autoSave });
     if (!validation.ok) {
-      Toast.warning(validation.message);
+      if (autoSave) {
+        controller.captureDraft();
+        controller.setSaveStatus('error', '草稿未保存：请修正字段');
+      } else {
+        Toast.warning(validation.message);
+      }
       return;
     }
     const id = document.getElementById('model-id').value;
@@ -213,17 +284,19 @@ const ConfigTabActions = {
     const group = Store.getGroup(groupId);
     const useUpstream = ['relay', 'proxy'].includes(group?.provider_type);
     const upstream = useUpstream ? document.getElementById('model-upstream').value.trim() : document.getElementById('model-ep').value.trim();
+    const key = document.getElementById('model-key')?.value?.trim() || '';
     const payload = {
       name: document.getElementById('model-name').value.trim(),
       ep_id: upstream || document.getElementById('model-ep')?.value?.trim(),
       group_id: groupId,
-      api_key: document.getElementById('model-key')?.value?.trim() || '',
       price_group: document.getElementById('model-price')?.value?.trim() || '',
       price_input: Number(document.getElementById('model-price-input').value || 0),
       price_output: Number(document.getElementById('model-price-output').value || 0),
       upstream_model: upstream,
       usable: document.getElementById('model-usable').checked,
     };
+    // 已保存的模型密钥不从状态 API 回传；空输入不参与更新，避免普通保存清空凭证。
+    if (key) Object.assign(payload, { api_key: key });
     try {
       controller.setSaveStatus('saving');
       if (id) await API.saveModel(id, payload);
@@ -232,8 +305,11 @@ const ConfigTabActions = {
       controller.clearDraft({ type: 'model', id: id || null });
       controller.setSaveStatus('saved');
     } catch (err) {
+      const rolledBack = autoSave && Boolean(id)
+        && controller.restoreFailedAutoSaveBaseline({ type: 'model', id }, controller._autoSaveSavingRevision);
+      if (autoSave && !rolledBack) controller.captureDraft();
       controller.setSaveStatus('error', '保存失败：' + err.message);
-      Toast.error('保存失败：' + err.message);
+      if (!autoSave) Toast.error('保存失败：' + err.message);
     }
   },
 
@@ -281,19 +357,29 @@ const ConfigTabActions = {
 
   async onAggregateSubmit(controller, e) {
     e.preventDefault();
+    const autoSave = e?.autoSave === true;
+    const validation = controller.validateAggregateForm({ focus: !autoSave });
+    if (!validation.ok) {
+      if (autoSave) {
+        controller.captureDraft();
+        controller.setSaveStatus('error', '草稿未保存：请修正字段');
+      } else {
+        Toast.warning(validation.message);
+      }
+      return;
+    }
     const id = document.getElementById('aggregate-id').value;
     if (Store.selected.type !== 'aggregate' || Store.selected.id !== id) {
       Toast.error('当前聚合模型表单状态已过期，请重新选择后再保存');
       controller.render();
       return;
     }
-    if (!await controller.confirmScopedSmartBreakerDisable('aggregate', id)) return;
     const payload = {
       name: document.getElementById('aggregate-name').value.trim(),
       display_name: document.getElementById('aggregate-display-name').value.trim(),
       client_model_aliases: document.getElementById('aggregate-client-model-aliases').value.split(/[\n,]+/).map(value => value.trim()).filter(Boolean),
       enabled: document.getElementById('aggregate-enabled').checked,
-      smart_breaker_enabled: document.getElementById('aggregate-smart-breaker-enabled')?.checked !== false,
+      routing_policy: document.getElementById('aggregate-routing-policy')?.value || 'smart_breaker',
       cooldown_minutes: Math.max(0, Number(document.getElementById('aggregate-cooldown').value || 0)),
       strategy: 'priority',
     };
@@ -307,17 +393,16 @@ const ConfigTabActions = {
       const stillViewingSavedAggregate = Tabs.current === 'config'
         && Store.selected.type === 'aggregate'
         && Store.selected.id === id;
-      if (stillViewingSavedAggregate) {
+      if (stillViewingSavedAggregate && !autoSave) {
         // Store.load 只更新数据；重新渲染当前表单才能同步移除已关闭策略下的恢复按钮。
         controller.render();
       }
     } catch (err) {
-      const previousEnabled = Store.getAggregate(id)?.smart_breaker_enabled !== false;
-      const breakerInput = document.getElementById('aggregate-smart-breaker-enabled');
-      if (breakerInput) breakerInput.checked = previousEnabled;
-      controller.captureDraft();
+      const rolledBack = autoSave && Boolean(id)
+        && controller.restoreFailedAutoSaveBaseline({ type: 'aggregate', id }, controller._autoSaveSavingRevision);
+      if (!rolledBack) controller.captureDraft();
       controller.setSaveStatus('error', '保存失败：' + err.message);
-      Toast.error('保存失败：' + err.message);
+      if (!autoSave) Toast.error('保存失败：' + err.message);
     }
   },
 

@@ -138,8 +138,10 @@ const ConfigTab = {
     const storedGroup = sel.type === 'group' && sel.id ? Store.getGroup(sel.id) : null;
     const g = this._itemWithDraft(sel, storedGroup || (this.isNewGroupDraft(sel) ? this._newGroupDraft : null));
     const isDraft = !storedGroup && Boolean(g);
+    const groupRisk = this.groupRiskSummary(g?.id);
     const provider = g?.provider_type || 'relay';
     const baseUrl = g?.base_url || '';
+    const groupKeyConfigured = this.groupKeyConfigured(g, provider);
     const usesSystemDefault = this.isSystemDefaultBaseUrl(baseUrl, provider);
     const systemDefaultProvider = this.systemDefaultProvider(baseUrl);
     return `
@@ -167,29 +169,34 @@ const ConfigTab = {
           <div class="form-row" id="group-key-row">
             <label id="group-key-label">Ark API Key</label>
             <div class="input-with-btn">
-              <input id="group-key" type="password" value="${Utils.escapeHtml(this.groupKeyValue(g) || '')}" placeholder="sk-xxxx">
+              <input id="group-key" type="password" value="${Utils.escapeHtml(this.groupKeyValue(g) || '')}" placeholder="${groupKeyConfigured ? '已配置，留空保持不变' : 'sk-xxxx'}">
               <button type="button" id="group-key-toggle">显示</button>
             </div>
+            ${groupKeyConfigured ? '<div class="form-hint">已保存上游 API Key；留空保持不变，填写新值才会替换。</div>' : ''}
           </div>
         </section>
+        ${this.renderGroupRiskAlert(groupRisk)}
         <details class="form-card advanced-config" id="group-advanced-card">
           <summary>高级配置</summary>
           <div class="advanced-config-body">
-          <div class="form-row" id="group-cooldown-row">
-            <label>自动冷却分钟</label>
-            <input id="group-cooldown" type="number" min="0" step="1" value="${g?.auto_model_cooldown_minutes ?? 5}">
-            <div class="form-hint">该项仅保留自动路由基础配置；智能熔断冷却按观察、30 秒、1 分钟、3 分钟和最高 5 分钟执行。</div>
+          <div class="form-row hidden" id="group-cooldown-row">
+            <label>固定冷却分钟</label>
+            <input id="group-cooldown" type="number" min="1" max="1440" step="1" value="${g?.auto_model_cooldown_minutes ?? 5}">
+            <div class="form-hint">仅固定冷却策略生效，范围为 1 到 1440 分钟。</div>
           </div>
-          <div class="form-row" id="group-smart-breaker-row">
-            <label class="checkbox smart-breaker-toggle">
-              <input id="group-smart-breaker-enabled" type="checkbox" ${g?.smart_breaker_enabled !== false ? 'checked' : ''}>
-              <span>智能熔断</span>
-            </label>
-            <div class="form-hint">关闭会清理该组真实模型及该组进入任意聚合成员的自动健康状态，不影响手动停用、其他连接组或其他组成员。</div>
+          <div class="form-row" id="group-routing-policy-row">
+            <label>路由策略</label>
+            <select id="group-routing-policy">
+              <option value="smart_breaker" ${(g?.routing_policy || 'smart_breaker') === 'smart_breaker' ? 'selected' : ''}>智能熔断</option>
+              <option value="fixed_cooldown" ${g?.routing_policy === 'fixed_cooldown' ? 'selected' : ''}>固定冷却</option>
+              <option value="sticky_route" ${g?.routing_policy === 'sticky_route' ? 'selected' : ''}>粘性路由</option>
+              <option value="cooldown_off" ${g?.routing_policy === 'cooldown_off' ? 'selected' : ''}>关闭自动冷却</option>
+            </select>
+            <div class="form-hint">策略只影响当前连接组；粘性路由按本地会话选取已符合健康条件的候选，不会绕过手动停用或冷却。</div>
           </div>
           <div class="form-row" id="group-stream-timeout-row">
             <label>流式空闲超时秒</label>
-            <input id="group-stream-timeout" type="number" min="0" max="600" step="1" value="${g?.stream_idle_timeout ?? 120}">
+            <input id="group-stream-timeout" type="number" min="0" max="600" step="1" value="${g?.stream_idle_timeout ?? 45}">
           </div>
           <div class="form-row" id="group-waf-row">
             <label class="checkbox">
@@ -289,6 +296,7 @@ const ConfigTab = {
       cooling: '冷却中',
       breaker_open: '已熔断',
       half_open_probe: '恢复探测中',
+      risk_isolated: '风险隔离',
       breaker_policy_disabled: '熔断保护已关闭',
       manual_disabled: '手动停用',
     };
@@ -296,9 +304,44 @@ const ConfigTab = {
   },
 
   healthDeadline(item) {
+    if (item?.risk_isolated && Number(item?.risk_until || 0) > 0) return Number(item.risk_until);
     const state = item?.health_state || 'normal';
     const until = state === 'breaker_open' ? item?.breaker_until : item?.cooldown_until;
     return Number(until || 0);
+  },
+
+  formatRiskUntil(until) {
+    const timestamp = Number(until || 0);
+    return timestamp > 0 ? Utils.formatDate(timestamp) : '未知到期时间';
+  },
+
+  groupRiskSummary(groupId) {
+    if (!groupId) return null;
+    const isolatedModels = (Store.state.models || []).filter(model => (
+      model.group_id === groupId && model.risk_isolated === true
+    ));
+    if (!isolatedModels.length) return null;
+    return {
+      modelCount: isolatedModels.length,
+      affectedCount: Math.max(
+        isolatedModels.length,
+        ...isolatedModels.map(model => Number(model.risk_affected_models || 0)),
+      ),
+      until: Math.max(...isolatedModels.map(model => Number(model.risk_until || 0))),
+    };
+  },
+
+  renderGroupRiskAlert(summary) {
+    if (!summary) return '';
+    return `
+      <section class="form-card group-workflow-card" data-group-risk-alert>
+        <h3>上游风控保护</h3>
+        <div class="group-workflow-line"><strong>状态：</strong><span class="connection-status-badge warning">检测到上游风控拦截</span></div>
+        <div class="group-workflow-line"><strong>影响：</strong><span>该连接组内 ${summary.modelCount} 个模型处于隔离；同一上游凭证共影响 ${summary.affectedCount} 个模型。</span></div>
+        <div class="group-workflow-line"><strong>系统动作：</strong><span>已隔离至 ${Utils.escapeHtml(this.formatRiskUntil(summary.until))}，流量会转向其他候选。</span></div>
+        <div class="group-workflow-line"><strong>建议：</strong><span>不要连续重试；检查中转后台账号状态、渠道权限、频率限制和风控通知。</span></div>
+        <div class="form-actions group-workflow-actions"><button type="button" class="btn-secondary" data-group-action="view-risk-diagnosis">查看诊断</button></div>
+      </section>`;
   },
 
   renderModelSection(sel = Store.selected) {
@@ -314,12 +357,17 @@ const ConfigTab = {
       && m?.derived_status !== 'breaker_policy_disabled'
       && ['cooling', 'breaker_open'].includes(modelHealthState)
     );
+    const attemptFailures = (m?.attempt_window || []).filter(result => result === 'qualified_failure').length;
+    const breakerLevel = Number(m?.breaker_level || 0);
+    const riskIsolated = Boolean(m?.risk_isolated || modelHealthState === 'risk_isolated');
+    const riskUntil = this.formatRiskUntil(m?.risk_until);
     const groupId = m?.group_id || Store.state.groups?.[0]?.id || '';
     const group = Store.getGroup(groupId);
     const isArk = group?.provider_type === 'ark';
     const isRelay = group?.provider_type === 'relay';
     const isProxy = group?.provider_type === 'proxy';
     const needUpstream = isRelay || isProxy;
+    const modelKeyConfigured = Boolean(m?.api_key_configured || m?.api_key);
     return `
       <form class="config-form" id="model-form" data-type="model" data-selected-type="model" data-selected-id="${m?.id || ''}">
         <input type="hidden" id="model-id" value="${m?.id || ''}">
@@ -336,7 +384,8 @@ const ConfigTab = {
           ${!isArk ? `
           <div class="form-row" id="model-key-row">
             <label>${isRelay ? '中转站 API Key' : '上游 API Key'}${isRelay ? '<span class="required-mark"> *</span>' : ''}</label>
-            <input id="model-key" type="password" value="${Utils.escapeHtml(m?.api_key || '')}" placeholder="sk-xxxx" ${isRelay ? 'required' : ''}>
+            <input id="model-key" type="password" value="${Utils.escapeHtml(m?.api_key || '')}" placeholder="${modelKeyConfigured ? '已配置，留空保持不变' : 'sk-xxxx'}" ${isRelay && !modelKeyConfigured ? 'required' : ''}>
+            ${modelKeyConfigured ? '<div class="form-hint">已保存上游 API Key；留空保持不变，填写新值才会替换。</div>' : ''}
           </div>
           ` : ''}
           <div class="form-row ${needUpstream ? 'hidden' : ''}" id="model-ep-row">
@@ -391,11 +440,15 @@ const ConfigTab = {
             <span id="model-health-state">${this.modelHealthLabel(modelHealthState)}</span>
           </div>
           <div class="form-row read-only">
-            <label>连续失败</label>
-            <span id="model-consecutive-failures">${Number(m?.consecutive_failures || 0)} 次</span>
+            <label>近 5 次合格失败</label>
+            <span id="model-consecutive-failures">${attemptFailures} / 5</span>
           </div>
           <div class="form-row read-only">
-            <label>${modelHealthState === 'breaker_open' ? '熔断截止' : '冷却截止'}</label>
+            <label>熔断等级</label>
+            <span>${breakerLevel ? `第 ${breakerLevel} 档` : '-'}</span>
+          </div>
+          <div class="form-row read-only">
+            <label>${modelHealthState === 'risk_isolated' ? '风险隔离截止' : (modelHealthState === 'breaker_open' ? '熔断截止' : '冷却截止')}</label>
             <span id="model-cooldown-display" data-health-state="${modelHealthState}" data-health-deadline="${healthDeadline}">-</span>
             ${canRecoverModel ? '<button type="button" id="model-recover" class="btn-recover btn-sm">重试恢复</button>' : ''}
           </div>
@@ -407,6 +460,16 @@ const ConfigTab = {
             <label>最近错误</label>
             <span class="error-text">${Utils.escapeHtml(m?.last_error || '-')}</span>
           </div>
+          ${riskIsolated ? `
+          <div class="form-row read-only" data-model-risk-alert>
+            <label>上游风控保护</label>
+            <span class="error-text">检测到上游风控拦截，影响 ${Number(m?.risk_affected_models || 0)} 个同凭证模型；已隔离至 ${Utils.escapeHtml(riskUntil)}，流量会转向其他候选。</span>
+            <div class="form-actions">
+              <button type="button" id="model-risk-diagnosis" class="btn-secondary btn-sm">查看诊断</button>
+              <button type="button" id="model-risk-recover" class="btn-danger btn-sm">我已检查账号，手动恢复</button>
+            </div>
+          </div>
+          ` : ''}
           <div class="form-actions form-actions-split">
             <div class="form-actions-left">
               <button type="submit" class="btn-primary">保存模型</button>
@@ -455,19 +518,23 @@ const ConfigTab = {
           <div class="form-row">
             <label class="checkbox">
               <input id="aggregate-enabled" type="checkbox" ${a?.enabled !== false ? 'checked' : ''}>
-              <span>启用</span>
+              <span>启用此聚合路由</span>
             </label>
           </div>
-          <div class="form-row">
-            <label class="checkbox smart-breaker-toggle">
-              <input id="aggregate-smart-breaker-enabled" type="checkbox" ${a?.smart_breaker_enabled !== false ? 'checked' : ''}>
-              <span>智能熔断</span>
-            </label>
-            <div class="form-hint">关闭只清理当前聚合成员的自动健康状态，不影响底层真实模型和其他聚合。</div>
+          <div class="form-row" id="aggregate-routing-policy-row">
+            <label>路由策略</label>
+            <select id="aggregate-routing-policy">
+              <option value="smart_breaker" ${(a?.routing_policy || 'smart_breaker') === 'smart_breaker' ? 'selected' : ''}>智能熔断</option>
+              <option value="fixed_cooldown" ${a?.routing_policy === 'fixed_cooldown' ? 'selected' : ''}>固定冷却</option>
+              <option value="sticky_route" ${a?.routing_policy === 'sticky_route' ? 'selected' : ''}>粘性路由</option>
+              <option value="cooldown_off" ${a?.routing_policy === 'cooldown_off' ? 'selected' : ''}>关闭自动冷却</option>
+            </select>
+            <div class="form-hint">聚合策略只作用于当前成员链；粘性命中失效后会回退既有手动优先级顺序。</div>
           </div>
-          <div class="form-row">
-            <label>冷却分钟</label>
-            <input id="aggregate-cooldown" type="number" min="0" step="1" value="${a?.cooldown_minutes ?? 5}">
+          <div class="form-row hidden" id="aggregate-cooldown-row">
+            <label>固定冷却分钟</label>
+            <input id="aggregate-cooldown" type="number" min="1" max="1440" step="1" value="${a?.cooldown_minutes ?? 5}">
+            <div class="form-hint">仅固定冷却策略生效，范围为 1 到 1440 分钟。</div>
           </div>
           <div class="form-row">
             <label>调度策略</label>
@@ -911,6 +978,7 @@ const ConfigTab = {
       cooling: { class: 'cooldown', text: '冷却中', title: member.derived_reason || member.cooldown_reason || '聚合成员正在冷却' },
       breaker_open: { class: 'danger', text: '已熔断', title: member.derived_reason || '聚合成员已触发智能熔断' },
       half_open_probe: { class: 'warning', text: '恢复探测中', title: member.derived_reason || '聚合成员正在执行唯一恢复探测' },
+      risk_isolated: { class: 'danger', text: '风险隔离', title: member.derived_reason || '检测到上游风控拦截，当前凭证已暂停自动请求' },
       breaker_policy_disabled: { class: 'warning', text: '熔断保护已关闭', title: member.derived_reason || '当前范围已关闭智能熔断保护' },
       underlying_model_disabled: { class: 'warning', text: '底层模型已停用', title: member.derived_reason || '请先启用底层真实模型' },
       underlying_model_observing: { class: 'warning', text: '底层观察中', title: member.derived_reason || '底层真实模型正在观察连续失败' },
@@ -1202,6 +1270,7 @@ const ConfigTab = {
       panel.querySelector('#speed-test-group-button')?.addEventListener('click', e => this.runSpeedTest(e.currentTarget.dataset.speedTestType, e.currentTarget.dataset.speedTestId));
       panel.querySelector('#group-provider')?.addEventListener('change', () => this.onGroupProviderChange());
       panel.querySelector('#group-waf')?.addEventListener('change', () => { this.syncGroupModeUI(); this.autoSaveGroup(); });
+      panel.querySelector('#group-routing-policy')?.addEventListener('change', () => this.onRoutingPolicyChange('group'));
       panel.querySelector('#group-key-toggle')?.addEventListener('click', e => {
         const input = document.getElementById('group-key');
         input.type = input.type === 'password' ? 'text' : 'password';
@@ -1240,6 +1309,8 @@ const ConfigTab = {
       panel.querySelector('#model-delete')?.addEventListener('click', () => this.onModelDelete());
       panel.querySelector('#model-clone')?.addEventListener('click', () => this.onModelClone());
       panel.querySelector('#model-recover')?.addEventListener('click', () => this.onRecoverModel());
+      panel.querySelector('#model-risk-recover')?.addEventListener('click', () => this.onReleaseModelRiskIsolation());
+      panel.querySelector('#model-risk-diagnosis')?.addEventListener('click', () => this.onOpenRiskDiagnosis());
       panel.querySelector('#model-fetch')?.addEventListener('click', () => this.onFetchUpstream());
       panel.querySelector('#model-test')?.addEventListener('click', () => this.openQuickTest(document.getElementById('model-id')?.value));
       this.bindAutoSave(modelForm);
@@ -1251,6 +1322,7 @@ const ConfigTab = {
       aggregateForm.addEventListener('submit', e => this.onAggregateSubmit(e));
       panel.querySelector('#speed-test-aggregate-button')?.addEventListener('click', e => this.runSpeedTest(e.currentTarget.dataset.speedTestType, e.currentTarget.dataset.speedTestId));
       panel.querySelector('#aggregate-delete')?.addEventListener('click', () => this.onAggregateDelete());
+      panel.querySelector('#aggregate-routing-policy')?.addEventListener('change', () => this.onRoutingPolicyChange('aggregate'));
       panel.querySelector('#aggregate-copy-route-key')?.addEventListener('click', () => this.onCopyAggregateRouteKey());
       panel.querySelector('#aggregate-add-members')?.addEventListener('click', () => this.onAddAggregateMembers());
       panel.querySelector('#aggregate-stats-limit')?.addEventListener('change', () => this.refreshAggregateStats());
@@ -1351,7 +1423,7 @@ const ConfigTab = {
         auto_model_cooldown_minutes: values['group-cooldown'] ?? item.auto_model_cooldown_minutes,
         stream_idle_timeout: values['group-stream-timeout'] ?? item.stream_idle_timeout,
         waf_compatible: values['group-waf'] ?? item.waf_compatible,
-        smart_breaker_enabled: values['group-smart-breaker-enabled'] ?? item.smart_breaker_enabled,
+        routing_policy: values['group-routing-policy'] ?? item.routing_policy,
         serial_protection: serial ? serial === 'serial' : item.serial_protection,
         waf_client_mode: values['group-waf-client-mode'] ?? item.waf_client_mode,
         waf_accept_policy: values['group-waf-policy'] ?? item.waf_accept_policy,
@@ -1383,7 +1455,7 @@ const ConfigTab = {
           ? String(values['aggregate-client-model-aliases']).split(/[\n,]+/).map(value => value.trim()).filter(Boolean)
           : item.client_model_aliases,
         enabled: values['aggregate-enabled'] ?? item.enabled,
-        smart_breaker_enabled: values['aggregate-smart-breaker-enabled'] ?? item.smart_breaker_enabled,
+        routing_policy: values['aggregate-routing-policy'] ?? item.routing_policy,
         cooldown_minutes: values['aggregate-cooldown'] ?? item.cooldown_minutes,
         strategy: values['aggregate-strategy'] ?? item.strategy,
       };
@@ -1394,6 +1466,7 @@ const ConfigTab = {
   isNewGroupDraft(...args) { return ConfigTabForm.isNewGroupDraft(this, ...args); },
   isDefaultRelayBaseUrl(...args) { return ConfigTabForm.isDefaultRelayBaseUrl(this, ...args); },
   groupKeyValue(...args) { return ConfigTabForm.groupKeyValue(this, ...args); },
+  groupKeyConfigured(...args) { return ConfigTabForm.groupKeyConfigured(this, ...args); },
   syncUIFromState(...args) { return ConfigTabForm.syncUIFromState(this, ...args); },
   syncAggregateUI(...args) { return ConfigTabForm.syncAggregateUI(this, ...args); },
   updateAggregateCooldownDisplay(...args) { return ConfigTabForm.updateAggregateCooldownDisplay(this, ...args); },
@@ -1408,13 +1481,17 @@ const ConfigTab = {
   captureDraft(...args) { return ConfigTabForm.captureDraft(this, ...args); },
   draftValues(...args) { return ConfigTabForm.draftValues(this, ...args); },
   clearDraft(...args) { return ConfigTabForm.clearDraft(this, ...args); },
+  restoreFailedAutoSaveBaseline(...args) { return ConfigTabForm.restoreFailedAutoSaveBaseline(this, ...args); },
   bindAutoSave(...args) { return ConfigTabForm.bindAutoSave(this, ...args); },
+  scheduleAutoSave(...args) { return ConfigTabForm.scheduleAutoSave(this, ...args); },
+  syncRoutingPolicyUI(...args) { return ConfigTabForm.syncRoutingPolicyUI(this, ...args); },
   _captureFormValues(...args) { return ConfigTabForm._captureFormValues(this, ...args); },
   _restoreFormValues(...args) { return ConfigTabForm._restoreFormValues(this, ...args); },
   clearFieldErrors(...args) { return ConfigTabForm.clearFieldErrors(this, ...args); },
   setFieldError(...args) { return ConfigTabForm.setFieldError(this, ...args); },
   validateGroupForm(...args) { return ConfigTabForm.validateGroupForm(this, ...args); },
   validateModelForm(...args) { return ConfigTabForm.validateModelForm(this, ...args); },
+  validateAggregateForm(...args) { return ConfigTabForm.validateAggregateForm(this, ...args); },
   autoSaveGroup(...args) { return ConfigTabForm.autoSaveGroup(this, ...args); },
   autoSaveModel(...args) { return ConfigTabForm.autoSaveModel(this, ...args); },
   autoSaveAggregate(...args) { return ConfigTabForm.autoSaveAggregate(this, ...args); },
@@ -1425,10 +1502,12 @@ const ConfigTab = {
   _stopCooldownTimer(...args) { return ConfigTabRuntimeView._stopCooldownTimer(this, ...args); },
   updateCooldownDisplay(...args) { return ConfigTabRuntimeView.updateCooldownDisplay(this, ...args); },
   onRecoverModel(...args) { return ConfigTabActions.onRecoverModel(this, ...args); },
+  onReleaseModelRiskIsolation(...args) { return ConfigTabActions.onReleaseModelRiskIsolation(this, ...args); },
+  onOpenRiskDiagnosis(...args) { return ConfigTabActions.onOpenRiskDiagnosis(this, ...args); },
   onGroupWorkflowAction(...args) { return ConfigTabActions.onGroupWorkflowAction(this, ...args); },
   openQuickTest(...args) { return ConfigTabActions.openQuickTest(this, ...args); },
   copyGroupClientConfig(...args) { return ConfigTabActions.copyGroupClientConfig(this, ...args); },
-  confirmScopedSmartBreakerDisable(...args) { return ConfigTabActions.confirmScopedSmartBreakerDisable(this, ...args); },
+  onRoutingPolicyChange(...args) { return ConfigTabActions.onRoutingPolicyChange(this, ...args); },
   onGroupSubmit(...args) { return ConfigTabActions.onGroupSubmit(this, ...args); },
   onGroupDelete(...args) { return ConfigTabActions.onGroupDelete(this, ...args); },
   onAddModelToGroup(...args) { return ConfigTabActions.onAddModelToGroup(this, ...args); },

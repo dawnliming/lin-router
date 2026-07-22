@@ -2,7 +2,7 @@
 
 本地优先的 OpenAI 兼容中转站。Lin Router 在本机提供统一的 `/v1` 接口，将 Codex、Hermes 和其他 OpenAI 兼容客户端的请求转发到你配置的上游服务。
 
-- 当前版本：`v0.6.3`
+- 当前版本：`v0.6.4`
 - 支持平台：Windows、macOS
 - 管理台：`http://127.0.0.1:18400`
 - API 地址：`http://127.0.0.1:18400/v1`
@@ -15,15 +15,15 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| `LinRouter-Setup-v0.6.3-win-x64.exe` | 推荐。安装版，支持快捷方式和卸载 |
+| `LinRouter-Setup-v0.6.4-win-x64.exe` | 推荐。安装版，支持快捷方式和卸载 |
 | `LinRouter_windows.exe` | 便携版，直接运行，不安装 |
-| `LinRouter-v0.6.3-win-x64.zip` | 便携版压缩包 |
+| `LinRouter-v0.6.4-win-x64.zip` | 便携版压缩包 |
 
 ### macOS
 
 下载 `LinRouter.dmg`，将 `LinRouter.app` 拖入 `/Applications`。
 
-当前 v0.6.3 为自动构建的候选版本。Windows 产物尚未完成 Authenticode 签名，首次运行可能出现未知发布者提示；请确认下载来源后，在受控环境中测试。
+当前 v0.6.4 为自动构建的候选版本。Windows 产物尚未完成 Authenticode 签名，首次运行可能出现未知发布者提示；请确认下载来源后，在受控环境中测试。
 
 ## 快速开始
 
@@ -158,7 +158,7 @@ Windows 也可以运行 `start-preview-18409.bat`。
 bash scripts/build.sh --target win32
 
 # Windows EXE、ZIP 和安装包
-bash scripts/build.sh --target win32 --installer --version 0.6.3
+bash scripts/build.sh --target win32 --installer --version 0.6.4
 
 # macOS App 和 DMG
 bash scripts/build.sh --target darwin --dmg

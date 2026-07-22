@@ -397,6 +397,18 @@ class ObservabilityService:
             item = self._find_stream_log(request_id)
             return bool(item and self.detail_value(item.detail, "downstream_write_failed").lower() == "true")
 
+    def downstream_failure_category(self, request_id: str) -> str:
+        """返回精确下游失败类别；历史通用标记仍由 ``downstream_write_failed`` 兼容。"""
+        allowed = {
+            "downstream_broken_pipe",
+            "downstream_connection_reset",
+            "downstream_write_os_error",
+        }
+        with self._logs_lock:
+            item = self._find_stream_log(request_id)
+            category = self.detail_value(item.detail, "downstream_failure_category") if item else ""
+            return category if category in allowed else ""
+
     def rewrite_log_file(self) -> None:
         with self._logs_lock:
             try:
@@ -404,15 +416,24 @@ class ObservabilityService:
             except Exception as exc:
                 self.log_write_error = f"日志回写失败: {exc}"
 
-    def record_stream_transport_event(self, request_id: str, event: str) -> None:
-        """Persist transport-side evidence after the HTTP response has begun."""
-        if event not in {"downstream_first_flush", "downstream_terminal_forwarded", "downstream_write_failed"}:
+    def record_stream_transport_event(self, request_id: str, event: str, **evidence: Any) -> None:
+        """记录响应头后的匿名传输事件，不接收异常正文或请求内容。"""
+        downstream_events = {
+            "downstream_broken_pipe",
+            "downstream_connection_reset",
+            "downstream_write_os_error",
+        }
+        post_header_events = downstream_events | {
+            "upstream_iterator_error_after_headers",
+            "local_stream_handler_error",
+        }
+        if event not in {"downstream_first_flush", "downstream_terminal_forwarded", "downstream_write_failed"} | post_header_events:
             return
         with self._logs_lock:
             item = self._find_stream_log(request_id)
             if not item:
                 return
-            if event == "downstream_write_failed" and (item.event == "request_cancelled" or item.failure_scope == "client_cancelled"):
+            if event in downstream_events | {"downstream_write_failed"} and (item.event == "request_cancelled" or item.failure_scope == "client_cancelled"):
                 return
             if event == "downstream_first_flush":
                 try:
@@ -428,16 +449,82 @@ class ObservabilityService:
                 elapsed_ms = max(0, int(time.time() * 1000) - started_at_ms) if started_at_ms else -1
                 item.detail = self.update_detail_fields(item.detail, {"first_downstream_flush_ms": elapsed_ms})
             else:
-                item.detail = self.update_detail_fields(item.detail, {event: "true"})
-            if event == "downstream_write_failed":
-                item.event = event
-                item.failure_scope = "downstream"
+                fields: Dict[str, Any] = {event: "true"}
+                if event in downstream_events:
+                    fields.update({
+                        "downstream_write_failed": "true",
+                        "downstream_failure_category": event,
+                        "failure_category": event,
+                    })
+                    item.event = event
+                    item.failure_scope = "downstream"
+                elif event == "downstream_write_failed":
+                    fields["downstream_write_failed"] = "true"
+                    item.event = event
+                    item.failure_scope = "downstream"
+                elif event in post_header_events:
+                    fields["failure_category"] = event
+                    item.event = event
+                    item.failure_scope = "upstream" if event.startswith("upstream_") else "local"
+                # 仅接受数值、布尔和固定枚举，避免异常对象或原始内容落盘。
+                for key, value in evidence.items():
+                    if key in {
+                        "response_headers_emitted",
+                        "downstream_os_error_code",
+                        "max_upstream_chunk_bytes",
+                        "downstream_write_chunks",
+                        "downstream_bytes_written",
+                        "downstream_terminal_forwarded",
+                    } and isinstance(value, (bool, int)):
+                        fields[key] = str(value).lower() if isinstance(value, bool) else max(0, int(value))
+                item.detail = self.update_detail_fields(item.detail, fields)
             if event == "downstream_first_flush":
                 # The stream finalizer, terminal-forwarded event, or write
                 # failure will persist this field shortly afterwards.  Do not
                 # rewrite up to 5000 log rows in the forwarding hot path.
                 self._record_runtime_activity(item)
                 return
+            self.rewrite_log_file()
+            self._record_runtime_activity(item)
+
+    def record_stream_delivery_evidence(self, request_id: str, **evidence: Any) -> None:
+        """写入断开后 drain 的匿名计数与终态，不影响主失败归因。"""
+        allowed_numbers = {
+            "max_upstream_chunk_bytes",
+            "downstream_write_chunks",
+            "downstream_bytes_written",
+            "downstream_drain_bytes",
+            "downstream_drain_chunks",
+            "downstream_drain_elapsed_ms",
+            "downstream_drain_max_upstream_chunk_bytes",
+        }
+        allowed_flags = {"downstream_terminal_forwarded"}
+        allowed_values = {
+            "downstream_drain_stop_reason": {
+                "upstream_eof", "upstream_terminal", "upstream_iterator_error_after_headers", "time_budget", "byte_budget",
+            },
+            "downstream_drain_terminal": {"", "[DONE]", "response.completed", "response.failed", "response.incomplete"},
+        }
+        with self._logs_lock:
+            item = self._find_stream_log(request_id)
+            if not item:
+                return
+            fields: Dict[str, Any] = {}
+            for key in allowed_numbers:
+                value = evidence.get(key)
+                if isinstance(value, int):
+                    fields[key] = max(0, value)
+            for key in allowed_flags:
+                value = evidence.get(key)
+                if isinstance(value, bool):
+                    fields[key] = str(value).lower()
+            for key, allowed in allowed_values.items():
+                value = str(evidence.get(key) or "")
+                if value in allowed:
+                    fields[key] = value
+            if not fields:
+                return
+            item.detail = self.update_detail_fields(item.detail, fields)
             self.rewrite_log_file()
             self._record_runtime_activity(item)
 

@@ -107,6 +107,7 @@ const API = {
   setAllUsable(usable) { return this.req('/api/models/usable/all', { method: 'POST', body: JSON.stringify({ usable }) }); },
   resetCooldown(id) { return this.req(`/api/models/${id}/reset`, { method: 'POST' }); },
   recoverModel(id) { return this.req(`/api/models/${id}/recover`, { method: 'POST' }); },
+  releaseModelRiskIsolation(id) { return this.req(`/api/models/${id}/risk-recover`, { method: 'POST', body: JSON.stringify({ confirmed: true }) }); },
   resetGroupCooldown(id) { return this.req(`/api/groups/${id}/reset`, { method: 'POST' }); },
   fetchUpstreamModels(groupId, apiKey) {
     return this.req('/api/models/fetch-upstream', {

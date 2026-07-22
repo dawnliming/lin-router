@@ -63,6 +63,8 @@ const DashboardTab = {
     ]);
     const modelHealth = (state.models || []).map(model => [
       model.id, model.usable, model.cooldown_until, model.last_success_at,
+      model.derived_status, model.risk_isolated, model.risk_until,
+      model.risk_level, model.risk_affected_models,
     ]);
     const memberHealth = (state.aggregate_members || []).map(member => [
       member.id, member.enabled, member.cooldown_until,
@@ -133,6 +135,7 @@ const DashboardTab = {
     }
 
     this.replaceSlot(panel, '[data-dashboard-live-requests]', this.renderLiveRequests(state.live_requests || []));
+    this.replaceSlot(panel, '[data-dashboard-risk-alert]', this.renderRiskIsolationAlert(state));
     if (['S3', 'S4'].includes(flow.code)) {
       this.replaceSlot(panel, '[data-dashboard-metrics]', this.renderMetrics(state, flow, recent));
       this.replaceSlot(panel, '[data-dashboard-aggregate-summary]', this.aggregateSummaryCards(state.aggregate_models || [], recent));
@@ -229,6 +232,40 @@ const DashboardTab = {
     return (logs || []).filter(log => !this.isConfigSkip(log)).slice(0, 30);
   },
 
+  riskIsolationSummary(state = Store.state || {}) {
+    const isolatedModels = (state.models || []).filter(model => model.risk_isolated === true);
+    if (!isolatedModels.length) return null;
+    const firstModel = isolatedModels[0];
+    return {
+      modelCount: isolatedModels.length,
+      affectedCount: Math.max(
+        isolatedModels.length,
+        ...isolatedModels.map(model => Number(model.risk_affected_models || 0)),
+      ),
+      until: Math.max(...isolatedModels.map(model => Number(model.risk_until || 0))),
+      modelId: firstModel.id,
+    };
+  },
+
+  renderRiskIsolationAlert(state = Store.state || {}) {
+    const summary = this.riskIsolationSummary(state);
+    if (!summary) return '<section class="dashboard-risk-alert hidden" data-dashboard-risk-alert></section>';
+    const until = summary.until > 0 ? Utils.formatDate(summary.until) : '未知到期时间';
+    return `
+      <section class="dashboard-risk-alert" data-dashboard-risk-alert aria-live="polite">
+        <div>
+          <div class="dashboard-risk-eyebrow">上游风控保护</div>
+          <h3>检测到上游风控拦截</h3>
+          <p>影响：当前有 ${summary.modelCount} 个本地模型处于隔离；按凭证范围共影响 ${summary.affectedCount} 个模型。系统已隔离至 ${Utils.escapeHtml(until)}，流量会转向其他候选。</p>
+          <p>建议：不要连续重试；检查中转后台账号状态、渠道权限、频率限制和风控通知。</p>
+        </div>
+        <div class="dashboard-flow-actions">
+          <button type="button" class="btn-secondary" data-dashboard-action="open-risk-model" data-model-id="${Utils.escapeHtml(summary.modelId)}">查看诊断与恢复</button>
+        </div>
+      </section>
+    `;
+  },
+
   render() {
     const state = Store.state || {};
     const groups = state.groups || [];
@@ -241,6 +278,7 @@ const DashboardTab = {
     return `
       <div class="dashboard-page">
         ${this.renderHero(flow)}
+        ${this.renderRiskIsolationAlert(state)}
         ${this.renderFlowCard(flow)}
         ${this.renderLiveRequests(state.live_requests || [])}
         ${operational ? `
@@ -915,6 +953,12 @@ const DashboardTab = {
     if (action === 'config') return Tabs.switch('config');
     if (action === 'test') return Tabs.switch('test');
     if (action === 'logs') return Tabs.switch('logs');
+    if (action === 'open-risk-model') {
+      const model = Store.getModel(btn.dataset.modelId);
+      if (!model?.risk_isolated) return Toast.warning('该模型当前没有可处理的上游风控隔离');
+      Store.select('model', model.id);
+      return Tabs.switch('config');
+    }
     if (action === 'select-group') { Store.select('group', btn.dataset.groupId); return Tabs.switch('config'); }
     if (action === 'add-model') return ConfigTab.onAddModelToGroup(btn.dataset.groupId);
     if (action === 'fetch-models') return ConfigTab.fetchModelsForGroup(btn.dataset.groupId);

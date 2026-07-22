@@ -47,6 +47,7 @@ class AllModelsFailedError(RuntimeError):
         error_code: str = "",
         fallback_chain: Optional[List[Dict[str, Any]]] = None,
         aggregate_name: str = "",
+        request_id: str = "",
     ) -> None:
         super().__init__(message)
         self.attempted = attempted
@@ -54,6 +55,7 @@ class AllModelsFailedError(RuntimeError):
         self.error_code = error_code
         self.fallback_chain = fallback_chain or []
         self.aggregate_name = aggregate_name
+        self.request_id = request_id
 
 
 class StreamIdleTimeoutError(TimeoutError):

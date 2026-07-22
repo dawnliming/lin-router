@@ -104,7 +104,10 @@ const ConnectionStatus = {
     const missing = [];
     if (!String(group?.name || '').trim()) missing.push('组名');
     if (!this.isValidBaseUrl(group?.base_url)) missing.push('Base URL');
-    if (['ark', 'proxy'].includes(group?.provider_type) && !String(group?.ark_api_key || group?.api_key || '').trim()) {
+    const hasGroupKey = group?.provider_type === 'proxy'
+      ? Boolean(group?.api_key_configured || String(group?.api_key || '').trim())
+      : Boolean(group?.ark_api_key_configured || String(group?.ark_api_key || '').trim());
+    if (['ark', 'proxy'].includes(group?.provider_type) && !hasGroupKey) {
       missing.push('API Key');
     }
     return missing;
@@ -114,7 +117,7 @@ const ConnectionStatus = {
     const missing = [];
     if (!String(model?.name || '').trim()) missing.push('模型名称');
     if (!String(model?.upstream_model || model?.ep_id || '').trim()) missing.push('上游模型');
-    if (group?.provider_type === 'relay' && !String(model?.api_key || '').trim()) missing.push('中转站 API Key');
+    if (group?.provider_type === 'relay' && !Boolean(model?.api_key_configured || String(model?.api_key || '').trim())) missing.push('中转站 API Key');
     return missing;
   },
 

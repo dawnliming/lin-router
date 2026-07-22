@@ -67,6 +67,7 @@ from linrouter_core.runtime import (
     StreamExecutionService,
 )
 from linrouter_core.runtime.http_api_runtime import handle_delete, handle_get, handle_post, handle_put
+from linrouter_core.runtime.router_runtime import CONNECT_TIMEOUT_SECONDS
 from linrouter_core.runtime.execution_runtime_ports import (
     CandidateStatePort,
     ConcurrencyPort as RuntimeConcurrencyPort,
@@ -329,6 +330,7 @@ class ArkProxyRouter:
             patch_stream=self.patch_stream_lifecycle,
             cancellation_requested=self._cancellation_requested,
             downstream_write_failed=self._downstream_write_failed,
+            downstream_failure_category=self._downstream_failure_category,
             set_response=self._set_live_response,
             close_response=self._close_live_response,
         )
@@ -553,15 +555,17 @@ class ArkProxyRouter:
         except ValueError:
             started_at_ms = 0
         duration_ms = max(item.duration_ms, int(time.time() * 1000) - started_at_ms) if started_at_ms else item.duration_ms
-        downstream_write_failed = self.observability.downstream_write_failed(request_id)
+        downstream_failure_category = self.observability.downstream_failure_category(request_id)
+        downstream_write_failed = bool(downstream_failure_category) or self.observability.downstream_write_failed(request_id)
+        downstream_result = downstream_failure_category or "downstream_write_failed"
         self.patch_stream_lifecycle(
             request_id, item.attempt, item.model,
             (item.prompt_tokens, item.completion_tokens, item.total_tokens, item.cached_tokens, item.reasoning_tokens),
             "stream_incomplete", final_status="downstream_disconnected" if downstream_write_failed else "client_disconnected",
-            lifecycle="downstream_write_failed" if downstream_write_failed else "client_disconnected",
-            final_result="downstream_write_failed" if downstream_write_failed else "client_disconnected", chunks_received=int(self._detail_value(item.detail, "chunks_received") or 1),
+            lifecycle=downstream_result if downstream_write_failed else "client_disconnected",
+            final_result=downstream_result if downstream_write_failed else "client_disconnected", chunks_received=int(self._detail_value(item.detail, "chunks_received") or 1),
             bytes_received=int(self._detail_value(item.detail, "bytes_received") or 0), duration_ms=duration_ms,
-            lock_release_reason="downstream_write_failed" if downstream_write_failed else "client_disconnect",
+            lock_release_reason=downstream_result if downstream_write_failed else "client_disconnect",
             failure_scope="downstream" if downstream_write_failed else "request",
         )
 
@@ -1427,6 +1431,9 @@ class ArkProxyRouter:
     def _downstream_write_failed(self, request_id: str) -> bool:
         return self.observability.downstream_write_failed(request_id)
 
+    def _downstream_failure_category(self, request_id: str) -> str:
+        return self.observability.downstream_failure_category(request_id)
+
     def is_live_request_cancelled(self, request_id: str) -> bool:
         return self.observability.cancellation_requested(request_id)
 
@@ -1439,8 +1446,11 @@ class ArkProxyRouter:
     def cancel_live_request(self, request_id: str, source: str = "dashboard") -> Dict[str, Any]:
         return self.observability.request_cancellation(request_id, source)
 
-    def record_stream_transport_event(self, request_id: str, event: str) -> None:
-        self.observability.record_stream_transport_event(request_id, event)
+    def record_stream_transport_event(self, request_id: str, event: str, **evidence: Any) -> None:
+        self.observability.record_stream_transport_event(request_id, event, **evidence)
+
+    def record_stream_delivery_evidence(self, request_id: str, **evidence: Any) -> None:
+        self.observability.record_stream_delivery_evidence(request_id, **evidence)
 
     def live_requests_payload(self) -> Dict[str, Any]:
         return self.observability.live_requests_payload()
@@ -1475,15 +1485,30 @@ class ArkProxyRouter:
             return self._finish_speed_test(f"group:{group_id}", {"ok": False, "code": "group_not_found", "message": "连接组不存在"})
         started = time.perf_counter()
         results = []
+        probe_attempts = 0
         for idx, model in enumerate(self.store.models):
             if model.group_id != group_id or not model.usable or model.disabled_by_user:
                 continue
             candidate = self._candidate_from_model(idx, model, group)
+            risk = self.candidate_health.risk_status_for_candidate(candidate)
+            if risk["risk_isolated"]:
+                results.append({
+                    "model": model.name,
+                    "group": group.name,
+                    "ok": False,
+                    "reason": "risk_isolated",
+                    "message": "检测到上游风控拦截，当前凭证已暂停测速请求。",
+                    "total_ms": 0,
+                    **risk,
+                })
+                continue
             probe_started = time.perf_counter()
             ok, reason, detail = self._manual_probe_candidate(candidate)
             results.append({"model": model.name, "group": group.name, "ok": ok, "reason": reason, "message": self._manual_probe_summary(reason, detail), "detail": detail, "total_ms": round((time.perf_counter() - probe_started) * 1000, 2)})
+            probe_attempts += 1
         success_count = sum(1 for item in results if item["ok"])
-        result = {"ok": success_count > 0, "results": results, "completed": len(results), "attempts": len(results), "success": success_count, "failure": len(results) - success_count, "fallback": False, "total_ms": round((time.perf_counter() - started) * 1000, 2), "message": "测速完成" if results else "该连接组没有可测速模型", "source": "health_check"}
+        risk_skipped = sum(1 for item in results if item.get("reason") == "risk_isolated")
+        result = {"ok": success_count > 0, "results": results, "completed": len(results), "attempts": probe_attempts, "success": success_count, "failure": probe_attempts - success_count, "risk_skipped": risk_skipped, "fallback": False, "total_ms": round((time.perf_counter() - started) * 1000, 2), "message": "测速完成" if probe_attempts else ("检测到上游风控拦截，当前凭证已暂停测速请求" if risk_skipped else "该连接组没有可测速模型"), "source": "health_check"}
         return self._finish_speed_test(f"group:{group_id}", result)
 
     def speed_test_aggregate(self, aggregate_id: str) -> Dict[str, Any]:
@@ -1508,6 +1533,9 @@ class ArkProxyRouter:
 
     def _manual_probe_candidate(self, candidate: UpstreamCandidate) -> Tuple[bool, str, str]:
         """对单个候选执行最小非流式探测，不计入正式请求与收益统计。"""
+        if self.candidate_health.risk_status_for_candidate(candidate)["risk_isolated"]:
+            # 防御未来入口绕过：风险隔离期间不允许任何测速/自动恢复探测触达上游。
+            return False, "risk_isolated", "检测到上游风控拦截，当前凭证已暂停自动请求。"
         if not candidate.auth_key:
             return False, "missing_upstream_api_key", "缺少上游 API Key"
         target_url = self._resolve_url(candidate.group.base_url, "/v1/chat/completions")
@@ -1524,16 +1552,37 @@ class ArkProxyRouter:
         if not acquired:
             return False, "serial_protection_wait_timeout", "该连接组已开启串行保护，候选仍在处理请求"
         try:
-            with self._upstream_client.request("POST", target_url, headers, body, stream=False, timeout=20) as resp:
-                resp.read()
+            # 探测同样是真实上游尝试：遵守 8 秒建连/响应头边界，并把结果写入
+            # 匿名风险窗口；但不触碰模型/成员的常规稳定性熔断窗口。
+            with self._upstream_client.request(
+                "POST",
+                target_url,
+                headers,
+                body,
+                stream=False,
+                timeout=CONNECT_TIMEOUT_SECONDS,
+            ) as resp:
+                response_body = resp.read()
                 if 200 <= int(resp.status) < 300:
+                    self.candidate_health.record_risk_attempt(candidate, "success")
                     return True, "probe_ok", "最小探测成功"
-                return False, f"http_{resp.status}", f"上游返回 HTTP {resp.status}"
+                raw = response_body.decode("utf-8", "ignore")
+                classification = self._classify_candidate_error(resp.status, raw, "http")
+                self.candidate_health.record_risk_attempt(
+                    candidate,
+                    "waf_blocked" if classification.category == "waf_blocked" else "other",
+                )
+                return False, classification.log_reason, self._short_error(raw)
         except HTTPError as err:
             raw = err.read().decode("utf-8", "ignore") if hasattr(err, "read") else str(err)
             classification = self._classify_candidate_error(err.code, raw, "http")
+            self.candidate_health.record_risk_attempt(
+                candidate,
+                "waf_blocked" if classification.category == "waf_blocked" else "other",
+            )
             return False, classification.log_reason, self._short_error(raw)
         except (URLError, TimeoutError, OSError) as err:
+            self.candidate_health.record_risk_attempt(candidate, "other")
             return False, "network", self._short_error(str(err))
         finally:
             self._release_lock(upstream_lock)
@@ -1593,6 +1642,14 @@ class ArkProxyRouter:
         group = self.store.find_group(model.group_id)
         if not group:
             return {"ok": False, "message": "模型所属连接组不存在，无法执行探测。", "code": "group_not_found"}
+        risk = self.candidate_health.risk_status_for_model(model)
+        if risk["risk_isolated"]:
+            return {
+                "ok": False,
+                "message": "检测到上游风控拦截，当前凭证已暂停自动请求；请先确认账号状态后执行手动恢复。",
+                "code": "risk_isolated",
+                **risk,
+            }
         policy_status = self.candidate_health.policy_status(model)
         if not policy_status["smart_breaker_effective_enabled"]:
             disabled_by = str(policy_status["smart_breaker_disabled_by"] or "")
@@ -1630,6 +1687,32 @@ class ArkProxyRouter:
         self.add_log("/api/models/recover", model.name, "probe_ok", f"manual_probe=true; model_id={model.id}; probe_result=success; summary=最小探测成功，模型已恢复参与调度。; cooldown_applied=false; failure_scope=manual", group=group, request_id=f"manual-probe-{uuid.uuid4().hex}", event="manual_probe", usage_source="manual_probe", failure_scope="manual")
         return {"ok": True, "message": "最小探测成功，已恢复该模型参与调度。", "model": asdict(model), "before": before}
 
+    def release_model_risk_isolation(self, model_id: str, *, confirmed: bool = False) -> Dict[str, Any]:
+        """人工二次确认后解除当前模型所属凭证的风险隔离；不执行任何上游探测。"""
+        model = self.store.find_model(model_id)
+        if not model:
+            return {"ok": False, "message": "模型不存在", "code": "model_not_found"}
+        if not confirmed:
+            return {
+                "ok": False,
+                "message": "请确认已检查上游账号状态。恢复后会重新发起上游请求，频繁恢复可能扩大账号风险。",
+                "code": "risk_recovery_confirmation_required",
+            }
+        result = self.candidate_health.release_risk_isolation_for_model(model)
+        if not result.get("ok"):
+            return result
+        group = self.store.find_group(model.group_id)
+        self.add_log(
+            "/api/models/risk-recover",
+            model.name,
+            "risk_recovered",
+            "risk_manual_recovery=true; risk_isolated=false; failure_scope=manual",
+            group=group,
+            event="risk_manual_recovery",
+            failure_scope="manual",
+        )
+        return {**result, "model_id": model.id}
+
     def recover_aggregate_member(self, member_id: str) -> Dict[str, Any]:
         member = self.store.find_aggregate_member(member_id)
         if not member:
@@ -1641,6 +1724,14 @@ class ArkProxyRouter:
         aggregate = self.store.find_aggregate(member.aggregate_id)
         if not model or not group:
             return {"ok": False, "message": "成员底层模型或连接组不存在，无法执行探测。", "code": "member_target_missing"}
+        risk = self.candidate_health.risk_status_for_member(member)
+        if risk["risk_isolated"]:
+            return {
+                "ok": False,
+                "message": "检测到上游风控拦截，当前凭证已暂停自动请求；请先在底层模型执行手动恢复。",
+                "code": "risk_isolated",
+                **risk,
+            }
         policy_status = self.candidate_health.policy_status(member)
         if not policy_status["smart_breaker_effective_enabled"]:
             disabled_by = str(policy_status["smart_breaker_disabled_by"] or "")
@@ -1846,7 +1937,8 @@ class ArkProxyRouter:
         if candidate.idx is None:
             return 0
         cooldown_seconds = self._auto_cooldown_seconds(candidate.group)
-        self._set_cooldown(candidate.idx, error, cooldown_seconds, "stream_timeout")
+        # 调用点已区分首帧与已输出后空闲，持久化原因必须保留该阶段。
+        self._set_cooldown(candidate.idx, error, cooldown_seconds, str(error or "stream_timeout"))
         return cooldown_seconds
 
     @staticmethod
@@ -1995,6 +2087,24 @@ class RouterHandler(BaseHTTPRequestHandler):
                     "reason": item.get("reason", ""),
                     "cooldown_applied": item.get("cooldown_applied", False),
                 })
+        elif err_code == "aggregate_first_frame_timeout":
+            err_type = "aggregate_first_frame_timeout"
+            code = "aggregate_first_frame_timeout"
+            details = {
+                "aggregate_model": getattr(err, "aggregate_name", ""),
+                "attempted": err.attempted,
+                "fallback_chain": [],
+            }
+            for item in err.fallback_chain:
+                details["fallback_chain"].append({
+                    "member_id": item.get("member_id", ""),
+                    "group": item.get("group", ""),
+                    "model": item.get("model", ""),
+                    "manual_price": item.get("manual_price"),
+                    "status": item.get("status", ""),
+                    "reason": item.get("reason", ""),
+                    "cooldown_applied": item.get("cooldown_applied", False),
+                })
         elif err_code == "aggregate_members_unavailable":
             err_type = "all_aggregate_members_failed"
             code = "aggregate_members_unavailable"
@@ -2030,6 +2140,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 "code": code,
             }
         }
+        if getattr(err, "request_id", ""):
+            payload["error"]["request_id"] = err.request_id
         if details:
             payload["error"]["details"] = details
         self._send_json(payload, status=status)
@@ -2546,6 +2658,7 @@ class RouterHandler(BaseHTTPRequestHandler):
     def _model_runtime_item(self, model: ModelConfig) -> Dict[str, Any]:
         health_state = self.router.candidate_health.runtime_health_state(model)
         policy = self.router.candidate_health.policy_status(model)
+        risk = self.router.candidate_health.risk_status_for_model(model)
         disabled_by = str(policy["smart_breaker_disabled_by"] or "")
         disabled_source = {
             "global": "全局总开关",
@@ -2555,6 +2668,9 @@ class RouterHandler(BaseHTTPRequestHandler):
         if health_state == "manual_disabled" or (model.usable is False and model.disabled_by_user):
             status = "manual_disabled"
             reason = "用户已停用该模型"
+        elif risk["risk_isolated"]:
+            status = "risk_isolated"
+            reason = "检测到上游风控拦截，当前凭证已暂停自动请求。"
         elif not policy["smart_breaker_effective_enabled"]:
             status = "breaker_policy_disabled"
             reason = f"熔断保护已关闭（{disabled_source}）"
@@ -2588,6 +2704,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             "disabled_by_user": model.disabled_by_user,
             "health_state": health_state,
             "consecutive_failures": model.consecutive_failures,
+            "attempt_window": list(getattr(model, "attempt_window", []) or []),
+            "breaker_level": int(getattr(model, "breaker_level", 0) or 0),
             "cooldown_until": model.cooldown_until,
             "cooldown_reason": model.cooldown_reason,
             "breaker_until": model.breaker_until,
@@ -2596,6 +2714,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             "last_success_at": getattr(model, "last_success_at", ""),
             "last_failure_at": getattr(model, "last_failure_at", ""),
             **policy,
+            **risk,
         }
 
     def _member_runtime_item(self, member: AggregateMember) -> Dict[str, Any]:
@@ -2603,6 +2722,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         model = self.store.find_model(member.model_id)
         health_state = self.router.candidate_health.runtime_health_state(member)
         policy = self.router.candidate_health.policy_status(member)
+        risk = self.router.candidate_health.risk_status_for_member(member)
         disabled_by = str(policy["smart_breaker_disabled_by"] or "")
         disabled_source = {
             "global": "全局总开关",
@@ -2618,6 +2738,9 @@ class RouterHandler(BaseHTTPRequestHandler):
         elif not model:
             status = "config_error"
             reason = "底层真实模型缺失"
+        elif risk["risk_isolated"]:
+            status = "risk_isolated"
+            reason = "检测到上游风控拦截，当前凭证已暂停自动请求。"
         elif not policy["smart_breaker_effective_enabled"]:
             status = "breaker_policy_disabled"
             reason = f"熔断保护已关闭（{disabled_source}）"
@@ -2662,6 +2785,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             "enabled": member.enabled,
             "health_state": health_state,
             "consecutive_failures": member.consecutive_failures,
+            "attempt_window": list(getattr(member, "attempt_window", []) or []),
+            "breaker_level": int(getattr(member, "breaker_level", 0) or 0),
             "cooldown_until": member.cooldown_until,
             "cooldown_reason": member.cooldown_reason,
             "breaker_until": member.breaker_until,
@@ -2671,6 +2796,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             "last_failure_at": getattr(member, "last_failure_at", ""),
             "underlying_model_status": self._model_runtime_item(model)["derived_status"] if model else "missing",
             **policy,
+            **risk,
         }
 
     def _filtered_recent_logs(self, include_skip: bool = False) -> List[RequestLog]:

@@ -6,16 +6,20 @@ from urllib.parse import urlparse
 
 BLOCKED_FORWARD_HEADERS = {
     "authorization", "connection", "content-length", "transfer-encoding", "host",
-    "openai-organization", "openai-project", "x-request-id",
+    "openai-organization", "openai-project", "x-request-id", "x-linrouter-session",
 }
 WAF_STRIP_PREFIXES = ("x-stainless-",)
 WAF_STRIP_EXACT = {
     "host", "connection", "content-length", "user-agent", "cache-control", "pragma",
     "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
     "transfer-encoding", "upgrade", "authorization", "openai-organization",
-    "openai-project", "x-request-id",
+    "openai-project", "x-request-id", "x-linrouter-session",
 }
-PASSTHROUGH_STRIP_EXACT = {"host", "connection", "content-length", "transfer-encoding", "authorization"}
+PASSTHROUGH_STRIP_EXACT = {
+    "host", "connection", "content-length", "transfer-encoding", "authorization",
+    # 仅供本地路由选择使用，任何上游路径都不得收到该 Header。
+    "x-linrouter-session",
+}
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"

@@ -17,7 +17,13 @@ from .constants import (
     new_aggregate_route_key,
     new_route_key,
 )
-from .models import AggregateMember, AggregateModel, ConnectionGroup, ModelConfig
+from .models import (
+    ROUTING_POLICY_SMART_BREAKER,
+    AggregateMember,
+    AggregateModel,
+    ConnectionGroup,
+    ModelConfig,
+)
 
 
 class ConfigStore:
@@ -65,7 +71,14 @@ class ConfigStore:
             self.groups = [ConnectionGroup.from_dict(x) for x in groups_raw if isinstance(x, dict)]
         else:
             self.groups = []
-        changed = False
+        # 首次读取旧布尔字段时立即迁移到 canonical 策略，后续落盘不再写回旧字段。
+        changed = any(
+            "routing_policy" not in item or "smart_breaker_enabled" in item
+            for item in [
+                *(item for item in groups_raw if isinstance(item, dict)),
+                *(item for item in aggregates_raw if isinstance(item, dict)),
+            ]
+        )
         for group in self.groups:
             if not group.route_key:
                 group.route_key = new_route_key()
@@ -131,18 +144,17 @@ class ConfigStore:
         # 清理 orphan 成员
         if self._cleanup_orphan_members():
             changed = True
-        # 已显式关闭局部策略的旧配置不能带着历史健康字段继续运行；
-        # 缺失字段会在 from_dict 中按 true 加载，不会触发这条兼容清理。
+        # 非 smart_breaker 的旧配置不能带着 breaker 健康字段继续运行。
         _snapshots, disabled_scope_changed = self._clear_health_states_locked(
             lambda item: (
                 isinstance(item, ModelConfig)
-                and not bool(getattr(self.find_group(item.group_id), "smart_breaker_enabled", True))
+                and self._policy_disables_smart_breaker(self.find_group(item.group_id))
             )
             or (
                 isinstance(item, AggregateMember)
                 and (
-                    not bool(getattr(self.find_group(item.group_id), "smart_breaker_enabled", True))
-                    or not bool(getattr(self.find_aggregate(item.aggregate_id), "smart_breaker_enabled", True))
+                    self._policy_disables_smart_breaker(self.find_group(item.group_id))
+                    or self._policy_disables_smart_breaker(self.find_aggregate(item.aggregate_id))
                 )
             )
         )
@@ -184,11 +196,18 @@ class ConfigStore:
             return len(self.aggregate_members) != before
 
     @staticmethod
+    def _policy_disables_smart_breaker(item: ConnectionGroup | AggregateModel | None) -> bool:
+        """仅关闭冷却和粘性路由清理自动状态；固定冷却需保留其截止时间。"""
+        return bool(item) and item.routing_policy in {"cooldown_off", "sticky_route"}
+
+    @staticmethod
     def _clear_health_item(item: ModelConfig | AggregateMember) -> bool:
         """清理系统健康字段，同时保留模型/成员的手动停用状态。"""
         before = (
             item.health_state,
             item.consecutive_failures,
+            list(getattr(item, "attempt_window", []) or []),
+            int(getattr(item, "breaker_level", 0) or 0),
             item.last_failure_at,
             item.breaker_until,
             item.breaker_reason,
@@ -199,6 +218,8 @@ class ConfigStore:
             getattr(item, "usable", None),
         )
         item.consecutive_failures = 0
+        item.attempt_window = []
+        item.breaker_level = 0
         item.last_failure_at = 0
         item.breaker_until = 0
         item.breaker_reason = ""
@@ -215,6 +236,8 @@ class ConfigStore:
         after = (
             item.health_state,
             item.consecutive_failures,
+            list(getattr(item, "attempt_window", []) or []),
+            int(getattr(item, "breaker_level", 0) or 0),
             item.last_failure_at,
             item.breaker_until,
             item.breaker_reason,
@@ -285,13 +308,13 @@ class ConfigStore:
             snapshots, changed = self._clear_health_states_locked(
                 lambda item: (
                     isinstance(item, ModelConfig)
-                    and not bool(getattr(self.find_group(item.group_id), "smart_breaker_enabled", True))
+                    and self._policy_disables_smart_breaker(self.find_group(item.group_id))
                 )
                 or (
                     isinstance(item, AggregateMember)
                     and (
-                        not bool(getattr(self.find_group(item.group_id), "smart_breaker_enabled", True))
-                        or not bool(getattr(self.find_aggregate(item.aggregate_id), "smart_breaker_enabled", True))
+                        self._policy_disables_smart_breaker(self.find_group(item.group_id))
+                        or self._policy_disables_smart_breaker(self.find_aggregate(item.aggregate_id))
                     )
                 )
             )
@@ -395,8 +418,8 @@ class ConfigStore:
             previous_aggregates = list(self.aggregate_models)
             previous_revisions = dict(self.aggregate_member_revisions)
             health_snapshots: List[Tuple[Any, Dict[str, Any]]] = []
-            if existing and existing.smart_breaker_enabled and not aggregate.smart_breaker_enabled:
-                # 聚合关闭只清理当前聚合成员，绝不触碰其底层真实模型或其他聚合。
+            if existing and existing.routing_policy != aggregate.routing_policy:
+                # 策略切换只清理当前聚合成员，绝不触碰底层真实模型或其他聚合。
                 health_snapshots, _changed = self._clear_health_states_locked(
                     lambda item: isinstance(item, AggregateMember) and item.aggregate_id == aggregate.id
                 )
@@ -1173,8 +1196,8 @@ class ConfigStore:
                 group.provider_type = PROVIDER_ARK
             previous_groups = list(self.groups)
             health_snapshots: List[Tuple[Any, Dict[str, Any]]] = []
-            if existing and existing.smart_breaker_enabled and not group.smart_breaker_enabled:
-                # 关闭组策略会清理该组模型，以及该组模型在任意聚合内的成员状态。
+            if existing and existing.routing_policy != group.routing_policy:
+                # 组策略切换清理该组模型及跨聚合成员，绝不改写组/聚合对象健康字段。
                 health_snapshots, _changed = self._clear_health_states_locked(
                     lambda item: item.group_id == group.id
                 )
