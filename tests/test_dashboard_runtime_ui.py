@@ -386,7 +386,8 @@ def test_v063_onboarding_quick_copy_follows_the_selected_group_and_model():
 def test_v063_onboarding_stays_information_only_and_readme_matches_contract():
     dashboard_js = (ROOT / "static/js/dashboard-tab.js").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    readme_onboarding = readme[readme.index("## 自助接入 Codex / Hermes"):readme.index("## 预览 / 调试")]
+    # README 已取消 Codex / Hermes 专项自助接入章节，只保留通用客户端接入说明。
+    readme_onboarding = readme[readme.index("### 3. 接入客户端"):readme.index("### Key 的区别")]
     onboarding_start = dashboard_js.index("  onboardingRelayGroups(")
     onboarding_end = dashboard_js.index("  formatElapsed(", onboarding_start)
     onboarding_source = dashboard_js[onboarding_start:onboarding_end]
@@ -408,10 +409,11 @@ def test_v063_onboarding_stays_information_only_and_readme_matches_contract():
     for forbidden in ("$env:", "config.toml", "model_providers", "hermes model", "Custom endpoint", "chat_completions"):
         assert forbidden not in onboarding_source
         assert forbidden not in readme_onboarding
-    assert "Lin Router 是本地 OpenAI 兼容中转站" in readme
+    assert "本地优先的 OpenAI 兼容中转站" in readme
     assert "上游 API Key" in readme
-    assert "route key 是客户端到本机 Lin Router 的认证信息" in readme
-    assert "一键复制接入信息" in readme
+    assert "route key（`lr-...`）" in readme
+    assert "Lin Router 仅生成和复制接入信息" in readme_onboarding
+    assert "不会自动探测、启动或写入 Codex、Hermes 等客户端的本地配置" in readme_onboarding
     assert "推理强度支持" not in readme
 
 
