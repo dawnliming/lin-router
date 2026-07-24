@@ -61,7 +61,12 @@ def _start_upstream(
     return server
 
 
-def _router(tmp_path: Path, upstream: ThreadingHTTPServer) -> tuple[ArkProxyRouter, RouteContext]:
+def _router(
+    tmp_path: Path,
+    upstream: ThreadingHTTPServer,
+    *,
+    stream_idle_timeout: int = 5,
+) -> tuple[ArkProxyRouter, RouteContext]:
     port = int(upstream.server_address[1])
     config_path = tmp_path / "config.json"
     config_path.write_text(
@@ -75,7 +80,7 @@ def _router(tmp_path: Path, upstream: ThreadingHTTPServer) -> tuple[ArkProxyRout
                         "base_url": f"http://127.0.0.1:{port}/v1",
                         "route_key": "group-key",
                         "auto_model_name": "lin-router-auto",
-                        "stream_idle_timeout": 5,
+                        "stream_idle_timeout": stream_idle_timeout,
                     }
                 ],
                 "models": [
@@ -172,6 +177,52 @@ def test_normal_sse_preserves_complete_frames_and_records_stage_timings(tmp_path
         assert "SSE_SENTINEL_ONE" not in next(item.detail for item in router.logs if item.request_id == request_id)
         assert "SSE_SENTINEL_ONE" not in (tmp_path / "logs.jsonl").read_text(encoding="utf-8")
         assert router.live_requests_payload()["count"] == 0
+    finally:
+        _stop(upstream)
+
+
+def test_urllib_initial_response_wait_is_not_capped_at_eight_seconds(tmp_path: Path) -> None:
+    frame = b'data: {"type":"response.completed"}\n\n'
+
+    class SlowHeadersHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            # 真实 HTTP 连接在 10 秒后才返回响应头，覆盖旧 8 秒误杀场景。
+            time.sleep(10)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(frame)))
+            self.end_headers()
+            self.wfile.write(frame)
+            self.wfile.flush()
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", _free_port()), SlowHeadersHandler)
+    upstream.daemon_threads = True
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    try:
+        router, context = _router(tmp_path, upstream, stream_idle_timeout=120)
+        started_at = time.perf_counter()
+        status, _headers, iterator, request_id = router.stream(
+            "/v1/chat/completions", _payload(), context
+        )
+        elapsed = time.perf_counter() - started_at
+
+        assert status == 200
+        assert list(iterator) == [frame]
+        assert 9 <= elapsed < 20
+        log = next(item for item in router.logs if item.request_id == request_id)
+        detail = _detail_fields(log.detail)
+        assert detail["upstream_transport"] == "urllib"
+        assert log.event == "stream_ok"
+        assert not any(
+            item.request_id == request_id and item.event == "network"
+            for item in router.logs
+        )
     finally:
         _stop(upstream)
 
@@ -556,6 +607,37 @@ def test_httpx_transport_is_used_and_debug_detail_avoids_full_urls_and_headers(t
         )
         assert "PATH_SENTINEL" not in custom_path_detail
         assert "custom_path_sha256:" in custom_path_detail
+    finally:
+        client.close()
+        _stop(upstream)
+
+
+def test_httpx_stream_read_timeout_uses_group_idle_timeout_after_first_frame(tmp_path: Path) -> None:
+    first_frame = b'data: {"type":"response.output_text.delta","delta":"first"}\n\n'
+    completed_frame = b'data: {"type":"response.completed"}\n\n'
+    upstream = _start_upstream(
+        {"Content-Type": "text/event-stream"},
+        [(first_frame, 31), (completed_frame, 0)],
+    )
+    client = UpstreamClient(client_type="httpx", http2=False, keepalive=False)
+    try:
+        router, context = _router(tmp_path, upstream, stream_idle_timeout=120)
+        _use_upstream_client(router, client)
+
+        status, _headers, iterator, request_id = router.stream(
+            "/v1/chat/completions", _payload(), context
+        )
+        assert status == 200
+        assert next(iterator) == first_frame
+        resumed_at = time.perf_counter()
+        assert list(iterator) == [completed_frame]
+        assert 30 <= time.perf_counter() - resumed_at < 45
+
+        log = next(item for item in router.logs if item.request_id == request_id)
+        detail = _detail_fields(log.detail)
+        assert detail["upstream_transport"] == "httpx"
+        assert detail["stream_socket_idle_timeout_seconds"] == "120"
+        assert detail["stream_socket_idle_timeout_applied"] == "true"
     finally:
         client.close()
         _stop(upstream)

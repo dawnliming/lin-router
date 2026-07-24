@@ -87,7 +87,7 @@ def test_model_and_member_use_prd_failure_ladder(tmp_path) -> None:
     member = router.store.find_aggregate_member("am1")
     assert member is not None
 
-    # 第 1、2 次合格失败：仍在观察态，未触发熔断。
+    # smart_breaker 第 1、2 次合格失败仅观察；第 3 次才进入熔断。
     for qualified_failures in range(1, 3):
         router._set_cooldown(0, "upstream unavailable", 0, "server_error_503")
         router._set_aggregate_member_cooldown(member.id, "upstream unavailable", 0, "server_error_503")
@@ -119,11 +119,13 @@ def test_model_and_member_use_prd_failure_ladder(tmp_path) -> None:
     assert router.store.find_aggregate_member("am1").consecutive_failures == member_before
 
 
-def test_expired_cooling_observes_and_expired_breaker_requires_single_probe(tmp_path) -> None:
+def test_expired_cooling_and_breaker_auto_return_to_observing(tmp_path) -> None:
     router, _settings = _router(tmp_path)
     model = router.store.models[0]
     model.health_state = "cooling"
     model.consecutive_failures = 2
+    now = int(time.time())
+    model.qualified_failure_timestamps = [now - 2, now - 1]
     model.cooldown_until = int(time.time()) - 1
     router.store.save()
 
@@ -134,15 +136,16 @@ def test_expired_cooling_observes_and_expired_breaker_requires_single_probe(tmp_
 
     model.health_state = "breaker_open"
     model.consecutive_failures = 3
+    model.qualified_failure_timestamps = [now - 2, now - 1, now]
     model.breaker_level = 1
     model.breaker_until = int(time.time()) - 1
     router.store.save()
 
     first = list(router._iter_upstream_candidates("first", "g1"))
     assert [candidate.label for candidate in first] == ["first"]
-    assert model.health_state == "breaker_open"
-    assert router.candidate_health.runtime_health_state(model) == "half_open_probe"
-    assert list(router._iter_upstream_candidates("first", "g1")) == []
+    assert model.health_state == "observing"
+    assert router.candidate_health.runtime_health_state(model) == "observing"
+    assert [candidate.label for candidate in router._iter_upstream_candidates("first", "g1")] == ["first"]
 
     router._set_success(0)
     assert model.health_state == "normal"
@@ -201,7 +204,7 @@ def _open_breaker(router, *, model_index: int = 0, member_id: str | None = None)
             )
 
 
-def test_expired_breaker_yields_one_real_probe_candidate_and_release_allows_retry(tmp_path) -> None:
+def test_expired_breaker_allows_normal_selection_without_probe_lease(tmp_path) -> None:
     router, _settings = _router(tmp_path)
     model = router.store.models[0]
     _open_breaker(router)
@@ -211,14 +214,12 @@ def test_expired_breaker_yields_one_real_probe_candidate_and_release_allows_retr
     model.breaker_until = int(time.time()) - 1
     first = list(router._iter_upstream_candidates(None, "g1"))
     assert [candidate.label for candidate in first] == ["first", "second"]
-    assert router.candidate_health.runtime_health_state(model) == "half_open_probe"
-    assert [candidate.label for candidate in router._iter_upstream_candidates(None, "g1")] == ["second"]
-
-    router.candidate_health.release_probe(first[0])
     assert [candidate.label for candidate in router._iter_upstream_candidates(None, "g1")] == ["first", "second"]
+    assert router.candidate_health.runtime_health_state(model) == "observing"
+    assert not getattr(first[0], "health_probe_keys", ())
 
 
-def test_member_and_underlying_breaker_projection_never_reports_healthy(tmp_path) -> None:
+def test_member_and_underlying_breaker_projection_keeps_scopes_distinct(tmp_path) -> None:
     router, _settings = _router(tmp_path)
     member = router.store.find_aggregate_member("am1")
     assert member is not None
@@ -242,7 +243,7 @@ def test_member_and_underlying_breaker_projection_never_reports_healthy(tmp_path
     assert model_item["usable"] is False
 
 
-def test_aggregate_probe_releases_member_and_underlying_model_leases(tmp_path) -> None:
+def test_aggregate_breaker_expiry_does_not_create_probe_leases(tmp_path) -> None:
     router, _settings = _router(tmp_path)
     member = router.store.find_aggregate_member("am1")
     aggregate = router.store.find_aggregate("a1")
@@ -257,13 +258,9 @@ def test_aggregate_probe_releases_member_and_underlying_model_leases(tmp_path) -
     candidates = list(router._iter_aggregate_candidates(aggregate))
     assert candidates
     first = candidates[0]
-    assert set(first.health_probe_keys) == {f"member:{member.id}", f"model:{model.id}"}
-    assert router.candidate_health.runtime_health_state(member) == "half_open_probe"
-    assert router.candidate_health.runtime_health_state(model) == "half_open_probe"
-
-    router.candidate_health.release_probe(first)
-    assert router.candidate_health.runtime_health_state(member) == "breaker_open"
-    assert router.candidate_health.runtime_health_state(model) == "breaker_open"
+    assert not getattr(first, "health_probe_keys", ())
+    assert router.candidate_health.runtime_health_state(member) == "observing"
+    assert router.candidate_health.runtime_health_state(model) == "observing"
 
 
 def test_expired_member_breaker_releases_lease_when_candidate_cannot_be_built(tmp_path) -> None:
@@ -291,7 +288,8 @@ def test_expired_member_breaker_releases_lease_when_candidate_cannot_be_built(tm
         else:
             member.model_id = "missing-model"
 
+        router.store.refresh_expired_cooldowns()
         for _ in range(2):
             reason, _message, _group, _model = router._aggregate_member_skip_reason(member)
             assert reason == expected_reason
-            assert router.candidate_health.runtime_health_state(member) == "breaker_open"
+            assert router.candidate_health.runtime_health_state(member) == "observing"

@@ -32,6 +32,7 @@ class CandidateHealthService:
     """Single business owner for candidate queries and health-state mutation."""
 
     _ATTEMPT_WINDOW_SIZE = 5
+    _ATTEMPT_WINDOW_TTL_SECONDS = 5 * 60
     _BREAKER_FAILURE_THRESHOLD = 3
     _BREAKER_COOLDOWN_BY_LEVEL = {1: 60, 2: 180, 3: 300}
     _BREAKER_COOLDOWN_CAP_SECONDS = 600
@@ -132,16 +133,25 @@ class CandidateHealthService:
         return f"{prefix}:{item.id}"
 
     def runtime_health_state(self, item: ModelConfig | AggregateMember) -> str:
-        """返回包含瞬时半开租约的运行态，不把租约写入持久化配置。"""
+        """返回运行态；过期 breaker 清理后不能残留旧的进程内探测租约。"""
         if isinstance(item, ModelConfig) and item.disabled_by_user:
             return "manual_disabled"
-        if self._item_key(item) in self._half_open_leases:
+        key = self._item_key(item)
+        persisted_state = str(getattr(item, "health_state", "normal") or "normal")
+        if key in self._half_open_leases and persisted_state not in {"breaker_open", "half_open_probe"}:
+            # Store.refresh_expired_cooldowns() 已把持久状态恢复为 observing/normal，
+            # 此时同步释放旧 lease，避免下一次请求被错误地当作半开探测。
+            self._half_open_leases.discard(key)
+        if key in self._half_open_leases:
             return "half_open_probe"
-        return str(getattr(item, "health_state", "normal") or "normal")
+        return persisted_state
 
     def _clear_item_health(self, item: ModelConfig | AggregateMember) -> None:
         item.consecutive_failures = 0
+        item.consecutive_network_failures = 0
         item.attempt_window = []
+        item.qualified_failure_timestamps = []
+        item.network_failure_timestamps = []
         item.breaker_level = 0
         item.last_failure_at = 0
         item.breaker_until = 0
@@ -389,7 +399,7 @@ class CandidateHealthService:
             }
 
     def _health_skip_reason(self, item: ModelConfig | AggregateMember) -> str:
-        """返回健康状态跳过原因；到期熔断由第一个真实请求原子领取探测租约。"""
+        """返回当前对象的自动健康跳过原因；到期 breaker 已由 Store 自动恢复。"""
         if not self.is_policy_enabled(item):
             return ""
         now_ts = int(time.time())
@@ -401,10 +411,6 @@ class CandidateHealthService:
             breaker_until = int(getattr(item, "breaker_until", 0) or 0)
             if breaker_until > now_ts:
                 return "breaker_open"
-            with self._health_lock:
-                if key in self._half_open_leases:
-                    return "half_open_probe"
-                self._half_open_leases.add(key)
             return ""
         if state == "cooling" and int(getattr(item, "cooldown_until", 0) or 0) > now_ts:
             return "cooling"
@@ -585,22 +591,8 @@ class CandidateHealthService:
         if model.disabled_by_user:
             self._release_member_probe(member)
             return "underlying_model_disabled", "底层真实模型已停用，请先启用真实模型。", group, model
-        model_health_skip = self._health_skip_reason(model)
-        if model_health_skip == "breaker_open":
-            self._release_member_probe(member)
-            return "underlying_model_breaker_open", "底层真实模型已熔断，暂不参与本次调度。", group, model
-        if model_health_skip == "half_open_probe":
-            self._release_member_probe(member)
-            return "underlying_model_half_open_probe", "底层真实模型正在恢复试探，其他请求继续切换候选。", group, model
-        # 聚合成员和底层模型都可能在到期 breaker 时领取探测租约。只有
-        # 持有模型租约的同一候选可越过 usable=False，防止成员留死 lease。
-        model_has_probe_lease = self._item_key(model) in self._half_open_leases
-        if not model.usable and not model_has_probe_lease:
-            self._release_member_probe(member)
-            return "underlying_model_disabled", "底层真实模型已停用，请先启用真实模型。", group, model
-        if model_health_skip == "cooling":
-            self._release_member_probe(member)
-            return "underlying_model_cooling", "底层真实模型冷却中，本次直接跳过。", group, model
+        # 聚合入口只使用成员自己的自动健康状态。底层模型的 usable、cooling
+        # 和 breaker_open 都是连接组入口的自动状态，不能跨域阻断聚合成员。
         return "", "", group, model
 
     def iter_aggregate_candidates(self, aggregate: AggregateModel, **kwargs: object) -> Iterator[UpstreamCandidate]:
@@ -627,12 +619,62 @@ class CandidateHealthService:
             self._attach_probe_keys(candidate, member)
             yield candidate
 
-    def _record_failure(self, item: ModelConfig | AggregateMember, error: str, reason: str) -> bool:
-        """按策略写入自动状态；固定冷却不累计失败、不进入 breaker。"""
+    @staticmethod
+    def _failure_category(reason: str, category: str | None) -> str:
+        """Normalize legacy reason strings while new callers pass a category."""
+        normalized_category = str(category or "").strip().lower()
+        if normalized_category:
+            return normalized_category
+        normalized_reason = str(reason or "").strip().lower()
+        if normalized_reason in {"network", "connect_timeout"}:
+            return "network"
+        if normalized_reason.startswith("server_error"):
+            return "server_error"
+        return normalized_reason
+
+    @classmethod
+    def _active_failure_timestamps(cls, values: Any, now_ts: int) -> list[int]:
+        """保留滚动 5 分钟内的匿名失败时间，最多保留窗口容量。"""
+        cutoff = now_ts - cls._ATTEMPT_WINDOW_TTL_SECONDS
+        timestamps: list[int] = []
+        for value in values if isinstance(values, list) else []:
+            if isinstance(value, bool):
+                continue
+            try:
+                timestamp = int(value)
+            except (TypeError, ValueError):
+                continue
+            if timestamp >= cutoff:
+                timestamps.append(timestamp)
+        return sorted(timestamps)[-cls._ATTEMPT_WINDOW_SIZE:]
+
+    @staticmethod
+    def _apply_failure_window(
+        item: ModelConfig | AggregateMember,
+        qualified: list[int],
+        network: list[int],
+    ) -> None:
+        """窗口派生字段只从时间戳计算，旧字符串队列不再参与熔断。"""
+        item.qualified_failure_timestamps = list(qualified)
+        item.network_failure_timestamps = list(network)
+        item.attempt_window = []
+        item.consecutive_failures = len(qualified)
+        item.consecutive_network_failures = len(network)
+        item.last_failure_at = qualified[-1] if qualified else 0
+
+    def _record_failure(
+        self,
+        item: ModelConfig | AggregateMember,
+        error: str,
+        reason: str,
+        category: str | None = None,
+    ) -> bool:
+        """按策略写入自动状态；返回本次是否实际进入阻断状态。"""
         if not self.is_policy_enabled(item):
             return False
         with self._health_lock:
             now_ts = int(time.time())
+            failure_category = self._failure_category(reason, category)
             if self.routing_policy(item) == ROUTING_POLICY_FIXED_COOLDOWN:
                 owner = self._store.find_group(item.group_id)
                 if isinstance(item, AggregateMember):
@@ -641,6 +683,10 @@ class CandidateHealthService:
                 minutes_field = "cooldown_minutes" if isinstance(item, AggregateMember) else "auto_model_cooldown_minutes"
                 minutes = max(1, int(getattr(owner, minutes_field, 5) or 5))
                 item.consecutive_failures = 0
+                item.consecutive_network_failures = 0
+                item.attempt_window = []
+                item.qualified_failure_timestamps = []
+                item.network_failure_timestamps = []
                 item.last_failure_at = 0
                 item.last_error = self._safe_error_reference(error)
                 item.last_checked_at = self._now()
@@ -654,11 +700,23 @@ class CandidateHealthService:
                 self._half_open_leases.discard(self._item_key(item))
                 self._store.save()
                 return True
-            attempts = list(getattr(item, "attempt_window", []) or [])
-            attempts.append("qualified_failure")
-            item.attempt_window = attempts[-self._ATTEMPT_WINDOW_SIZE:]
-            item.consecutive_failures = sum(result == "qualified_failure" for result in item.attempt_window)
-            item.last_failure_at = now_ts
+            prior_breaker_until = int(getattr(item, "breaker_until", 0) or 0)
+            prior_breaker_reason = str(getattr(item, "breaker_reason", "") or "")
+            already_open = item.health_state == "breaker_open" and prior_breaker_until > now_ts
+            qualified = self._active_failure_timestamps(
+                getattr(item, "qualified_failure_timestamps", []), now_ts
+            )
+            network = self._active_failure_timestamps(
+                getattr(item, "network_failure_timestamps", []), now_ts
+            )
+            qualified.append(now_ts)
+            if failure_category == "network":
+                network.append(now_ts)
+            # 失败发生后的这一次写入也必须保持窗口上限，不能等下一次
+            # 读取/刷新时才从 6 条回收为 5 条。
+            qualified = qualified[-self._ATTEMPT_WINDOW_SIZE:]
+            network = network[-self._ATTEMPT_WINDOW_SIZE:]
+            self._apply_failure_window(item, qualified, network)
             item.last_error = self._safe_error_reference(error)
             item.last_checked_at = self._now()
             item.cooldown_until = 0
@@ -666,35 +724,58 @@ class CandidateHealthService:
             item.breaker_until = 0
             item.breaker_reason = ""
 
-            if item.consecutive_failures < self._BREAKER_FAILURE_THRESHOLD:
+            opens_standard_breaker = item.consecutive_failures >= self._BREAKER_FAILURE_THRESHOLD
+            if opens_standard_breaker:
+                item.health_state = "breaker_open"
+                if already_open:
+                    # 正常运行时打开的 breaker 不会再次进入候选列表；这里保留
+                    # 原截止时间，避免直接健康 API 的重复写入意外升级等级。
+                    item.breaker_until = prior_breaker_until
+                    item.breaker_reason = prior_breaker_reason
+                else:
+                    item.breaker_level = max(0, int(getattr(item, "breaker_level", 0) or 0)) + 1
+                    cooldown_seconds = self._BREAKER_COOLDOWN_BY_LEVEL.get(
+                        item.breaker_level,
+                        self._BREAKER_COOLDOWN_CAP_SECONDS,
+                    )
+                    item.breaker_until = now_ts + cooldown_seconds
+                    item.breaker_reason = reason[:120]
+                if isinstance(item, ModelConfig):
+                    item.usable = False
+            else:
+                # smart_breaker 的网络、5xx、首帧超时等合格失败只进入观察。
+                # 不能把显式的 fixed_cooldown 产品语义偷渡到智能熔断路径。
                 item.health_state = "observing"
                 if isinstance(item, ModelConfig) and not item.disabled_by_user:
                     item.usable = True
-            else:
-                item.breaker_level = max(0, int(getattr(item, "breaker_level", 0) or 0)) + 1
-                cooldown_seconds = self._BREAKER_COOLDOWN_BY_LEVEL.get(
-                    item.breaker_level,
-                    self._BREAKER_COOLDOWN_CAP_SECONDS,
-                )
-                item.health_state = "breaker_open"
-                item.breaker_until = now_ts + cooldown_seconds
-                item.breaker_reason = reason[:120]
-                if isinstance(item, ModelConfig):
-                    item.usable = False
 
             self._half_open_leases.discard(self._item_key(item))
             self._store.save()
-        return True
+            return item.health_state in {"cooling", "breaker_open"}
 
-    def set_cooldown(self, idx: int, error: str, cooldown_seconds: int, reason: str) -> None:
+    def set_cooldown(
+        self,
+        idx: int,
+        error: str,
+        cooldown_seconds: int,
+        reason: str,
+        category: str | None = None,
+    ) -> bool:
         """兼容旧调用点；智能策略忽略调用方传入的固定冷却秒数。"""
         del cooldown_seconds
-        self._record_failure(self._store.models[idx], error, reason)
+        return self._record_failure(self._store.models[idx], error, reason, category)
 
-    def record_qualified_failure(self, idx: int, error: str, cooldown_seconds: int, reason: str) -> bool:
+    def record_qualified_failure(
+        self,
+        idx: int,
+        error: str,
+        cooldown_seconds: int,
+        reason: str,
+        category: str | None = None,
+    ) -> bool:
         """仅将运行时已分类的合格失败纳入智能熔断统计。"""
         del cooldown_seconds
-        return self._record_failure(self._store.models[idx], error, reason)
+        return self._record_failure(self._store.models[idx], error, reason, category)
 
     def set_success(self, idx: int) -> None:
         model = self._store.models[idx]
@@ -708,18 +789,20 @@ class CandidateHealthService:
             model.last_checked_at = model.last_success_at
             model.cooldown_until = 0
             model.cooldown_reason = ""
-            model.health_state = "normal"
             if self.routing_policy(model) == ROUTING_POLICY_SMART_BREAKER:
-                attempts = list(getattr(model, "attempt_window", []) or [])
-                attempts.append("success")
-                model.attempt_window = attempts[-self._ATTEMPT_WINDOW_SIZE:]
-                model.consecutive_failures = sum(result == "qualified_failure" for result in model.attempt_window)
+                now_ts = int(time.time())
+                self._apply_failure_window(
+                    model,
+                    self._active_failure_timestamps(model.qualified_failure_timestamps, now_ts),
+                    self._active_failure_timestamps(model.network_failure_timestamps, now_ts),
+                )
+                model.health_state = "observing" if model.consecutive_failures else "normal"
             else:
                 model.attempt_window = []
                 model.consecutive_failures = 0
-                model.breaker_level = 0
-            model.last_failure_at = 0
-            if model.attempt_window == ["success"] * self._ATTEMPT_WINDOW_SIZE:
+                model.consecutive_network_failures = 0
+                model.qualified_failure_timestamps = []
+                model.network_failure_timestamps = []
                 model.breaker_level = 0
             model.breaker_until = 0
             model.breaker_reason = ""
@@ -738,12 +821,19 @@ class CandidateHealthService:
         self._half_open_leases.discard(self._item_key(model))
         self._store.save()
 
-    def set_aggregate_member_cooldown(self, member_id: str, error: str, cooldown_seconds: int, reason: str) -> None:
+    def set_aggregate_member_cooldown(
+        self,
+        member_id: str,
+        error: str,
+        cooldown_seconds: int,
+        reason: str,
+        category: str | None = None,
+    ) -> bool:
         member = self._store.find_aggregate_member(member_id)
         if not member:
-            return
+            return False
         del cooldown_seconds
-        self._record_failure(member, error, reason)
+        return self._record_failure(member, error, reason, category)
 
     def mark_aggregate_member_success(self, member_id: str) -> None:
         member = self._store.find_aggregate_member(member_id)
@@ -757,20 +847,88 @@ class CandidateHealthService:
             member.last_checked_at = member.last_success_at
             member.cooldown_until = 0
             member.cooldown_reason = ""
-            member.health_state = "normal"
             if self.routing_policy(member) == ROUTING_POLICY_SMART_BREAKER:
-                attempts = list(getattr(member, "attempt_window", []) or [])
-                attempts.append("success")
-                member.attempt_window = attempts[-self._ATTEMPT_WINDOW_SIZE:]
-                member.consecutive_failures = sum(result == "qualified_failure" for result in member.attempt_window)
+                now_ts = int(time.time())
+                self._apply_failure_window(
+                    member,
+                    self._active_failure_timestamps(member.qualified_failure_timestamps, now_ts),
+                    self._active_failure_timestamps(member.network_failure_timestamps, now_ts),
+                )
+                member.health_state = "observing" if member.consecutive_failures else "normal"
             else:
                 member.attempt_window = []
                 member.consecutive_failures = 0
-                member.breaker_level = 0
-            member.last_failure_at = 0
-            if member.attempt_window == ["success"] * self._ATTEMPT_WINDOW_SIZE:
+                member.consecutive_network_failures = 0
+                member.qualified_failure_timestamps = []
+                member.network_failure_timestamps = []
                 member.breaker_level = 0
             member.breaker_until = 0
             member.breaker_reason = ""
             self._release_member_probe(member)
             self._store.save()
+
+    def recover_aggregate_members(self, aggregate_id: str) -> Dict[str, Any]:
+        """恢复一个聚合内可调度成员的自动状态，不探测上游也不写底层模型。"""
+        with self._health_lock:
+            aggregate = self._store.find_aggregate(aggregate_id)
+            if not aggregate:
+                return {"ok": False, "code": "aggregate_not_found", "message": "聚合模型不存在"}
+
+            counts = {
+                "recovered_count": 0,
+                "already_normal_count": 0,
+                "manual_disabled_count": 0,
+                "risk_isolated_count": 0,
+                "missing_target_count": 0,
+            }
+            recover_ids: list[str] = []
+            for member in self._store.get_aggregate_members(aggregate_id):
+                group = self._store.find_group(member.group_id)
+                model = self._store.find_model(member.model_id)
+                if not member.enabled or (model is not None and model.disabled_by_user):
+                    counts["manual_disabled_count"] += 1
+                    continue
+                if not group or not model:
+                    counts["missing_target_count"] += 1
+                    continue
+                if self.risk_status_for_member(member)["risk_isolated"]:
+                    counts["risk_isolated_count"] += 1
+                    continue
+                has_failure_window = bool(
+                    member.consecutive_failures
+                    or member.consecutive_network_failures
+                    or member.qualified_failure_timestamps
+                    or member.network_failure_timestamps
+                )
+                has_automatic_state = bool(
+                    member.health_state in {"cooling", "breaker_open", "half_open_probe"}
+                    # breaker 自动到期和已恢复成员都会处于 observing；只有仍带
+                    # 窗口证据或错误时才需要再次清理，才能保证操作可重复调用。
+                    or (member.health_state == "observing" and (has_failure_window or member.last_error))
+                    or member.cooldown_until
+                    or member.breaker_until
+                    or has_failure_window
+                    or member.last_error
+                )
+                if has_automatic_state:
+                    recover_ids.append(member.id)
+                else:
+                    counts["already_normal_count"] += 1
+
+            ok, code, revision = self._store.recover_aggregate_member_auto_health(
+                aggregate_id,
+                recover_ids,
+            )
+            if not ok:
+                message = "保存聚合成员恢复状态失败" if code == "config_save_failed" else "聚合成员状态已变更，请刷新后重试"
+                return {"ok": False, "code": code, "message": message, "revision": revision}
+            for member_id in recover_ids:
+                self._half_open_leases.discard(f"member:{member_id}")
+            counts["recovered_count"] = len(recover_ids)
+            return {
+                "ok": True,
+                "aggregate_id": aggregate_id,
+                "revision": revision,
+                "message": f"已恢复 {len(recover_ids)} 个本聚合可调度成员，未发起上游探测。",
+                **counts,
+            }

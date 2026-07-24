@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from app import ArkProxyRouter, ConfigStore
@@ -31,7 +32,9 @@ def test_five_attempt_window_opens_after_three_failures_without_success_reset(tm
         else:
             router.candidate_health.record_qualified_failure(0, reason, 0, reason)
 
-    assert model.attempt_window == ["qualified_failure", "success", "qualified_failure", "success", "qualified_failure"]
+    assert model.attempt_window == []
+    assert len(model.qualified_failure_timestamps) == 3
+    assert len(model.network_failure_timestamps) == 1
     assert model.health_state == "breaker_open"
     assert model.breaker_level == 1
     assert model.breaker_until > 0
@@ -52,12 +55,28 @@ def test_attempt_window_evicts_oldest_and_breaker_cooldown_escalates_to_ten_minu
 
     assert model.breaker_level == 4
     assert model.breaker_until == 0
-    assert len(model.attempt_window) == 5
-    assert model.attempt_window[-1] == "success"
-    assert model.attempt_window.count("qualified_failure") == 2
+    assert len(model.qualified_failure_timestamps) <= 5
+    assert len(model.network_failure_timestamps) <= 5
+    assert model.consecutive_failures == len(model.qualified_failure_timestamps)
 
 
-def test_five_successes_after_half_open_recovery_reset_breaker_level(tmp_path: Path) -> None:
+def test_failure_window_is_capped_during_the_failure_write(tmp_path: Path) -> None:
+    router = _router(tmp_path)
+    model = router.store.find_model("m1")
+    assert model is not None
+    now = int(time.time())
+    model.qualified_failure_timestamps = [now - offset for offset in range(1, 6)]
+    model.network_failure_timestamps = [now - offset for offset in range(1, 6)]
+
+    router.candidate_health.record_qualified_failure(0, "network", 0, "network")
+
+    assert len(model.qualified_failure_timestamps) == 5
+    assert len(model.network_failure_timestamps) == 5
+    assert model.consecutive_failures == 5
+    assert model.consecutive_network_failures == 5
+
+
+def test_successes_after_breaker_recovery_keep_breaker_level_ladder(tmp_path: Path) -> None:
     router = _router(tmp_path)
     model = router.store.find_model("m1")
     assert model is not None
@@ -69,5 +88,5 @@ def test_five_successes_after_half_open_recovery_reset_breaker_level(tmp_path: P
         router.candidate_health.set_success(0)
 
     assert model.health_state == "normal"
-    assert model.breaker_level == 0
-    assert model.attempt_window == ["success"] * 5
+    assert model.breaker_level == 3
+    assert model.attempt_window == []

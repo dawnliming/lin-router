@@ -821,6 +821,34 @@ const ConfigTabActions = {
     }
   },
 
+  async onRecoverAggregateMembers(controller) {
+    const aggregateId = document.getElementById('aggregate-id')?.value;
+    if (!aggregateId) return;
+    const confirmed = await Modal.confirm({
+      title: '恢复本聚合可调度成员',
+      message: '仅清理本聚合成员的自动冷却、熔断和观察窗口，不发起上游探测，不修改底层模型，不恢复人工停用，也不会解除风控隔离。确认继续？',
+      confirmText: '确认恢复成员',
+      cancelText: '取消',
+    });
+    if (!confirmed) return;
+    const button = document.getElementById('aggregate-recover-members');
+    if (button) {
+      button.disabled = true;
+      button.textContent = '恢复中…';
+    }
+    try {
+      const result = await API.recoverAggregateMembers(aggregateId);
+      await controller.reloadAfterAggregateMemberChange();
+      Toast.success(result.message || '已恢复本聚合可调度成员');
+    } catch (err) {
+      if (button) {
+        button.disabled = false;
+        button.textContent = '恢复本聚合可调度成员';
+      }
+      Toast.error('聚合成员恢复失败：' + err.message);
+    }
+  },
+
   async onMoveAggregateMember(controller, memberId, direction) {
     const aggregateId = document.getElementById('aggregate-id')?.value;
     const members = aggregateId ? Store.getAggregateMembers(aggregateId) : [];

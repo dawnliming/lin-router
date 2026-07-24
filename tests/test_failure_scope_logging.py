@@ -335,11 +335,14 @@ def test_aggregate_500_failure_scope_upstream():
         log = failure_logs[0]
         assert log.failure_scope == "upstream", f"日志 failure_scope 应为 upstream，实际 {log.failure_scope}"
         assert "failure_scope=upstream" in log.detail
-        assert log.cooldown_applied is True
+        assert log.cooldown_applied is False
+        member = store.find_aggregate_member(member1_id)
+        assert member is not None
+        assert member.health_state == "observing"
+        assert member.cooldown_until == 0
 
-        chain = [log for log in router.logs if log.aggregate_id == aggregate_id and log.event == "cooldown"]
-        # fallback_chain 不直接存在于日志，但可以通过 add_log 写入的 detail 中没有 fallback_chain 来确认
-        # 这里只确认日志字段本身
+        chain = [log for log in router.logs if log.aggregate_id == aggregate_id and log.event == "fallback"]
+        assert chain
         print("PASS: 聚合模型 500 日志 failure_scope=upstream")
     finally:
         server1.shutdown()

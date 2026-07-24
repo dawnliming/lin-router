@@ -298,7 +298,7 @@ def test_disabled_scope_does_not_read_or_write_stale_health(tmp_path: Path) -> N
 
 
 
-def test_aggregate_policy_does_not_bypass_underlying_group_policy(tmp_path: Path) -> None:
+def test_aggregate_policy_keeps_underlying_automatic_health_isolated(tmp_path: Path) -> None:
     router, _settings, _config_path = _router(tmp_path)
     aggregate_x = router.store.find_aggregate("agg-x")
     model_a = router.store.find_model("m-a")
@@ -310,8 +310,9 @@ def test_aggregate_policy_does_not_bypass_underlying_group_policy(tmp_path: Path
     assert list(router._iter_aggregate_candidates(aggregate_x))
 
     _mark_health(model_a)
-    # 聚合关闭只忽略成员级状态；底层模型 A 仍按连接组策略跳过，组 B 成员继续可用。
+    # 聚合入口只看成员状态；底层模型 A 的自动 breaker 不跨域阻断成员。
     assert [candidate.aggregate_member_id for candidate in router._iter_aggregate_candidates(aggregate_x)] == [
+        "member-x-a",
         "member-x-b"
     ]
 

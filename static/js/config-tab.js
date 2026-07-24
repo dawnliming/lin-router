@@ -310,6 +310,32 @@ const ConfigTab = {
     return Number(until || 0);
   },
 
+  failureWindowInfo(item) {
+    const ttl = Math.max(1, Number(item?.failure_window_ttl_seconds || 300));
+    const now = Math.floor(Date.now() / 1000);
+    const timestamps = Array.isArray(item?.qualified_failure_timestamps)
+      ? item.qualified_failure_timestamps.map(value => Number(value)).filter(value => Number.isFinite(value) && value > 0)
+      : [];
+    const active = timestamps.filter(value => value >= now - ttl).sort((a, b) => a - b).slice(-5);
+    const count = Math.min(5, active.length || (timestamps.length === 0 ? Math.max(0, Number(item?.consecutive_failures || 0)) : 0));
+    const newest = active.length ? active[active.length - 1] : 0;
+    return {
+      count,
+      threshold: 3,
+      remainingSeconds: newest ? Math.max(0, newest + ttl - now) : 0,
+    };
+  },
+
+  formatFailureWindow(item) {
+    const info = this.failureWindowInfo(item);
+    if (!info.count) return '最近5次失败 0/5';
+    const remain = info.remainingSeconds;
+    if (!remain) return `最近5次失败 ${info.count}/5`;
+    const mm = Math.floor(remain / 60).toString().padStart(2, '0');
+    const ss = (remain % 60).toString().padStart(2, '0');
+    return `最近5次失败 ${info.count}/5 · 本观察窗口剩余 ${mm}:${ss}`;
+  },
+
   formatRiskUntil(until) {
     const timestamp = Number(until || 0);
     return timestamp > 0 ? Utils.formatDate(timestamp) : '未知到期时间';
@@ -357,7 +383,8 @@ const ConfigTab = {
       && m?.derived_status !== 'breaker_policy_disabled'
       && ['cooling', 'breaker_open'].includes(modelHealthState)
     );
-    const attemptFailures = (m?.attempt_window || []).filter(result => result === 'qualified_failure').length;
+    const failureInfo = this.failureWindowInfo(m);
+    const attemptFailures = failureInfo.count;
     const breakerLevel = Number(m?.breaker_level || 0);
     const riskIsolated = Boolean(m?.risk_isolated || modelHealthState === 'risk_isolated');
     const riskUntil = this.formatRiskUntil(m?.risk_until);
@@ -437,11 +464,11 @@ const ConfigTab = {
           </div>
           <div class="form-row read-only">
             <label>健康状态</label>
-            <span id="model-health-state">${this.modelHealthLabel(modelHealthState)}</span>
+            <span id="model-health-state">${modelHealthState === 'observing' ? `观察中 · ${this.formatFailureWindow(m)} · breaker_level ${breakerLevel}` : modelHealthState === 'breaker_open' ? `已熔断 · ${this.formatFailureWindow(m)} · breaker_level ${breakerLevel}` : this.modelHealthLabel(modelHealthState)}</span>
           </div>
           <div class="form-row read-only">
-            <label>近 5 次合格失败</label>
-            <span id="model-consecutive-failures">${attemptFailures} / 5</span>
+            <label>最近5次失败</label>
+            <span id="model-consecutive-failures">${attemptFailures}/5</span>
           </div>
           <div class="form-row read-only">
             <label>熔断等级</label>
@@ -720,10 +747,11 @@ const ConfigTab = {
     const now = Date.now();
     if (
       !model
-      || model.usable === false
+      || model.disabled_by_user
       || Boolean(member.last_error)
       || (member.cooldown_until && member.cooldown_until * 1000 > now)
-      || (model.cooldown_until && model.cooldown_until * 1000 > now)
+      || (member.health_state && ['cooling', 'breaker_open'].includes(member.health_state))
+      || member.risk_isolated
     ) {
       return 'unavailable';
     }
@@ -860,6 +888,7 @@ const ConfigTab = {
         <div class="aggregate-members-header">
           <h3>聚合成员</h3>
           <div class="aggregate-members-header-actions">
+            ${members.length ? '<button type="button" id="aggregate-recover-members" class="btn-secondary btn-sm">恢复本聚合可调度成员</button>' : ''}
             <button type="button" id="aggregate-add-members" class="btn-secondary btn-sm">添加成员</button>
           </div>
         </div>
@@ -877,7 +906,7 @@ const ConfigTab = {
               <option value="all" ${state.filters.status === 'all' ? 'selected' : ''}>全部状态</option>
               <option value="normal" ${state.filters.status === 'normal' ? 'selected' : ''}>正常</option>
               <option value="manual_disabled" ${state.filters.status === 'manual_disabled' ? 'selected' : ''}>手动停用</option>
-              <option value="unavailable" ${state.filters.status === 'unavailable' ? 'selected' : ''}>冷却或底层不可用</option>
+              <option value="unavailable" ${state.filters.status === 'unavailable' ? 'selected' : ''}>自动异常或不可用</option>
             </select>
           </label>
           <label class="aggregate-member-filter-query">模型 / 上游模型
@@ -922,9 +951,9 @@ const ConfigTab = {
     const model = Store.getModel(member.model_id);
     const status = this.aggregateMemberStatus(member, model);
     const isCooling = member.cooldown_until && member.cooldown_until * 1000 > Date.now();
-    const underlyingDisabled = !model || model.usable === false || (model.cooldown_until && model.cooldown_until * 1000 > Date.now());
+    const underlyingDisabled = Boolean(model?.disabled_by_user);
     const warningBadge = underlyingDisabled
-      ? '<span class="pill warning" title="底层真实模型不可用或处于冷却">底层不可用</span>'
+      ? '<span class="pill warning" title="底层真实模型已手动停用">底层已停用</span>'
       : '';
     const memberHealthState = member.derived_status || member.health_state || (isCooling ? 'cooling' : 'normal');
     const canRecoverMember = member.enabled !== false
@@ -977,14 +1006,9 @@ const ConfigTab = {
       observing: { class: 'warning', text: '观察中', title: member.derived_reason || '聚合成员正在观察连续失败' },
       cooling: { class: 'cooldown', text: '冷却中', title: member.derived_reason || member.cooldown_reason || '聚合成员正在冷却' },
       breaker_open: { class: 'danger', text: '已熔断', title: member.derived_reason || '聚合成员已触发智能熔断' },
-      half_open_probe: { class: 'warning', text: '恢复探测中', title: member.derived_reason || '聚合成员正在执行唯一恢复探测' },
       risk_isolated: { class: 'danger', text: '风险隔离', title: member.derived_reason || '检测到上游风控拦截，当前凭证已暂停自动请求' },
       breaker_policy_disabled: { class: 'warning', text: '熔断保护已关闭', title: member.derived_reason || '当前范围已关闭智能熔断保护' },
       underlying_model_disabled: { class: 'warning', text: '底层模型已停用', title: member.derived_reason || '请先启用底层真实模型' },
-      underlying_model_observing: { class: 'warning', text: '底层观察中', title: member.derived_reason || '底层真实模型正在观察连续失败' },
-      underlying_model_cooling: { class: 'cooldown', text: '底层模型冷却中', title: member.derived_reason || '底层真实模型正在冷却' },
-      underlying_model_breaker_open: { class: 'danger', text: '底层已熔断', title: `${member.derived_reason || '底层真实模型已触发智能熔断'}；请到真实模型配置中重试恢复。` },
-      underlying_model_half_open_probe: { class: 'warning', text: '底层恢复探测中', title: member.derived_reason || '底层真实模型正在执行唯一恢复探测' },
       config_error: { class: 'danger', text: '配置异常', title: member.derived_reason || '底层连接组或模型缺失' },
       warning: { class: 'warning', text: '最近错误', title: member.derived_reason || member.last_error || '最近发生错误' },
       healthy: { class: 'success', text: '正常', title: member.derived_reason || '该成员可参与聚合调度' },
@@ -997,15 +1021,20 @@ const ConfigTab = {
       const ss = (remainSec % 60).toString().padStart(2, '0');
       return { class: 'cooldown', text: `冷却中（剩 ${mm}:${ss}）`, title: member.cooldown_reason || '该聚合成员因上游健康失败进入短期冷却' };
     }
-    if (model?.cooldown_until && model.cooldown_until * 1000 > Date.now()) {
-      const remainSec = Math.max(0, Math.ceil((model.cooldown_until * 1000 - Date.now()) / 1000));
-      const mm = Math.floor(remainSec / 60).toString().padStart(2, '0');
-      const ss = (remainSec % 60).toString().padStart(2, '0');
-      return { class: 'cooldown', text: `底层冷却中（剩 ${mm}:${ss}）`, title: model.cooldown_reason || '底层真实模型正在冷却' };
+    if (member.derived_status && derivedMap[member.derived_status]) {
+      const status = derivedMap[member.derived_status];
+      if (member.derived_status === 'observing') {
+        return { ...status, text: `观察中 · ${this.formatFailureWindow(member)} · breaker_level ${Number(member.breaker_level || 0)}`, title: `${status.title}；${this.formatFailureWindow(member)}；当前 breaker_level=${Number(member.breaker_level || 0)}` };
+      }
+      if (member.derived_status === 'breaker_open') {
+        return { ...status, text: `已熔断 · ${this.formatFailureWindow(member)} · breaker_level ${Number(member.breaker_level || 0)}`, title: `${status.title}；当前 breaker_level=${Number(member.breaker_level || 0)}` };
+      }
+      return status;
     }
-    if (member.derived_status && derivedMap[member.derived_status]) return derivedMap[member.derived_status];
     if (!model) return { class: 'danger', text: '底层模型不存在', title: '底层真实模型已删除或配置异常' };
-    if (model.usable === false) return { class: 'warning', text: '底层模型已停用', title: '请先启用底层真实模型' };
+    if (model.disabled_by_user) return { class: 'warning', text: '底层模型已停用', title: '请先启用底层真实模型' };
+    if (member.health_state === 'observing') return { class: 'warning', text: `观察中 · ${this.formatFailureWindow(member)} · breaker_level ${Number(member.breaker_level || 0)}`, title: `${this.formatFailureWindow(member)}；当前 breaker_level=${Number(member.breaker_level || 0)}` };
+    if (member.health_state === 'breaker_open') return { class: 'danger', text: `已熔断 · ${this.formatFailureWindow(member)} · breaker_level ${Number(member.breaker_level || 0)}`, title: `当前 breaker_level=${Number(member.breaker_level || 0)}` };
     if (member.last_error) return { class: 'warning', text: '最近错误', title: member.last_error };
     return { class: 'success', text: '正常', title: '该成员可参与聚合调度' };
   },
@@ -1324,6 +1353,7 @@ const ConfigTab = {
       panel.querySelector('#aggregate-delete')?.addEventListener('click', () => this.onAggregateDelete());
       panel.querySelector('#aggregate-routing-policy')?.addEventListener('change', () => this.onRoutingPolicyChange('aggregate'));
       panel.querySelector('#aggregate-copy-route-key')?.addEventListener('click', () => this.onCopyAggregateRouteKey());
+      panel.querySelector('#aggregate-recover-members')?.addEventListener('click', () => this.onRecoverAggregateMembers());
       panel.querySelector('#aggregate-add-members')?.addEventListener('click', () => this.onAddAggregateMembers());
       panel.querySelector('#aggregate-stats-limit')?.addEventListener('change', () => this.refreshAggregateStats());
       this.refreshAggregateStats();
@@ -1531,6 +1561,7 @@ const ConfigTab = {
   confirmAggregateMemberPreview(...args) { return ConfigTabActions.confirmAggregateMemberPreview(this, ...args); },
   reloadAfterAggregateMemberChange(...args) { return ConfigTabActions.reloadAfterAggregateMemberChange(this, ...args); },
   onRecoverAggregateMember(...args) { return ConfigTabActions.onRecoverAggregateMember(this, ...args); },
+  onRecoverAggregateMembers(...args) { return ConfigTabActions.onRecoverAggregateMembers(this, ...args); },
   onMoveAggregateMember(...args) { return ConfigTabActions.onMoveAggregateMember(this, ...args); },
   onCopyAggregateRouteKey(...args) { return ConfigTabActions.onCopyAggregateRouteKey(this, ...args); },
   onToggleAggregateMember(...args) { return ConfigTabActions.onToggleAggregateMember(this, ...args); },

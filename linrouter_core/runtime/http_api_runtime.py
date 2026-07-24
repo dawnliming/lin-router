@@ -1298,6 +1298,18 @@ def handle_post(handler: Any) -> None:
         _invalidate_configuration_affinity(handler, aggregate_ids=(aggregate_id,))
         handler._send_json({"ok": True, "revision": revision, "members": [asdict(member) for member in members]})
         return
+    if parsed.path.startswith("/api/aggregates/") and parsed.path.endswith("/recover-members"):
+        parts = parsed.path.split("/")
+        if len(parts) != 5 or not parts[3]:
+            handler._send_json({"error": {"message": "聚合恢复路径无效", "type": "invalid_request_error", "code": "invalid_path"}}, status=400)
+            return
+        aggregate_id = parts[3]
+        payload = handler.router.recover_aggregate_members(aggregate_id)
+        if payload.get("ok"):
+            _invalidate_configuration_affinity(handler, aggregate_ids=(aggregate_id,))
+        status = 200 if payload.get("ok") else (404 if payload.get("code") == "aggregate_not_found" else 500 if payload.get("code") == "config_save_failed" else 400)
+        handler._send_json(payload, status=status)
+        return
     if parsed.path.startswith("/api/aggregates/") and parsed.path.endswith("/members"):
         parts = parsed.path.split("/")
         if len(parts) < 5:

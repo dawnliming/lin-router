@@ -27,6 +27,10 @@ def test_i3_policy_classification_preserves_all_five_fields() -> None:
     expected = {
         (None, "network", "network"): (True, False, "network", "network", "upstream"),
         (None, "timeout", "stream_timeout"): (True, False, "stream_timeout", "stream_timeout", "upstream"),
+        (None, "timeout", "initial_response_timeout"): (True, False, "initial_response_timeout", "initial_response_timeout", "upstream"),
+        (None, "connect", "upstream_connect_failure"): (True, False, "upstream_connect_failure", "upstream_connect_failure", "upstream"),
+        (None, "stream", "upstream_stream_terminal_failure"): (True, False, "upstream_stream_terminal_failure", "upstream_stream_terminal_failure", "upstream"),
+        (None, "adapter", "router_transport_error"): (False, False, "router_transport_error", "router_transport_error", "request"),
         (503, "failure", "http"): (True, False, "server_error", "server_error_503", "upstream"),
         (429, "rate", "http"): (False, False, "rate_limit", "rate_limit", "upstream"),
         (429, "quota", "http"): (True, False, "quota_exhausted", "quota_exhausted", "upstream"),

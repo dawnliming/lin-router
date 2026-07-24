@@ -30,6 +30,7 @@ class UpstreamResponse:
         transport: str = "urllib",
         content_decoded: bool = False,
         opaque_stream: bool = False,
+        stream_read_timeout_preconfigured: bool = False,
     ) -> None:
         self.status = status
         self.headers = headers
@@ -43,6 +44,7 @@ class UpstreamResponse:
         self._line_reader = line_reader
         self._body_bytes = body_bytes
         self._close_callback = close_callback
+        self._stream_read_timeout_preconfigured = bool(stream_read_timeout_preconfigured)
         self._closed = False
         self._body_consumed = False
 
@@ -75,6 +77,17 @@ class UpstreamResponse:
                 return read_chunk(timeout_seconds)
             return self._line_reader.readline(timeout_seconds)
         return self.readline(timeout_seconds)
+
+    def set_stream_idle_timeout(self, timeout_seconds: int) -> bool:
+        """响应头到达后切换流读取 socket 超时，避免沿用初始响应上限。"""
+        if self._line_reader is None:
+            return self._stream_read_timeout_preconfigured
+        configure = getattr(self._line_reader, "set_stream_idle_timeout", None)
+        if callable(configure) and configure(timeout_seconds):
+            return True
+        # httpx 在构建请求时已把 read 超时写入传输配置，响应头后无需再次
+        # 修改底层对象；该标记使运行时观测仍能反映真实配置已生效。
+        return self._stream_read_timeout_preconfigured
 
     def close(self) -> None:
         if self._closed:
@@ -240,6 +253,10 @@ class _LineReader:
         except queue.Empty as exc:
             raise StreamIdleTimeoutError("stream_idle_timeout") from exc
         if isinstance(item, Exception):
+            # urllib 在 socket 已设置读取超时时直接抛出 socket.timeout。
+            # 对上层而言这与线程等待到期同属流空闲超时，必须统一归因。
+            if isinstance(item, TimeoutError):
+                raise StreamIdleTimeoutError("stream_idle_timeout") from item
             raise item
         return item
 
@@ -267,6 +284,33 @@ class _LineReader:
         if self._closed:
             return b""
         return self._read_with_timeout(self._read_raw_chunk_once, timeout_seconds)
+
+    def set_stream_idle_timeout(self, timeout_seconds: int) -> bool:
+        """仅 urllib 可在 HTTP 响应头后安全更新 socket 的读取超时。"""
+        if self._is_httpx:
+            return False
+        timeout: float | None = None if timeout_seconds <= 0 else float(timeout_seconds)
+        pending = [self._raw]
+        visited: set[int] = set()
+        while pending:
+            current = pending.pop()
+            if current is None or id(current) in visited:
+                continue
+            visited.add(id(current))
+            settimeout = getattr(current, "settimeout", None)
+            if callable(settimeout):
+                try:
+                    settimeout(timeout)
+                    return True
+                except (OSError, ValueError):
+                    pass
+            # urllib 的标准层级是 HTTPResponse.fp.raw._sock；保留其他常见
+            # 包装层可兼容 SSL 与不同 Python 小版本，而不依赖私有类型判断。
+            for attribute in ("_sock", "sock", "socket", "raw", "fp"):
+                child = getattr(current, attribute, None)
+                if child is not None:
+                    pending.append(child)
+        return False
 
     def close(self) -> None:
         if self._closed:
@@ -379,6 +423,7 @@ class UpstreamClient:
         body: bytes,
         stream: bool,
         timeout: float,
+        stream_idle_timeout: float | None = None,
     ) -> UpstreamResponse:
         request = Request(url, data=body, headers=headers, method=method)
         kwargs: Dict[str, Any] = {"timeout": timeout}
@@ -419,17 +464,26 @@ class UpstreamClient:
         body: bytes,
         stream: bool,
         timeout: float,
+        stream_idle_timeout: float | None = None,
     ) -> UpstreamResponse:
         import httpx
 
         if not self._ensure_httpx_client():
-            return self._urllib_request(method, url, headers, body, stream, timeout)
+            return self._urllib_request(method, url, headers, body, stream, timeout, stream_idle_timeout)
         client = self._httpx_client
         assert client is not None
-        # ``Client.send`` does not accept ``timeout`` in supported httpx
-        # versions.  Put the timeout on the built request so the selected
-        # httpx / HTTP2 / keepalive transport actually handles the request.
-        request = client.build_request(method, url, headers=headers, content=body, timeout=timeout)
+        # httpx 的单个标量 timeout 会同时限制连接和后续流读取。将其拆开：
+        # 连接、写入和连接池仍受初始响应保护；流读取由连接组空闲上限控制。
+        read_timeout: float | None = timeout
+        if stream and stream_idle_timeout is not None:
+            read_timeout = None if stream_idle_timeout <= 0 else float(stream_idle_timeout)
+        request_timeout = httpx.Timeout(
+            connect=float(timeout),
+            write=float(timeout),
+            pool=float(timeout),
+            read=read_timeout,
+        )
+        request = client.build_request(method, url, headers=headers, content=body, timeout=request_timeout)
         if stream:
             resp = client.send(request, stream=True)
             resp.raise_for_status()
@@ -448,6 +502,7 @@ class UpstreamClient:
                 transport="httpx",
                 content_decoded=content_decoded,
                 opaque_stream=opaque_stream,
+                stream_read_timeout_preconfigured=stream_idle_timeout is not None,
             )
         resp = client.send(request)
         resp.raise_for_status()
@@ -472,12 +527,21 @@ class UpstreamClient:
         body: bytes,
         stream: bool = False,
         timeout: float = 120.0,
+        stream_idle_timeout: float | None = None,
     ) -> UpstreamResponse:
         if self.client_type == "httpx":
             if not self._ensure_httpx_client():
-                return self._urllib_request(method, url, headers, body, stream, timeout)
+                return self._urllib_request(method, url, headers, body, stream, timeout, stream_idle_timeout)
             try:
-                return self._httpx_request(method, url, headers, body, stream, timeout)
+                return self._httpx_request(
+                    method,
+                    url,
+                    headers,
+                    body,
+                    stream,
+                    timeout,
+                    stream_idle_timeout,
+                )
             except HTTPError:
                 raise
             except Exception as exc:
@@ -497,7 +561,7 @@ class UpstreamClient:
                 except ImportError:
                     pass
                 raise
-        return self._urllib_request(method, url, headers, body, stream, timeout)
+        return self._urllib_request(method, url, headers, body, stream, timeout, stream_idle_timeout)
 
     @staticmethod
     def _try_extract_httpx_status_error(exc: Exception) -> Optional[HTTPError]:

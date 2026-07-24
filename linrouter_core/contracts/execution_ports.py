@@ -42,12 +42,36 @@ class HealthStatePort(Protocol):
     def refresh_expired_cooldowns(self) -> None: ...
     def mark_success(self, candidate: Any) -> None: ...
     def mark_unusable(self, candidate: Any, error: str) -> None: ...
-    def set_cooldown(self, idx: int, error: str, cooldown_seconds: int, reason: str) -> None: ...
-    def set_aggregate_member_cooldown(self, member_id: str, error: str, cooldown_seconds: int, reason: str) -> None: ...
+    def set_cooldown(
+        self,
+        idx: int,
+        error: str,
+        cooldown_seconds: int,
+        reason: str,
+        category: str | None = None,
+    ) -> bool: ...
+    def set_aggregate_member_cooldown(
+        self,
+        member_id: str,
+        error: str,
+        cooldown_seconds: int,
+        reason: str,
+        category: str | None = None,
+    ) -> bool: ...
 
 
 class UpstreamRequestPort(Protocol):
-    def request(self, method: str, url: str, headers: Dict[str, str], body: bytes, *, stream: bool, timeout: int) -> Any: ...
+    def request(
+        self,
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+        body: bytes,
+        *,
+        stream: bool,
+        timeout: int,
+        stream_idle_timeout: int | None = None,
+    ) -> Any: ...
     def close(self) -> None: ...
 
 

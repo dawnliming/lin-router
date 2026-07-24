@@ -237,7 +237,7 @@ def test_breaker_opens_after_three_of_five_explicit_non_stream_http_5xx_then_man
         model = router.store.models[0]
         assert model.health_state == "breaker_open"
         assert model.consecutive_failures == 3
-        assert model.attempt_window == ["qualified_failure"] * 3
+        assert len(model.qualified_failure_timestamps) == 3
         assert model.breaker_level == 1
         assert model.breaker_until > int(time.time())
 
@@ -250,10 +250,10 @@ def test_breaker_opens_after_three_of_five_explicit_non_stream_http_5xx_then_man
         recovered = router.recover_model(model.id)
         assert recovered["ok"] is True
         assert upstream.call_count == 4
-        assert model.health_state == "normal"
-        # 半开成功只恢复可路由状态；窗口历史和等级要等待五次连续成功后再清零。
+        assert model.health_state == "observing"
+        # 成功恢复可路由状态，但 5 分钟内仍有失败时保持观察；等级不会被成功清零。
         assert model.consecutive_failures == 3
-        assert model.attempt_window == ["qualified_failure"] * 3 + ["success"]
+        assert len(model.qualified_failure_timestamps) == 3
         assert model.breaker_level == 1
         assert model.breaker_until == 0
         assert model.usable is True
@@ -272,7 +272,7 @@ def test_breaker_opens_after_three_of_five_explicit_stream_http_5xx_and_skips_fo
         model = router.store.models[0]
         assert model.health_state == "breaker_open"
         assert model.consecutive_failures == 3
-        assert model.attempt_window == ["qualified_failure"] * 3
+        assert len(model.qualified_failure_timestamps) == 3
         assert model.breaker_level == 1
         assert model.breaker_until > int(time.time())
 

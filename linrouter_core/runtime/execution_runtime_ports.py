@@ -18,7 +18,7 @@ class ExecutionFaults:
 
 
 class CandidateStatePort:
-    def __init__(self, *, refresh: Callable[[], None], find_group: Callable[[str], Any], route_group_id: Callable[[Any], str | None], resolve_aggregate: Callable[[str | None, Any], Any], supports_requested_model: Callable[..., bool], iter_candidates: Callable[..., Iterator[Any]], iter_aggregate: Callable[..., Iterator[Any]], aggregate_cooldown_seconds: Callable[[Any], int], set_aggregate_cooldown: Callable[..., None], set_cooldown: Callable[..., None], record_qualified_failure: Callable[..., bool], set_unusable: Callable[..., None], mark_success: Callable[[Any], None], mark_aggregate_success: Callable[[str], None], mark_unusable: Callable[..., None], release_probe: Callable[[Any], None]) -> None:
+    def __init__(self, *, refresh: Callable[[], None], find_group: Callable[[str], Any], route_group_id: Callable[[Any], str | None], resolve_aggregate: Callable[[str | None, Any], Any], supports_requested_model: Callable[..., bool], iter_candidates: Callable[..., Iterator[Any]], iter_aggregate: Callable[..., Iterator[Any]], aggregate_cooldown_seconds: Callable[[Any], int], set_aggregate_cooldown: Callable[..., bool], set_cooldown: Callable[..., bool], record_qualified_failure: Callable[..., bool], set_unusable: Callable[..., None], mark_success: Callable[[Any], None], mark_aggregate_success: Callable[[str], None], mark_unusable: Callable[..., None], release_probe: Callable[[Any], None]) -> None:
         self._refresh = refresh; self._find_group = find_group; self._route_group_id = route_group_id
         self._resolve_aggregate = resolve_aggregate; self._supports_requested_model = supports_requested_model; self._iter_candidates = iter_candidates; self._iter_aggregate = iter_aggregate
         self._aggregate_cooldown_seconds = aggregate_cooldown_seconds; self._set_aggregate_cooldown = set_aggregate_cooldown
@@ -32,8 +32,8 @@ class CandidateStatePort:
     def iter_upstream_candidates(self, *args: Any, **kwargs: Any) -> Iterator[Any]: return self._iter_candidates(*args, **kwargs)
     def iter_aggregate_candidates(self, *args: Any, **kwargs: Any) -> Iterator[Any]: return self._iter_aggregate(*args, **kwargs)
     def aggregate_cooldown_seconds(self, aggregate: Any) -> int: return self._aggregate_cooldown_seconds(aggregate)
-    def set_aggregate_member_cooldown(self, *args: Any) -> None: self._set_aggregate_cooldown(*args)
-    def set_cooldown(self, *args: Any) -> None: self._set_cooldown(*args)
+    def set_aggregate_member_cooldown(self, *args: Any) -> bool: return bool(self._set_aggregate_cooldown(*args))
+    def set_cooldown(self, *args: Any) -> bool: return bool(self._set_cooldown(*args))
     def record_qualified_failure(self, *args: Any) -> bool: return bool(self._record_qualified_failure(*args))
     def set_unusable(self, *args: Any) -> None: self._set_unusable(*args)
     def mark_success(self, candidate: Any) -> None: self._mark_success(candidate)

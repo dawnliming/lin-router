@@ -83,9 +83,10 @@ WafLockState = SerialProtectionState
 
 MAX_SSE_FRAME_BYTES = 4 * 1024 * 1024
 MAX_SSE_FRAME_WAIT_SECONDS = 15
-CONNECT_TIMEOUT_SECONDS = 8
-FIRST_FRAME_TIMEOUT_SECONDS = 25
-LARGE_REQUEST_FIRST_FRAME_TIMEOUT_SECONDS = 45
+# 该阶段涵盖 TCP/TLS、请求写入及等待 HTTP 响应头，并非仅 TCP 建连。
+UPSTREAM_INITIAL_RESPONSE_TIMEOUT_SECONDS = 30
+FIRST_FRAME_TIMEOUT_SECONDS = 45
+LARGE_REQUEST_FIRST_FRAME_TIMEOUT_SECONDS = 90
 LARGE_REQUEST_BODY_BYTES = 128 * 1024
 LARGE_REQUEST_TOOLS_BYTES = 64 * 1024
 LARGE_REQUEST_RESPONSES_INPUT_BYTES = 128 * 1024
@@ -127,6 +128,27 @@ class ManagedStreamIterator:
                 close()
         finally:
             self._finalize()
+
+
+def _configure_stream_idle_timeout(response: Any, timeout_seconds: int) -> bool:
+    """在响应头到达后切换底层流读取超时，兼容既有测试替身。"""
+    configure = getattr(response, "set_stream_idle_timeout", None)
+    if not callable(configure):
+        return False
+    try:
+        return bool(configure(timeout_seconds))
+    except Exception:
+        # 已获得响应头后不能因某个适配器不支持 socket 配置而中断请求；
+        # 运行时的线程空闲保护仍会继续生效。
+        return False
+
+
+def _is_initial_response_timeout(error: Exception, response: Any) -> bool:
+    """只在尚未取得响应头时，把超时归因为初始响应阶段。"""
+    if response is not None:
+        return False
+    reason = getattr(error, "reason", None)
+    return isinstance(error, TimeoutError) or isinstance(reason, TimeoutError)
 
 
 def _read_sse_frame(
@@ -374,8 +396,15 @@ class CandidateRuntime:
     def iter_aggregate_candidates(self, aggregate: Any, **kwargs: Any) -> Iterator[Any]:
         yield from self.candidate_health.iter_aggregate_candidates(aggregate, **kwargs)
 
-    def set_cooldown(self, idx: int, error: str, cooldown_seconds: int, reason: str) -> None:
-        self.candidate_health.set_cooldown(idx, error, cooldown_seconds, reason)
+    def set_cooldown(
+        self,
+        idx: int,
+        error: str,
+        cooldown_seconds: int,
+        reason: str,
+        category: str | None = None,
+    ) -> bool:
+        return self.candidate_health.set_cooldown(idx, error, cooldown_seconds, reason, category)
 
     def set_success(self, idx: int) -> None:
         self.candidate_health.set_success(idx)
@@ -451,6 +480,7 @@ class CandidateRuntime:
         group: Any,
         error: str,
         reason: str,
+        category: str | None = None,
         *,
         auto_fallback: bool,
     ) -> bool:
@@ -462,6 +492,7 @@ class CandidateRuntime:
             error,
             self.policy.auto_cooldown_seconds(group),
             reason,
+            category,
         )
 
     def _record_stream_terminal_failure(
@@ -472,30 +503,34 @@ class CandidateRuntime:
         aggregate_model: Optional[AggregateModel],
         error: str,
         reason: str,
+        category: str | None = None,
         *,
         auto_fallback: bool,
     ) -> bool:
-        """Apply the existing route-specific health policy after a started stream fails."""
+        """记录已获响应头后的终态；返回是否真正进入阻断状态。"""
         self._record_risk_outcome(candidate, "other")
+        health_category = category if category is not None else (
+            "network" if reason in {"network", "connect_timeout"} else None
+        )
         if candidate.aggregate_member_id and aggregate_model:
-            state.set_aggregate_member_cooldown(
+            # 聚合请求只写 AggregateMember 健康状态；底层真实模型仍可由其
+            # 直连请求独立评估，不能因某个聚合链路失败被一并熔断。
+            return state.set_aggregate_member_cooldown(
                 candidate.aggregate_member_id,
                 error,
                 state.aggregate_cooldown_seconds(aggregate_model),
                 reason,
+                health_category,
             )
-            # 聚合请求只写 AggregateMember 健康状态；底层真实模型仍可由其
-            # 直连请求独立评估，不能因某个聚合链路失败被一并熔断。
-            return True
         if auto_fallback:
             if candidate.group.provider_type == PROVIDER_RELAY and candidate.idx is not None:
-                state.set_cooldown(
+                return state.set_cooldown(
                     candidate.idx,
                     error,
                     self.policy.auto_cooldown_seconds(group),
                     reason,
+                    health_category,
                 )
-                return True
             if candidate.idx is not None:
                 state.set_unusable(candidate.idx, error)
                 return True
@@ -506,6 +541,7 @@ class CandidateRuntime:
             group,
             error,
             reason,
+            health_category,
             auto_fallback=auto_fallback,
         )
 
@@ -560,7 +596,7 @@ class CandidateRuntime:
         if aggregate_info:
             aggregate_model, resolved_as = aggregate_info
             auto_fallback = True
-            candidates_iter: Iterator[UpstreamCandidate] = state.iter_aggregate_candidates(aggregate_model, log_skips=True, path=path, requested_label=requested_label, request_id=request_id, resolved_as=resolved_as)
+            candidates_iter: Iterator[UpstreamCandidate] = state.iter_aggregate_candidates(aggregate_model)
         else:
             candidates_iter = state.iter_upstream_candidates(str(requested_model) if requested_model else None, group_id)
 
@@ -620,10 +656,6 @@ class CandidateRuntime:
             routing_suffix = f"routing_policy={policy}; sticky_status={sticky_status}; selection_reason={selection_reason}"
             aggregate_suffix = f"{aggregate_suffix}; {routing_suffix}" if aggregate_suffix else routing_suffix
             if not candidate.auth_key:
-                skip_detail = f"requested={requested_label}; missing upstream api key"
-                if aggregate_suffix:
-                    skip_detail += "; " + aggregate_suffix
-                self.observability.add_log(path, candidate.label, "skip", skip_detail, group=group, request_id=request_id, attempt=attempt, event="skip")
                 state.release_probe(candidate)
                 continue
             payload_for_upstream = payload
@@ -676,8 +708,8 @@ class CandidateRuntime:
                 return 499, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({"error": {"message": "请求已由用户终止", "type": "request_cancelled", "code": "manual_cancelled", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
             try:
                 self.observability.update_live_request(request_id, stage="connecting_upstream", stage_label="连接上游")
-                # 建连和收到 HTTP 响应头最多等待 8 秒，不能让单一候选长期占用自动切换。
-                resp = self.upstream.request("POST", target_url, outbound_headers, body, stream=False, timeout=CONNECT_TIMEOUT_SECONDS)
+                # TCP/TLS、请求写入和 HTTP 响应头统一受初始响应上限保护。
+                resp = self.upstream.request("POST", target_url, outbound_headers, body, stream=False, timeout=UPSTREAM_INITIAL_RESPONSE_TIMEOUT_SECONDS)
                 self.observability.set_live_response(request_id, resp)
                 if self.observability.cancellation_requested(request_id):
                     self.observability.close_live_response(request_id, resp)
@@ -749,18 +781,28 @@ class CandidateRuntime:
                     candidate,
                     "waf_blocked" if classification.category == "waf_blocked" else "other",
                 )
-                cooldown_applied = classification.should_cooldown
+                classified_should_cooldown = classification.should_cooldown
+                # 对聚合成员，最终是否真的阻断由健康服务返回值决定；组级
+                # 非聚合路径继续保留既有分类语义，避免改变显式模型处理。
+                cooldown_applied = classified_should_cooldown
                 is_request_level = classification.is_request_level
-                if cooldown_applied:
-                    saw_cooldown = True
                 if is_request_level:
                     saw_request_level = True
 
                 # 聚合成员失败：仅冷却类错误写 AggregateMember，不能污染底层真实模型健康。
                 if is_aggregate_candidate and aggregate_model and candidate.aggregate_member_id:
-                    if cooldown_applied:
+                    cooldown_applied = False
+                    if classified_should_cooldown:
                         cooldown_seconds = state.aggregate_cooldown_seconds(aggregate_model)
-                        state.set_aggregate_member_cooldown(candidate.aggregate_member_id, raw or str(err), cooldown_seconds, classification.log_reason)
+                        cooldown_applied = state.set_aggregate_member_cooldown(
+                            candidate.aggregate_member_id,
+                            raw or str(err),
+                            cooldown_seconds,
+                            classification.log_reason,
+                            classification.category,
+                        )
+                    if cooldown_applied:
+                        saw_cooldown = True
                     failure_scope = classification.failure_scope
                     fallback_chain.append({
                         "member_id": candidate.aggregate_member_id,
@@ -783,7 +825,7 @@ class CandidateRuntime:
                 if classification.category == "rate_limit" and not is_aggregate_candidate:
                     try:
                         retry_started_at = time.perf_counter()
-                        with self.upstream.request("POST", target_url, outbound_headers, body, stream=False, timeout=CONNECT_TIMEOUT_SECONDS) as resp:
+                        with self.upstream.request("POST", target_url, outbound_headers, body, stream=False, timeout=UPSTREAM_INITIAL_RESPONSE_TIMEOUT_SECONDS) as resp:
                             data = resp.read()
                             retry_duration_ms = int((time.perf_counter() - retry_started_at) * 1000)
                             prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens = self.stream_lifecycle.usage_from_response(data)
@@ -841,7 +883,13 @@ class CandidateRuntime:
                 if auto_fallback:
                     if cooldown_applied:
                         if candidate.group.provider_type == PROVIDER_RELAY and candidate.idx is not None:
-                            state.set_cooldown(candidate.idx, raw or str(err), self.policy.auto_cooldown_seconds(group), classification.log_reason)
+                            state.set_cooldown(
+                                candidate.idx,
+                                raw or str(err),
+                                self.policy.auto_cooldown_seconds(group),
+                                classification.log_reason,
+                                classification.category,
+                            )
                         elif candidate.idx is not None:
                             state.set_unusable(candidate.idx, raw or str(err))
                         saw_cooldown = True
@@ -875,6 +923,7 @@ class CandidateRuntime:
                         group,
                         raw or str(err),
                         classification.log_reason,
+                        classification.category,
                         auto_fallback=auto_fallback,
                     )
                 if classification.category == "quota_exhausted":
@@ -900,14 +949,25 @@ class CandidateRuntime:
                     return 499, {"Content-Type": "application/json; charset=utf-8"}, json.dumps({"error": {"message": "请求已由用户终止", "type": "request_cancelled", "code": "manual_cancelled", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 last_error = err
-                classification = self.policy.classify_candidate_error(None, str(err), "network")
+                classification = self.policy.classify_candidate_error(
+                    None,
+                    str(err),
+                    "initial_response_timeout" if _is_initial_response_timeout(err, None) else "upstream_connect_failure",
+                )
                 self._record_risk_outcome(candidate, "other")
-                saw_cooldown = True
+                saw_cooldown = False
 
                 # 聚合成员网络失败只更新成员健康状态，保留底层真实模型的独立直连状态。
                 if is_aggregate_candidate and aggregate_model and candidate.aggregate_member_id:
                     cooldown_seconds = state.aggregate_cooldown_seconds(aggregate_model)
-                    state.set_aggregate_member_cooldown(candidate.aggregate_member_id, str(err), cooldown_seconds, classification.log_reason)
+                    health_blocked = state.set_aggregate_member_cooldown(
+                        candidate.aggregate_member_id,
+                        str(err),
+                        cooldown_seconds,
+                        classification.log_reason,
+                        classification.category,
+                    )
+                    saw_cooldown = saw_cooldown or health_blocked
                     failure_scope = classification.failure_scope
                     fallback_chain.append({
                         "member_id": candidate.aggregate_member_id,
@@ -916,20 +976,29 @@ class CandidateRuntime:
                         "manual_price": candidate.manual_price,
                         "status": "network",
                         "reason": self.preparation.short_error(str(err)),
-                        "cooldown_applied": True,
+                        "cooldown_applied": health_blocked,
                         "failure_scope": failure_scope,
                         "category": classification.category,
                         "waf_compatible": group.waf_compatible,
                     })
                     fallback_index += 1
-                    detail = f"cooldown_applied=true; failure_scope={failure_scope}; {classification.log_reason}; try next; error={self.preparation.short_error(str(err))}"
-                    self.observability.add_log(path, candidate.label, "network", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="network_error", aggregate_suffix=aggregate_suffix), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network", cooldown_applied=True, failure_scope=failure_scope)
+                    detail = f"cooldown_applied={str(health_blocked).lower()}; failure_scope={failure_scope}; {classification.log_reason}; try next; error={self.preparation.short_error(str(err))}"
+                    self.observability.add_log(path, candidate.label, "network", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="network_error", aggregate_suffix=aggregate_suffix), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network", cooldown_applied=health_blocked, failure_scope=failure_scope)
                     continue
                 if auto_fallback:
+                    health_blocked = False
                     if candidate.group.provider_type == PROVIDER_RELAY and candidate.idx is not None:
-                        state.set_cooldown(candidate.idx, str(err), self.policy.auto_cooldown_seconds(group), classification.log_reason)
+                        health_blocked = state.set_cooldown(
+                            candidate.idx,
+                            str(err),
+                            self.policy.auto_cooldown_seconds(group),
+                            classification.log_reason,
+                            classification.category,
+                        )
                     elif candidate.idx is not None:
                         state.set_unusable(candidate.idx, str(err))
+                        health_blocked = True
+                    saw_cooldown = saw_cooldown or health_blocked
                     failure_scope = classification.failure_scope
                     if not is_aggregate_candidate:
                         fallback_chain.append({
@@ -939,14 +1008,14 @@ class CandidateRuntime:
                             "manual_price": candidate.manual_price,
                             "status": "network",
                             "reason": self.preparation.short_error(str(err)),
-                            "cooldown_applied": True,
+                            "cooldown_applied": health_blocked,
                             "failure_scope": failure_scope,
                             "category": classification.category,
                             "waf_compatible": group.waf_compatible,
                         })
                         fallback_index += 1
-                    detail = f"cooldown_applied=true; failure_scope={failure_scope}; {classification.log_reason}; try next; error={self.preparation.short_error(str(err))}"
-                    self.observability.add_log(path, candidate.label, "network", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="network_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network", cooldown_applied=True, failure_scope=failure_scope)
+                    detail = f"cooldown_applied={str(health_blocked).lower()}; failure_scope={failure_scope}; {classification.log_reason}; try next; error={self.preparation.short_error(str(err))}"
+                    self.observability.add_log(path, candidate.label, "network", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason="network_error"), duration_ms, group=group, request_id=request_id, attempt=attempt, event="network", cooldown_applied=health_blocked, failure_scope=failure_scope)
                     continue
                 failure_scope = classification.failure_scope
                 explicit_failure_recorded = self._record_explicit_qualified_failure(
@@ -955,6 +1024,7 @@ class CandidateRuntime:
                     group,
                     str(err),
                     classification.log_reason,
+                    classification.category,
                     auto_fallback=auto_fallback,
                 )
                 detail = f"cooldown_applied={str(explicit_failure_recorded).lower()}; failure_scope={failure_scope}; {classification.log_reason}; error={self.preparation.short_error(str(err))}"
@@ -1035,9 +1105,10 @@ class CandidateRuntime:
         saw_stream_timeout = False
         saw_cooldown = False
         saw_request_level = False
-        # 预算从第一个聚合候选实际开始上游请求前起算，且只覆盖首帧前阶段。
-        aggregate_first_frame_budget_started_at: float | None = None
-        aggregate_first_frame_budget_seconds = 0
+        # 聚合预算仅累计每个成员在拿到响应头后等待首个完整 SSE 帧的时间。
+        # 连接、TLS、请求写入、响应头与串行保护均不属于首帧等待，不能扣减额度。
+        aggregate_first_frame_wait_elapsed_seconds = 0.0
+        aggregate_first_frame_budget_seconds = 0.0
         last_aggregate_candidate: UpstreamCandidate | None = None
 
         # 聚合模型已在创建 live request 前完成契约解析。
@@ -1048,7 +1119,7 @@ class CandidateRuntime:
         if aggregate_info:
             aggregate_model, resolved_as = aggregate_info
             auto_fallback = True
-            candidates_iter = state.iter_aggregate_candidates(aggregate_model, log_skips=True, path=path, requested_label=requested_label, request_id=request_id, resolved_as=resolved_as)
+            candidates_iter = state.iter_aggregate_candidates(aggregate_model)
         else:
             candidates_iter = state.iter_upstream_candidates(str(requested_model) if requested_model else None, group_id)
 
@@ -1130,10 +1201,6 @@ class CandidateRuntime:
             routing_suffix = f"routing_policy={policy}; sticky_status={sticky_status}; selection_reason={selection_reason}"
             aggregate_suffix = f"{aggregate_suffix}; {routing_suffix}" if aggregate_suffix else routing_suffix
             if not candidate.auth_key:
-                skip_detail = f"requested={requested_label}; missing upstream api key"
-                if aggregate_suffix:
-                    skip_detail += "; " + aggregate_suffix
-                self.observability.add_log(path, candidate.label, "skip", skip_detail, group=group, request_id=request_id, attempt=attempt, event="skip")
                 state.release_probe(candidate)
                 continue
             payload_for_upstream = payload
@@ -1145,70 +1212,10 @@ class CandidateRuntime:
             first_frame_timeout = float(
                 LARGE_REQUEST_FIRST_FRAME_TIMEOUT_SECONDS if is_large_request else FIRST_FRAME_TIMEOUT_SECONDS
             )
-            # 聚合总预算只覆盖下游尚未提交时的首帧阶段；首个成员开始尝试后
-            # 所有 fallback 共享同一剩余时间，不能重新获得完整 60/90 秒。
-            if aggregate_model:
-                if aggregate_first_frame_budget_started_at is None:
-                    aggregate_first_frame_budget_started_at = time.perf_counter()
-                    aggregate_first_frame_budget_seconds = (
-                        LARGE_REQUEST_AGGREGATE_FIRST_FRAME_TIMEOUT_SECONDS
-                        if is_large_request
-                        else AGGREGATE_FIRST_FRAME_TIMEOUT_SECONDS
-                    )
-                remaining_budget = (
-                    aggregate_first_frame_budget_seconds
-                    - (time.perf_counter() - aggregate_first_frame_budget_started_at)
-                )
-                stream_metrics["aggregate_first_frame_budget_remaining_ms"] = max(
-                    0,
-                    int(remaining_budget * 1000),
-                )
-                first_frame_timeout = min(first_frame_timeout, max(0.0, remaining_budget))
             # 实际上游请求保留兼容字段；诊断和捕获使用独立安全副本。
             observability_payload = self._safe_observability_payload(payload_for_upstream)
             observability_body = self._safe_observability_body(payload_for_upstream)
             outbound_headers = self.preparation.headers_for(group, candidate.auth_key, incoming_headers, stream=True)
-            if aggregate_model and first_frame_timeout <= 0:
-                # 预算已经在前序成员的首帧等待中耗尽；禁止启动新的上游请求。
-                state.release_probe(candidate)
-                budget_detail = (
-                    "failure_category=aggregate_first_frame_timeout; "
-                    "aggregate_first_frame_budget_remaining_ms=0; "
-                    "fallback_next=false; final_result=aggregate_first_frame_timeout; "
-                    + _stream_metrics_text(stream_metrics)
-                )
-                self.observability.add_log(
-                    path,
-                    candidate.label,
-                    "timeout",
-                    self.preparation.debug_detail(
-                        candidate,
-                        requested_label,
-                        target_url,
-                        body_mode,
-                        body,
-                        payload_for_upstream,
-                        outbound_headers,
-                        budget_detail,
-                        aggregate_suffix=aggregate_suffix,
-                    ),
-                    group=group,
-                    request_id=request_id,
-                    attempt=attempt,
-                    event="aggregate_first_frame_timeout",
-                    cooldown_applied=False,
-                    failure_scope="upstream",
-                )
-                self.observability.finish_live_request(request_id, "error")
-                raise self.faults.all_models_failed(
-                    "聚合模型首个完整 SSE 帧等待超时，请稍后重试",
-                    attempted=max(0, attempt - 1),
-                    stream_timeout=True,
-                    error_code="aggregate_first_frame_timeout",
-                    fallback_chain=fallback_chain,
-                    aggregate_name=aggregate_model.name,
-                    request_id=request_id,
-                )
             upstream_lock = self.concurrency.candidate_lock(candidate, incoming_headers)
             resp: Optional[Any] = None
             started_at = time.perf_counter()
@@ -1251,7 +1258,15 @@ class CandidateRuntime:
                 self.observability.update_live_request(request_id, stage="connecting_upstream", stage_label="连接上游")
                 upstream_request_started_ms = _elapsed_ms(stream_started_at)
                 stream_metrics["upstream_request_started_ms"] = upstream_request_started_ms
-                resp = self.upstream.request("POST", target_url, outbound_headers, body, stream=True, timeout=CONNECT_TIMEOUT_SECONDS)
+                resp = self.upstream.request(
+                    "POST",
+                    target_url,
+                    outbound_headers,
+                    body,
+                    stream=True,
+                    timeout=UPSTREAM_INITIAL_RESPONSE_TIMEOUT_SECONDS,
+                    stream_idle_timeout=idle_timeout,
+                )
                 upstream_headers_ms = _elapsed_ms(stream_started_at)
                 stream_metrics["upstream_headers_ms"] = upstream_headers_ms
                 self.observability.set_live_response(request_id, resp)
@@ -1261,6 +1276,36 @@ class CandidateRuntime:
                     self._finalize_cancelled(request_id, path, requested_label, group=group, candidate=candidate, attempt=attempt, lock_released=lock_released)
                     error_body = json.dumps({"error": {"message": "请求已由用户终止", "type": "request_cancelled", "code": "manual_cancelled", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
                     return 499, {"Content-Type": "application/json; charset=utf-8"}, [error_body], request_id
+                # 聚合成员先独立完成连接和响应头接收；预算只累计下方
+                # _read_sse_frame 的实际等待时长，不能用连续墙钟时间扣减。
+                if aggregate_model:
+                    if not aggregate_first_frame_budget_seconds:
+                        aggregate_first_frame_budget_seconds = (
+                            LARGE_REQUEST_AGGREGATE_FIRST_FRAME_TIMEOUT_SECONDS
+                            if is_large_request
+                            else AGGREGATE_FIRST_FRAME_TIMEOUT_SECONDS
+                        )
+                    remaining_budget = (
+                        aggregate_first_frame_budget_seconds
+                        - aggregate_first_frame_wait_elapsed_seconds
+                    )
+                    stream_metrics["aggregate_first_frame_budget_remaining_ms"] = max(
+                        0,
+                        int(remaining_budget * 1000),
+                    )
+                    first_frame_timeout = min(first_frame_timeout, max(0.0, remaining_budget))
+                    if first_frame_timeout <= 0:
+                        raise self.faults.stream_idle_timeout(
+                            "aggregate_first_frame_budget_exhausted"
+                        )
+                # 首帧阶段的 socket 上限不能低于首帧上限，否则 urllib 会先于
+                # 首帧计时器抛出底层超时；首个完整帧后再回落到组级空闲上限。
+                first_read_socket_timeout = max(idle_timeout, int(first_frame_timeout))
+                stream_metrics["stream_socket_first_read_timeout_seconds"] = first_read_socket_timeout
+                stream_metrics["stream_socket_first_read_timeout_applied"] = str(
+                    _configure_stream_idle_timeout(resp, first_read_socket_timeout)
+                ).lower()
+                stream_metrics["stream_socket_idle_timeout_seconds"] = idle_timeout
                 upstream_content_type = _safe_media_type(_header_value(resp.headers, "content-type"))
                 upstream_content_encoding = _safe_header_token(_header_value(resp.headers, "content-encoding"))
                 upstream_transfer_encoding = _safe_header_token(_header_value(resp.headers, "transfer-encoding"))
@@ -1299,6 +1344,14 @@ class CandidateRuntime:
                         "opaque_chunk_count": 1,
                         "opaque_bytes_received": len(first_opaque_chunk),
                     })
+                    if first_read_socket_timeout != idle_timeout:
+                        stream_metrics["stream_socket_idle_timeout_applied"] = str(
+                            _configure_stream_idle_timeout(resp, idle_timeout)
+                        ).lower()
+                    else:
+                        stream_metrics["stream_socket_idle_timeout_applied"] = stream_metrics[
+                            "stream_socket_first_read_timeout_applied"
+                        ]
                     self.observability.add_log(
                         path,
                         candidate.label,
@@ -1355,13 +1408,31 @@ class CandidateRuntime:
                             lifecycle_result = "stream_idle_timeout"
                             lifecycle_scope = "upstream"
                             usage_source = "stream_incomplete"
-                            failure_recorded = self._record_stream_terminal_failure(state, candidate, group, aggregate_model, lifecycle_result, lifecycle_result, auto_fallback=auto_fallback)
+                            failure_recorded = self._record_stream_terminal_failure(
+                                state,
+                                candidate,
+                                group,
+                                aggregate_model,
+                                lifecycle_result,
+                                "upstream_stream_terminal_failure",
+                                "upstream_stream_terminal_failure",
+                                auto_fallback=auto_fallback,
+                            )
                         elif opaque_state["transport_error"]:
                             lifecycle_status = "network"
                             lifecycle_result = "stream_incomplete"
                             lifecycle_scope = "upstream"
                             usage_source = "stream_incomplete"
-                            failure_recorded = self._record_stream_terminal_failure(state, candidate, group, aggregate_model, str(opaque_state["transport_error"]), "network", auto_fallback=auto_fallback)
+                            failure_recorded = self._record_stream_terminal_failure(
+                                state,
+                                candidate,
+                                group,
+                                aggregate_model,
+                                str(opaque_state["transport_error"]),
+                                "upstream_stream_terminal_failure",
+                                "upstream_stream_terminal_failure",
+                                auto_fallback=auto_fallback,
+                            )
                         else:
                             lifecycle_status = "200"
                             lifecycle_result = "stream_done"
@@ -1433,11 +1504,30 @@ class CandidateRuntime:
                     return 200, downstream_headers, ManagedStreamIterator(opaque_iterator(), finalize_opaque_stream), request_id
 
                 self.observability.update_live_request(request_id, stage="waiting_first_byte", stage_label="等待首完整 SSE 帧")
-                first_chunk = _read_sse_frame(
-                    lambda timeout: self.stream_lifecycle.readline_with_idle_timeout(resp, timeout),
-                    first_frame_timeout,
-                    mark_first_raw_line,
-                )
+                first_frame_wait_started_at = time.perf_counter() if aggregate_model else None
+                try:
+                    first_chunk = _read_sse_frame(
+                        lambda timeout: self.stream_lifecycle.readline_with_idle_timeout(resp, timeout),
+                        first_frame_timeout,
+                        mark_first_raw_line,
+                    )
+                finally:
+                    if first_frame_wait_started_at is not None:
+                        # 无论首帧成功、超时、协议错误还是读取中断，都只结算这次
+                        # 已建立连接后的实际读取等待，避免后续成员的连接阶段侵蚀预算。
+                        aggregate_first_frame_wait_elapsed_seconds += max(
+                            0.0,
+                            time.perf_counter() - first_frame_wait_started_at,
+                        )
+                if first_chunk:
+                    if first_read_socket_timeout != idle_timeout:
+                        stream_metrics["stream_socket_idle_timeout_applied"] = str(
+                            _configure_stream_idle_timeout(resp, idle_timeout)
+                        ).lower()
+                    else:
+                        stream_metrics["stream_socket_idle_timeout_applied"] = stream_metrics[
+                            "stream_socket_first_read_timeout_applied"
+                        ]
                 if self.observability.cancellation_requested(request_id):
                     self.observability.close_live_response(request_id, resp)
                     lock_released = self.concurrency.release(upstream_lock)
@@ -1553,7 +1643,8 @@ class CandidateRuntime:
                             group,
                             aggregate_model,
                             "stream_idle_timeout",
-                            "stream_idle_timeout",
+                            "upstream_stream_terminal_failure",
+                            "upstream_stream_terminal_failure",
                             auto_fallback=auto_fallback,
                         )
                     elif stream_state["transport_error"]:
@@ -1567,7 +1658,8 @@ class CandidateRuntime:
                             group,
                             aggregate_model,
                             str(stream_state["transport_error"]),
-                            "network",
+                            "upstream_stream_terminal_failure",
+                            "upstream_stream_terminal_failure",
                             auto_fallback=auto_fallback,
                         )
                     elif stream_state["lifecycle"] == "stream_done":
@@ -1714,15 +1806,16 @@ class CandidateRuntime:
                     error_body = json.dumps({"error": {"message": "请求已由用户终止", "type": "request_cancelled", "code": "manual_cancelled", "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
                     return 499, {"Content-Type": "application/json; charset=utf-8"}, [error_body], request_id
                 saw_stream_timeout = True
-                saw_cooldown = True
+                saw_cooldown = False
                 last_error = err
                 timeout_reason = "first_frame_timeout"
                 self._record_risk_outcome(candidate, "other")
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 aggregate_budget_expired = False
-                if aggregate_model and aggregate_first_frame_budget_started_at is not None:
-                    remaining_budget = aggregate_first_frame_budget_seconds - (
-                        time.perf_counter() - aggregate_first_frame_budget_started_at
+                if aggregate_model and aggregate_first_frame_budget_seconds:
+                    remaining_budget = (
+                        aggregate_first_frame_budget_seconds
+                        - aggregate_first_frame_wait_elapsed_seconds
                     )
                     stream_metrics["aggregate_first_frame_budget_remaining_ms"] = max(
                         0,
@@ -1736,12 +1829,14 @@ class CandidateRuntime:
                 # 此处尚未向下游提交完整 SSE 帧，可记录成员失败并尝试下一个成员。
                 if is_aggregate_candidate and aggregate_model and candidate.aggregate_member_id:
                     cooldown_seconds = state.aggregate_cooldown_seconds(aggregate_model)
-                    state.set_aggregate_member_cooldown(
+                    health_blocked = state.set_aggregate_member_cooldown(
                         candidate.aggregate_member_id,
                         timeout_reason,
                         cooldown_seconds,
                         timeout_reason,
+                        "stream_timeout",
                     )
+                    saw_cooldown = saw_cooldown or health_blocked
                     fallback_chain.append({
                         "member_id": candidate.aggregate_member_id,
                         "group": group.name,
@@ -1749,14 +1844,14 @@ class CandidateRuntime:
                         "manual_price": candidate.manual_price,
                         "status": timeout_reason,
                         "reason": timeout_reason,
-                        "cooldown_applied": True,
+                        "cooldown_applied": health_blocked,
                         "failure_scope": "upstream",
                         "category": timeout_reason,
                         "waf_compatible": group.waf_compatible,
                     })
                     fallback_index += 1
                     detail = (
-                        f"failure_category={timeout_reason}; cooldown_applied=true; "
+                        f"failure_category={timeout_reason}; cooldown_applied={str(health_blocked).lower()}; "
                         f"failure_scope=upstream; first_frame_timeout_seconds={first_frame_timeout}; "
                         "chunks_received=0; bytes_received=0; "
                         f"cooldown_minutes={cooldown_seconds // 60}; "
@@ -1787,7 +1882,7 @@ class CandidateRuntime:
                         attempt=attempt,
                         event="stream_timeout",
                         usage_source="stream_incomplete",
-                        cooldown_applied=True,
+                        cooldown_applied=health_blocked,
                         failure_scope="upstream",
                     )
                     if aggregate_budget_expired:
@@ -1802,7 +1897,17 @@ class CandidateRuntime:
                             request_id=request_id,
                         )
                     continue
-                cooldown_seconds = self.stream_lifecycle.mark_stream_timeout(candidate, timeout_reason)
+                cooldown_seconds = self.policy.auto_cooldown_seconds(group)
+                health_blocked = False
+                if candidate.idx is not None:
+                    health_blocked = state.set_cooldown(
+                        candidate.idx,
+                        timeout_reason,
+                        cooldown_seconds,
+                        timeout_reason,
+                        "stream_timeout",
+                    )
+                saw_cooldown = saw_cooldown or health_blocked
                 detail = self.preparation.debug_detail(
                     candidate,
                     requested_label,
@@ -1811,7 +1916,7 @@ class CandidateRuntime:
                     body,
                     payload,
                     outbound_headers,
-                    f"failure_category={timeout_reason}; cooldown_applied=true; "
+                    f"failure_category={timeout_reason}; cooldown_applied={str(health_blocked).lower()}; "
                     f"first_frame_timeout_seconds={first_frame_timeout}; chunks_received=0; "
                     f"bytes_received=0; cooldown_minutes={cooldown_seconds // 60}; "
                     f"fallback_next={str(auto_fallback).lower()}; final_result={timeout_reason}; "
@@ -1819,9 +1924,9 @@ class CandidateRuntime:
                     lock_wait_ms=lock_wait_ms,
                     lock_release_reason=timeout_reason,
                 )
-                self.observability.add_log(path, candidate.label, "timeout", detail, duration_ms, group=group, request_id=request_id, attempt=attempt, event="stream_timeout", usage_source="stream_incomplete", cooldown_applied=True, failure_scope="upstream")
+                self.observability.add_log(path, candidate.label, "timeout", detail, duration_ms, group=group, request_id=request_id, attempt=attempt, event="stream_timeout", usage_source="stream_incomplete", cooldown_applied=health_blocked, failure_scope="upstream")
                 if auto_fallback:
-                    self.observability.add_log(path, candidate.label, "fallback", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, f"failure_category={timeout_reason}; fallback_next=true", lock_wait_ms=lock_wait_ms), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=True, failure_scope="upstream")
+                    self.observability.add_log(path, candidate.label, "fallback", self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, f"failure_category={timeout_reason}; cooldown_applied={str(health_blocked).lower()}; fallback_next=true", lock_wait_ms=lock_wait_ms), duration_ms, group=group, request_id=request_id, attempt=attempt, event="fallback", cooldown_applied=health_blocked, failure_scope="upstream")
                     continue
                 error_body = json.dumps({"error": {"message": "等待首个完整 SSE 事件超时，请稍后重试", "type": "timeout", "code": timeout_reason, "request_id": request_id}}, ensure_ascii=False).encode("utf-8")
                 self.observability.finish_live_request(request_id, "error")
@@ -1841,18 +1946,28 @@ class CandidateRuntime:
                     candidate,
                     "waf_blocked" if classification.category == "waf_blocked" else "other",
                 )
-                cooldown_applied = classification.should_cooldown
+                classified_should_cooldown = classification.should_cooldown
+                # 聚合成员最终是否阻断必须以健康服务实际返回值为准，不能
+                # 把“分类应计入窗口”误写成“本次已冷却”。
+                cooldown_applied = classified_should_cooldown
                 is_request_level = classification.is_request_level
-                if cooldown_applied:
-                    saw_cooldown = True
                 if is_request_level:
                     saw_request_level = True
 
                 # 聚合成员 HTTP 失败只写成员健康状态，不能把聚合失败扩散到真实模型。
                 if is_aggregate_candidate and aggregate_model and candidate.aggregate_member_id:
-                    if cooldown_applied:
+                    cooldown_applied = False
+                    if classified_should_cooldown:
                         cooldown_seconds = state.aggregate_cooldown_seconds(aggregate_model)
-                        state.set_aggregate_member_cooldown(candidate.aggregate_member_id, raw or str(err), cooldown_seconds, classification.log_reason)
+                        cooldown_applied = state.set_aggregate_member_cooldown(
+                            candidate.aggregate_member_id,
+                            raw or str(err),
+                            cooldown_seconds,
+                            classification.log_reason,
+                            classification.category,
+                        )
+                    if cooldown_applied:
+                        saw_cooldown = True
                     failure_scope = classification.failure_scope
                     fallback_chain.append({
                         "member_id": candidate.aggregate_member_id,
@@ -1875,7 +1990,13 @@ class CandidateRuntime:
                 if auto_fallback:
                     if cooldown_applied:
                         if candidate.group.provider_type == PROVIDER_RELAY and candidate.idx is not None:
-                            state.set_cooldown(candidate.idx, raw or str(err), self.policy.auto_cooldown_seconds(group), classification.log_reason)
+                            state.set_cooldown(
+                                candidate.idx,
+                                raw or str(err),
+                                self.policy.auto_cooldown_seconds(group),
+                                classification.log_reason,
+                                classification.category,
+                            )
                         elif candidate.idx is not None:
                             state.set_unusable(candidate.idx, raw or str(err))
                         saw_cooldown = True
@@ -1909,6 +2030,7 @@ class CandidateRuntime:
                         group,
                         raw or str(err),
                         classification.log_reason,
+                        classification.category,
                         auto_fallback=auto_fallback,
                     )
                 if classification.category == "quota_exhausted":
@@ -1949,10 +2071,27 @@ class CandidateRuntime:
                 state.release_probe(candidate)
                 duration_ms = int((time.perf_counter() - started_at) * 1000)
                 last_error = err
-                classification = self.policy.classify_candidate_error(None, str(err), "network")
+                connect_phase = resp is None
+                initial_response_timeout = _is_initial_response_timeout(err, resp)
                 is_stream_protocol_error = isinstance(err, StreamFrameProtocolError)
-                failure_reason = "stream_protocol_error" if is_stream_protocol_error else classification.log_reason
-                lock_release_reason = "stream_protocol_error" if is_stream_protocol_error else "network_error"
+                transport_source = (
+                    "router_transport_error"
+                    if is_stream_protocol_error
+                    else "initial_response_timeout"
+                    if initial_response_timeout
+                    else "upstream_connect_failure"
+                    if connect_phase
+                    else "upstream_stream_terminal_failure"
+                )
+                classification = self.policy.classify_candidate_error(None, str(err), transport_source)
+                failure_reason = classification.log_reason
+                lock_release_reason = (
+                    "stream_protocol_error"
+                    if is_stream_protocol_error
+                    else "initial_response_timeout"
+                    if initial_response_timeout
+                    else "network_error"
+                )
                 log_status = "protocol" if is_stream_protocol_error else "network"
                 log_event = "stream_protocol_error" if is_stream_protocol_error else "network"
                 if is_stream_protocol_error:
@@ -1966,12 +2105,20 @@ class CandidateRuntime:
                 # 首帧前网络/协议失败已经实际触达上游；只记匿名风险尝试，
                 # 不把取消、busy 等未发出上游请求的本地事件混入该窗口。
                 self._record_risk_outcome(candidate, "other")
-                saw_cooldown = True
+                health_blocked = False
 
                 # 聚合成员网络失败只更新成员，底层真实模型继续保留独立健康状态。
                 if is_aggregate_candidate and aggregate_model and candidate.aggregate_member_id:
                     cooldown_seconds = state.aggregate_cooldown_seconds(aggregate_model)
-                    state.set_aggregate_member_cooldown(candidate.aggregate_member_id, str(err), cooldown_seconds, failure_reason)
+                    if classification.should_cooldown:
+                        health_blocked = state.set_aggregate_member_cooldown(
+                            candidate.aggregate_member_id,
+                            str(err),
+                            cooldown_seconds,
+                            failure_reason,
+                            classification.category,
+                        )
+                    saw_cooldown = saw_cooldown or health_blocked
                     failure_scope = classification.failure_scope
                     fallback_chain.append({
                         "member_id": candidate.aggregate_member_id,
@@ -1980,20 +2127,34 @@ class CandidateRuntime:
                         "manual_price": candidate.manual_price,
                         "status": "network",
                         "reason": self.preparation.short_error(str(err)),
-                        "cooldown_applied": True,
+                        "cooldown_applied": health_blocked,
                         "failure_scope": failure_scope,
                         "category": failure_reason,
                         "waf_compatible": group.waf_compatible,
                     })
                     fallback_index += 1
-                    detail = f"cooldown_applied=true; failure_scope={failure_scope}; {failure_reason}; try next; error={self.preparation.short_error(str(err))}; {_stream_metrics_text(stream_metrics)}"
-                    self.observability.add_log(path, candidate.label, log_status, self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason=lock_release_reason, aggregate_suffix=aggregate_suffix), duration_ms, group=group, request_id=request_id, attempt=attempt, event=log_event, cooldown_applied=True, failure_scope=failure_scope)
+                    detail = (
+                        f"cooldown_applied={str(health_blocked).lower()}; failure_scope={failure_scope}; "
+                        f"connect_phase={str(connect_phase).lower()}; {failure_reason}; "
+                        f"try next; error={self.preparation.short_error(str(err))}; "
+                        f"{_stream_metrics_text(stream_metrics)}"
+                    )
+                    self.observability.add_log(path, candidate.label, log_status, self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason=lock_release_reason, aggregate_suffix=aggregate_suffix), duration_ms, group=group, request_id=request_id, attempt=attempt, event=log_event, cooldown_applied=health_blocked, failure_scope=failure_scope)
                     continue
                 if auto_fallback:
-                    if candidate.group.provider_type == PROVIDER_RELAY and candidate.idx is not None:
-                        state.set_cooldown(candidate.idx, str(err), self.policy.auto_cooldown_seconds(group), failure_reason)
-                    elif candidate.idx is not None:
-                        state.set_unusable(candidate.idx, str(err))
+                    if classification.should_cooldown:
+                        if candidate.group.provider_type == PROVIDER_RELAY and candidate.idx is not None:
+                            health_blocked = state.set_cooldown(
+                                candidate.idx,
+                                str(err),
+                                self.policy.auto_cooldown_seconds(group),
+                                failure_reason,
+                                classification.category,
+                            )
+                        elif candidate.idx is not None:
+                            state.set_unusable(candidate.idx, str(err))
+                            health_blocked = True
+                    saw_cooldown = saw_cooldown or health_blocked
                     failure_scope = classification.failure_scope
                     if not is_aggregate_candidate:
                         fallback_chain.append({
@@ -2003,14 +2164,19 @@ class CandidateRuntime:
                             "manual_price": candidate.manual_price,
                             "status": "network",
                             "reason": self.preparation.short_error(str(err)),
-                            "cooldown_applied": True,
+                            "cooldown_applied": health_blocked,
                             "failure_scope": failure_scope,
                             "category": failure_reason,
                             "waf_compatible": group.waf_compatible,
                         })
                         fallback_index += 1
-                    detail = f"cooldown_applied=true; failure_scope={failure_scope}; {failure_reason}; try next; error={self.preparation.short_error(str(err))}; {_stream_metrics_text(stream_metrics)}"
-                    self.observability.add_log(path, candidate.label, log_status, self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason=lock_release_reason), duration_ms, group=group, request_id=request_id, attempt=attempt, event=log_event, cooldown_applied=True, failure_scope=failure_scope)
+                    detail = (
+                        f"cooldown_applied={str(health_blocked).lower()}; failure_scope={failure_scope}; "
+                        f"connect_phase={str(connect_phase).lower()}; {failure_reason}; "
+                        f"try next; error={self.preparation.short_error(str(err))}; "
+                        f"{_stream_metrics_text(stream_metrics)}"
+                    )
+                    self.observability.add_log(path, candidate.label, log_status, self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason=lock_release_reason), duration_ms, group=group, request_id=request_id, attempt=attempt, event=log_event, cooldown_applied=health_blocked, failure_scope=failure_scope)
                     continue
                 failure_scope = classification.failure_scope
                 explicit_failure_recorded = self._record_explicit_qualified_failure(
@@ -2019,9 +2185,15 @@ class CandidateRuntime:
                     group,
                     str(err),
                     failure_reason,
+                    classification.category,
                     auto_fallback=auto_fallback,
                 )
-                detail = f"cooldown_applied={str(explicit_failure_recorded).lower()}; failure_scope={failure_scope}; {failure_reason}; error={self.preparation.short_error(str(err))}; {_stream_metrics_text(stream_metrics)}"
+                detail = (
+                    f"cooldown_applied={str(explicit_failure_recorded).lower()}; "
+                    f"failure_scope={failure_scope}; connect_phase={str(connect_phase).lower()}; "
+                    f"{failure_reason}; error={self.preparation.short_error(str(err))}; "
+                    f"{_stream_metrics_text(stream_metrics)}"
+                )
                 self.observability.add_log(path, candidate.label, log_status, self.preparation.debug_detail(candidate, requested_label, target_url, body_mode, body, payload_for_upstream, outbound_headers, detail, lock_wait_ms=lock_wait_ms, lock_release_reason=lock_release_reason), duration_ms, group=group, request_id=request_id, attempt=attempt, event=log_event, cooldown_applied=explicit_failure_recorded, failure_scope=failure_scope)
                 continue
 
@@ -2031,8 +2203,8 @@ class CandidateRuntime:
             return 502, {"Content-Type": "application/json; charset=utf-8"}, [error_body], request_id
         if (
             aggregate_model
-            and aggregate_first_frame_budget_started_at is not None
-            and time.perf_counter() - aggregate_first_frame_budget_started_at >= aggregate_first_frame_budget_seconds
+            and aggregate_first_frame_budget_seconds
+            and aggregate_first_frame_wait_elapsed_seconds >= aggregate_first_frame_budget_seconds
         ):
             if last_aggregate_candidate is not None:
                 self.observability.add_log(

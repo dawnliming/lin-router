@@ -218,9 +218,10 @@ def test_v054_frontend_contracts():
     assert "panel.querySelector('#group-waf')?.addEventListener('change'" in config_sources
     assert "API.recoverModel" in config_sources
     assert "API.recoverAggregateMember" in config_sources
+    assert "API.recoverAggregateMembers" in config_sources
     assert "reloadAfterAggregateMemberChange" in config_sources
     assert "冷却中（剩 ${mm}:${ss}）" in config_sources
-    assert "底层冷却中（剩 ${mm}:${ss}）" in config_sources
+    assert "底层冷却中（剩 ${mm}:${ss}）" not in config_sources
     assert "data-aggregate-member-status" in config_sources
     assert "恢复/启用" not in config_sources
     assert "_openDetailKey" in logs_js

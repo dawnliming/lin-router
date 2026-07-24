@@ -328,7 +328,7 @@ def test_response_failed_and_incomplete_have_distinct_stream_lifecycles() -> Non
                 assert f"completion_signal={signal}" in log.detail
                 assert f"lifecycle={lifecycle}" in log.detail
                 assert log.failure_scope == "upstream"
-                assert log.cooldown_applied is True
+                assert log.cooldown_applied is False
                 assert router.store.models[0].health_state == "observing"
                 assert router.store.models[0].consecutive_failures == expected_failures
                 assert router.live_requests_payload()["count"] == 0
@@ -336,10 +336,11 @@ def test_response_failed_and_incomplete_have_distinct_stream_lifecycles() -> Non
             status, _headers, stream, _request_id = router.stream("/v1/responses", stream_payload("response.completed"), context)
             assert status == 200
             assert b"response.completed" in b"".join(stream)
-            assert router.store.models[0].health_state == "normal"
+            # 成功不伪造清空滚动失败窗口；窗口仍有失败时保持 observing。
+            assert router.store.models[0].health_state == "observing"
             # 成功只追加匿名窗口，不会抹掉此前的合格失败。
             assert router.store.models[0].consecutive_failures == 2
-            assert router.store.models[0].attempt_window == ["qualified_failure", "qualified_failure", "success"]
+            assert len(router.store.models[0].qualified_failure_timestamps) == 2
             assert router.store.models[0].usable is True
     finally:
         upstream.shutdown()
@@ -384,7 +385,7 @@ def test_post_first_byte_idle_timeout_is_not_recorded_as_client_disconnect() -> 
             assert log.status == "timeout"
             assert "lifecycle=stream_idle_timeout" in log.detail
             assert "lifecycle=client_disconnected" not in log.detail
-            assert log.cooldown_applied is True
+            assert log.cooldown_applied is False
             assert router.store.models[0].health_state == "observing"
             assert router.store.models[0].consecutive_failures == 1
     finally:
@@ -433,7 +434,7 @@ def test_post_first_byte_network_error_counts_as_upstream_failure() -> None:
         assert "lifecycle=stream_incomplete" in log.detail
         assert "completion_signal=network_error" in log.detail
         assert log.failure_scope == "upstream"
-        assert log.cooldown_applied is True
+        assert log.cooldown_applied is False
         assert router.store.models[0].health_state == "observing"
         assert router.store.models[0].consecutive_failures == 1
         assert router.live_requests_payload()["count"] == 0

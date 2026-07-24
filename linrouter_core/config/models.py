@@ -30,6 +30,23 @@ MIN_FIXED_COOLDOWN_MINUTES = 1
 MAX_FIXED_COOLDOWN_MINUTES = 1440
 
 
+def _failure_timestamps(value: Any) -> List[int]:
+    """只接受匿名 epoch 秒值；保留同秒多次失败以免丢失阈值证据。"""
+    if not isinstance(value, list):
+        return []
+    timestamps: List[int] = []
+    for item in value:
+        if isinstance(item, bool):
+            continue
+        try:
+            timestamp = int(item)
+        except (TypeError, ValueError):
+            continue
+        if timestamp > 0:
+            timestamps.append(timestamp)
+    return sorted(timestamps)[-5:]
+
+
 class RoutingPolicyValidationError(ValueError):
     """路由策略配置非法时提供稳定错误码，供 HTTP 与导入入口统一返回。"""
 
@@ -211,11 +228,15 @@ class ModelConfig:
     cooldown_reason: str = ""
     health_state: str = "normal"
     consecutive_failures: int = 0
+    consecutive_network_failures: int = 0
     last_failure_at: int = 0
     breaker_until: int = 0
     breaker_reason: str = ""
     # 只保存匿名成功/合格失败结果，不能保存上游响应或请求内容。
     attempt_window: List[str] = field(default_factory=list)
+    # v0.6.4 之后以匿名时间戳作为滚动窗口唯一依据，旧 attempt_window 仅兼容读取。
+    qualified_failure_timestamps: List[int] = field(default_factory=list)
+    network_failure_timestamps: List[int] = field(default_factory=list)
     breaker_level: int = 0
 
     @classmethod
@@ -239,10 +260,13 @@ class ModelConfig:
             cooldown_reason=str(data.get("cooldown_reason", "")),
             health_state=str(data.get("health_state") or "normal"),
             consecutive_failures=max(0, int(data.get("consecutive_failures") or 0)),
+            consecutive_network_failures=max(0, int(data.get("consecutive_network_failures") or 0)),
             last_failure_at=max(0, int(data.get("last_failure_at") or 0)),
             breaker_until=max(0, int(data.get("breaker_until") or 0)),
             breaker_reason=str(data.get("breaker_reason", "")),
             attempt_window=[item for item in data.get("attempt_window", []) if item in {"success", "qualified_failure"}][-5:] if isinstance(data.get("attempt_window"), list) else [],
+            qualified_failure_timestamps=_failure_timestamps(data.get("qualified_failure_timestamps")),
+            network_failure_timestamps=_failure_timestamps(data.get("network_failure_timestamps")),
             breaker_level=max(0, int(data.get("breaker_level") or 0)),
         )
 
@@ -345,11 +369,14 @@ class AggregateMember:
     last_checked_at: str = ""
     health_state: str = "normal"
     consecutive_failures: int = 0
+    consecutive_network_failures: int = 0
     last_failure_at: int = 0
     breaker_until: int = 0
     breaker_reason: str = ""
     # 聚合成员独立维护匿名稳定性窗口，绝不改变底层真实模型的状态归属。
     attempt_window: List[str] = field(default_factory=list)
+    qualified_failure_timestamps: List[int] = field(default_factory=list)
+    network_failure_timestamps: List[int] = field(default_factory=list)
     breaker_level: int = 0
 
     @classmethod
@@ -378,9 +405,12 @@ class AggregateMember:
             last_checked_at=str(data.get("last_checked_at", "")),
             health_state=str(data.get("health_state") or "normal"),
             consecutive_failures=max(0, int(data.get("consecutive_failures") or 0)),
+            consecutive_network_failures=max(0, int(data.get("consecutive_network_failures") or 0)),
             last_failure_at=max(0, int(data.get("last_failure_at") or 0)),
             breaker_until=max(0, int(data.get("breaker_until") or 0)),
             breaker_reason=str(data.get("breaker_reason", "")),
             attempt_window=[item for item in data.get("attempt_window", []) if item in {"success", "qualified_failure"}][-5:] if isinstance(data.get("attempt_window"), list) else [],
+            qualified_failure_timestamps=_failure_timestamps(data.get("qualified_failure_timestamps")),
+            network_failure_timestamps=_failure_timestamps(data.get("network_failure_timestamps")),
             breaker_level=max(0, int(data.get("breaker_level") or 0)),
         )

@@ -157,6 +157,7 @@ const API = {
     });
   },
   reorderAggregateMembers(aggregateId, memberIds, expectedRevision) { return this.req(`/api/aggregates/${encodeURIComponent(aggregateId)}/members/reorder`, { method: 'POST', body: JSON.stringify({ member_ids: memberIds, expected_revision: expectedRevision }) }); },
+  recoverAggregateMembers(aggregateId) { return this.req(`/api/aggregates/${encodeURIComponent(aggregateId)}/recover-members`, { method: 'POST' }); },
   saveAggregateMember(id, data) { return this.req(`/api/aggregate-members/${id}`, { method: 'PUT', body: JSON.stringify(data) }); },
   clearAggregateMemberCooldown(id) { return this.req(`/api/aggregate-members/${id}/clear-cooldown`, { method: 'POST' }); },
   recoverAggregateMember(id) { return this.req(`/api/aggregate-members/${id}/recover`, { method: 'POST' }); },

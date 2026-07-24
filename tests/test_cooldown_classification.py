@@ -260,9 +260,38 @@ def build_aggregate(config, aggregate_id, member1_id, member2_id):
     return config
 
 
+def build_single_member_aggregate(port):
+    """构造仅含一个成员的聚合，便于连续验证同一成员的 500 窗口。"""
+    config = build_one_relay_group_two_models(port)
+    group = config["groups"][0]
+    model = config["models"][0]
+    aggregate_id = uuid.uuid4().hex
+    member_id = uuid.uuid4().hex
+    config["models"] = [model]
+    config["aggregate_models"] = [{
+        "id": aggregate_id,
+        "name": "agg-single",
+        "route_key": "lr-ag-single",
+        "enabled": True,
+        "routing_policy": "smart_breaker",
+        "cooldown_minutes": 5,
+    }]
+    config["aggregate_members"] = [{
+        "id": member_id,
+        "aggregate_id": aggregate_id,
+        "group_id": group["id"],
+        "model_id": model["id"],
+        "priority": 1,
+        "enabled": True,
+    }]
+    return config, member_id
+
+
 def make_router(config_path):
     store = ConfigStore(config_path)
-    return Router(store, settings_store=None)
+    # 测试必须使用临时日志，避免历史运行记录污染本次请求断言或写入仓库根目录。
+    log_path = Path(config_path).with_suffix(".logs.jsonl")
+    return Router(store, settings_store=None, log_file=log_path)
 
 
 def group_route_ctx(store, route_key):
@@ -324,6 +353,7 @@ def test_group_auto_400_no_cooldown():
             assert m.cooldown_until == 0, f"模型 {m.name} 不应有 cooldown"
 
         # 第二次正常请求应成功
+        log_start = len(router.logs)
         status, _headers, data = router.call("/v1/chat/completions", payload, ctx)
         assert status == 200, f"第二次请求期望 200，实际 {status}"
         resp = json.loads(data)
@@ -335,7 +365,7 @@ def test_group_auto_400_no_cooldown():
 
 
 def test_group_auto_500_cooldown_and_fallback():
-    """组级 auto：第一个模型 500 cooldown，fallback 到第二个模型成功。"""
+    """smart_breaker：第一个模型 500 仅观察，fallback 到第二个模型成功。"""
     port = get_free_port()
     server = start_server(Conditional500ThenOkHandler, port)
 
@@ -359,8 +389,9 @@ def test_group_auto_500_cooldown_and_fallback():
         assert resp["choices"][0]["message"]["content"] == "ok"
 
         model1, model2 = store.models[0], store.models[1]
-        assert model1.health_state == "observing", "第一个模型应进入观察态"
+        assert model1.health_state == "observing", "第一个模型应先进入观察"
         assert model1.consecutive_failures == 1
+        assert model1.cooldown_until == 0
         assert model2.cooldown_until == 0, "第二个模型不应 cooldown"
         print("PASS: 连接组 auto 500 进入 cooldown 并成功 fallback")
     finally:
@@ -484,6 +515,7 @@ def test_aggregate_500_cooldown_and_fallback():
         ctx = aggregate_route_ctx(store, "lr-ag-test")
         payload = {"model": "agg-test", "messages": [{"role": "user", "content": "hi"}]}
 
+        log_start = len(router.logs)
         status, _headers, data = router.call("/v1/chat/completions", payload, ctx)
         assert status == 200, f"期望 fallback 到第二个成员后 200，实际 {status}"
         resp = json.loads(data)
@@ -491,13 +523,111 @@ def test_aggregate_500_cooldown_and_fallback():
 
         member1 = next(m for m in store.aggregate_members if m.id == member1_id)
         member2 = next(m for m in store.aggregate_members if m.id == member2_id)
-        assert member1.health_state == "observing", "第一个成员应进入观察态"
+        assert member1.health_state == "observing", "第一个成员应先进入观察"
         assert member1.consecutive_failures == 1
+        assert member1.cooldown_until == 0
         assert member2.cooldown_until == 0, "第二个成员不应 cooldown"
+        member_logs = [
+            log for log in router.logs[:len(router.logs) - log_start]
+            if log.status == "500"
+        ]
+        assert len(member_logs) == 1
+        assert member_logs[0].event == "fallback"
+        assert member_logs[0].cooldown_applied is False
         print("PASS: 聚合模型 500 进入 cooldown 并成功 fallback")
     finally:
         server1.shutdown()
         server2.shutdown()
+        Path(config_path).unlink(missing_ok=True)
+
+
+def _assert_aggregate_500_health_blocking_semantics(stream: bool) -> None:
+    """HTTP 500 的日志/链路标记必须跟随健康服务实际阻断结果。"""
+    port = get_free_port()
+    server = start_server(ServerError500Handler, port)
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        config_path = f.name
+        config, member_id = build_single_member_aggregate(port)
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+    try:
+        router = make_router(config_path)
+        store = router.store
+        ctx = aggregate_route_ctx(store, "lr-ag-single")
+        payload = {
+            "model": "agg-single",
+            "messages": [{"role": "user", "content": "500 health semantics"}],
+            "stream": stream,
+        }
+        expected_event = ("fallback", "fallback", "cooldown")
+        expected_blocked = (False, False, True)
+        for index in range(3):
+            log_start = len(router.logs)
+            try:
+                if stream:
+                    router.stream("/v1/chat/completions", payload, ctx)
+                else:
+                    router.call("/v1/chat/completions", payload, ctx)
+                raise AssertionError("500 聚合请求应失败并进入下一次尝试")
+            except Exception as err:
+                chain = getattr(err, "fallback_chain", []) or []
+                assert chain and chain[0]["cooldown_applied"] is expected_blocked[index]
+                request_logs = [
+                    log for log in router.logs[:len(router.logs) - log_start]
+                    if log.status == "500"
+                ]
+                assert len(request_logs) == 1, [
+                    (log.event, log.status, log.request_id, log.cooldown_applied)
+                    for log in router.logs
+                ]
+                log = request_logs[0]
+                assert log.event == expected_event[index]
+                assert log.cooldown_applied is expected_blocked[index]
+
+            member = store.find_aggregate_member(member_id)
+            assert member is not None
+            if index < 2:
+                assert member.health_state == "observing"
+                assert member.cooldown_until == 0
+            else:
+                assert member.health_state == "breaker_open"
+                assert member.breaker_until > int(time.time())
+    finally:
+        server.shutdown()
+        server.server_close()
+        Path(config_path).unlink(missing_ok=True)
+
+
+def test_aggregate_non_stream_500_uses_health_blocked_result() -> None:
+    _assert_aggregate_500_health_blocking_semantics(stream=False)
+
+
+def test_aggregate_stream_500_uses_health_blocked_result() -> None:
+    _assert_aggregate_500_health_blocking_semantics(stream=True)
+
+
+def test_request_candidate_skips_are_not_written_as_request_logs() -> None:
+    config = build_two_relay_groups_one_model_each(get_free_port(), get_free_port())
+    aggregate_id = uuid.uuid4().hex
+    member1_id = uuid.uuid4().hex
+    member2_id = uuid.uuid4().hex
+    build_aggregate(config, aggregate_id, member1_id, member2_id)
+    config["aggregate_members"][0]["enabled"] = False
+    config["models"][1]["api_key"] = ""
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        config_path = f.name
+        json.dump(config, f, ensure_ascii=False, indent=2)
+    try:
+        router = make_router(config_path)
+        ctx = aggregate_route_ctx(router.store, "lr-ag-test")
+        payload = {"model": "agg-test", "messages": [{"role": "user", "content": "skip log"}]}
+        try:
+            router.call("/v1/chat/completions", payload, ctx)
+        except Exception:
+            pass
+        assert not any(log.event == "skip" for log in router.logs)
+    finally:
         Path(config_path).unlink(missing_ok=True)
 
 

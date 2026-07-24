@@ -212,10 +212,22 @@ const ConfigTabRuntimeView = {
         display.textContent = '-';
       }
       const stateEl = document.getElementById('model-health-state');
-      if (stateEl) stateEl.textContent = controller.modelHealthLabel(healthState);
+      const failureInfo = typeof controller.failureWindowInfo === 'function'
+        ? controller.failureWindowInfo(m)
+        : { count: Number(m?.consecutive_failures || 0), remainingSeconds: 0 };
+      const failureText = typeof controller.formatFailureWindow === 'function'
+        ? controller.formatFailureWindow(m)
+        : `最近5次失败 ${Math.min(5, failureInfo.count)}/5`;
+      if (stateEl) {
+        stateEl.textContent = healthState === 'observing'
+          ? `观察中 · ${failureText} · breaker_level ${Number(m?.breaker_level || 0)}`
+          : healthState === 'breaker_open'
+            ? `已熔断 · ${failureText} · breaker_level ${Number(m?.breaker_level || 0)}`
+            : controller.modelHealthLabel(healthState);
+      }
       const failuresEl = document.getElementById('model-consecutive-failures');
-      const attemptFailures = (m?.attempt_window || []).filter(result => result === 'qualified_failure').length;
-      if (failuresEl) failuresEl.textContent = `${attemptFailures} / 5`;
+      const attemptFailures = failureInfo.count;
+      if (failuresEl) failuresEl.textContent = `${Math.min(5, attemptFailures)}/5`;
       const reasonEl = document.getElementById('model-health-reason');
       if (reasonEl) reasonEl.textContent = m?.derived_reason || m?.breaker_reason || m?.cooldown_reason || m?.last_error || '-';
       const row = display.closest('.form-row');

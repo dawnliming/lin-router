@@ -67,7 +67,7 @@ from linrouter_core.runtime import (
     StreamExecutionService,
 )
 from linrouter_core.runtime.http_api_runtime import handle_delete, handle_get, handle_post, handle_put
-from linrouter_core.runtime.router_runtime import CONNECT_TIMEOUT_SECONDS
+from linrouter_core.runtime.router_runtime import UPSTREAM_INITIAL_RESPONSE_TIMEOUT_SECONDS
 from linrouter_core.runtime.execution_runtime_ports import (
     CandidateStatePort,
     ConcurrencyPort as RuntimeConcurrencyPort,
@@ -369,6 +369,19 @@ class ArkProxyRouter:
             self._upstream_client = UpstreamClient(client_type=client_type, http2=http2, keepalive=keepalive, ssl_context=_ssl_context)
 
     def _resolve_log_file(self) -> Path:
+        # 应用服务会显式传入日志路径；省略时优先随配置存放，既避免测试把
+        # 运行日志写进工作目录，也让临时配置的日志与其生命周期保持一致。
+        config_path = getattr(self.store, "path", None)
+        if config_path is not None:
+            try:
+                candidate = Path(config_path).parent / "lin-router-logs.jsonl"
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                with candidate.open("a", encoding="utf-8"):
+                    pass
+                return candidate
+            except Exception:
+                # Store 替身或受限目录仍沿用既有平台级回退策略。
+                pass
         candidates = [
             get_platform().get_log_dir() / "lin-router-logs.jsonl",
             Path.home() / ".lin-router" / "logs" / "lin-router-logs.jsonl",
@@ -1552,7 +1565,7 @@ class ArkProxyRouter:
         if not acquired:
             return False, "serial_protection_wait_timeout", "该连接组已开启串行保护，候选仍在处理请求"
         try:
-            # 探测同样是真实上游尝试：遵守 8 秒建连/响应头边界，并把结果写入
+            # 探测同样是真实上游尝试：遵守初始响应边界，并把结果写入
             # 匿名风险窗口；但不触碰模型/成员的常规稳定性熔断窗口。
             with self._upstream_client.request(
                 "POST",
@@ -1560,7 +1573,7 @@ class ArkProxyRouter:
                 headers,
                 body,
                 stream=False,
-                timeout=CONNECT_TIMEOUT_SECONDS,
+                timeout=UPSTREAM_INITIAL_RESPONSE_TIMEOUT_SECONDS,
             ) as resp:
                 response_body = resp.read()
                 if 200 <= int(resp.status) < 300:
@@ -1748,11 +1761,7 @@ class ArkProxyRouter:
                 "code": "smart_breaker_disabled",
                 **policy_status,
             }
-        if model.disabled_by_user or (
-            not model.usable
-            and not model.cooldown_until
-            and model.health_state != "breaker_open"
-        ):
+        if model.disabled_by_user:
             return {"ok": False, "message": "底层模型为手动停用状态，不能自动恢复聚合成员。", "code": "underlying_manual_disabled"}
         before = asdict(member)
         member.health_state = "half_open_probe"
@@ -1773,6 +1782,31 @@ class ArkProxyRouter:
         self.store.save()
         self.add_log("/api/aggregate-members/recover", model.name, "probe_ok", f"manual_probe=true; aggregate_member_id={member.id}; probe_result=success; summary=最小探测成功，成员已恢复参与调度。; cooldown_applied=false; failure_scope=manual", group=group, request_id=f"manual-probe-{uuid.uuid4().hex}", event="manual_probe", usage_source="manual_probe", failure_scope="manual")
         return {"ok": True, "message": "最小探测成功，已恢复该聚合成员参与调度。", "member": asdict(member), "before": before}
+
+    def recover_aggregate_members(self, aggregate_id: str) -> Dict[str, Any]:
+        """无探测恢复当前聚合的自动异常成员，底层模型状态保持原样。"""
+        result = self.candidate_health.recover_aggregate_members(aggregate_id)
+        if not result.get("ok"):
+            return result
+        aggregate = self.store.find_aggregate(aggregate_id)
+        if aggregate:
+            self.add_log(
+                "/api/aggregates/recover-members",
+                aggregate.name,
+                "recover",
+                (
+                    "aggregate_recovery=true; upstream_probe=false; "
+                    f"recovered_count={result['recovered_count']}; "
+                    f"already_normal_count={result['already_normal_count']}; "
+                    f"manual_disabled_count={result['manual_disabled_count']}; "
+                    f"risk_isolated_count={result['risk_isolated_count']}; "
+                    f"missing_target_count={result['missing_target_count']}"
+                ),
+                event="aggregate_recovery",
+                failure_scope="manual",
+            )
+        return result
+
     def _iter_upstream_candidates(self, requested_model: str | None, group_id: str | None = None) -> Iterator[UpstreamCandidate]:
         yield from self.runtime.iter_upstream_candidates(requested_model, group_id)
 
@@ -1888,8 +1922,21 @@ class ArkProxyRouter:
             minutes = DEFAULT_AUTO_MODEL_COOLDOWN_MINUTES
         return max(0, minutes) * 60
 
-    def _set_aggregate_member_cooldown(self, member_id: str, error: str, cooldown_seconds: int, reason: str) -> None:
-        self.candidate_health.set_aggregate_member_cooldown(member_id, error, cooldown_seconds, reason)
+    def _set_aggregate_member_cooldown(
+        self,
+        member_id: str,
+        error: str,
+        cooldown_seconds: int,
+        reason: str,
+        category: str | None = None,
+    ) -> bool:
+        return self.candidate_health.set_aggregate_member_cooldown(
+            member_id,
+            error,
+            cooldown_seconds,
+            reason,
+            category,
+        )
 
     def _mark_aggregate_member_success(self, member_id: str) -> None:
         self.candidate_health.mark_aggregate_member_success(member_id)
@@ -1897,11 +1944,31 @@ class ArkProxyRouter:
     def _set_unusable(self, idx: int, error: str) -> None:
         self.candidate_health.set_unusable(idx, error)
 
-    def _set_cooldown(self, idx: int, error: str, cooldown_seconds: int, reason: str) -> None:
-        self.candidate_health.set_cooldown(idx, error, cooldown_seconds, reason)
+    def _set_cooldown(
+        self,
+        idx: int,
+        error: str,
+        cooldown_seconds: int,
+        reason: str,
+        category: str | None = None,
+    ) -> bool:
+        return self.candidate_health.set_cooldown(idx, error, cooldown_seconds, reason, category)
 
-    def _record_qualified_failure(self, idx: int, error: str, cooldown_seconds: int, reason: str) -> bool:
-        return self.candidate_health.record_qualified_failure(idx, error, cooldown_seconds, reason)
+    def _record_qualified_failure(
+        self,
+        idx: int,
+        error: str,
+        cooldown_seconds: int,
+        reason: str,
+        category: str | None = None,
+    ) -> bool:
+        return self.candidate_health.record_qualified_failure(
+            idx,
+            error,
+            cooldown_seconds,
+            reason,
+            category,
+        )
 
     def _set_success(self, idx: int) -> None:
         self.candidate_health.set_success(idx)
@@ -2705,6 +2772,10 @@ class RouterHandler(BaseHTTPRequestHandler):
             "health_state": health_state,
             "consecutive_failures": model.consecutive_failures,
             "attempt_window": list(getattr(model, "attempt_window", []) or []),
+            # 仅暴露匿名时间戳，前端据此计算滚动观察窗口；不回传请求内容或凭证信息。
+            "qualified_failure_timestamps": list(getattr(model, "qualified_failure_timestamps", []) or []),
+            "network_failure_timestamps": list(getattr(model, "network_failure_timestamps", []) or []),
+            "failure_window_ttl_seconds": self.router.candidate_health._ATTEMPT_WINDOW_TTL_SECONDS,
             "breaker_level": int(getattr(model, "breaker_level", 0) or 0),
             "cooldown_until": model.cooldown_until,
             "cooldown_reason": model.cooldown_reason,
@@ -2759,18 +2830,6 @@ class RouterHandler(BaseHTTPRequestHandler):
         elif model.usable is False and model.disabled_by_user:
             status = "underlying_model_disabled"
             reason = "底层真实模型已手动停用"
-        elif self.router.candidate_health.runtime_health_state(model) == "breaker_open":
-            status = "underlying_model_breaker_open"
-            reason = model.breaker_reason or "底层真实模型已触发智能熔断"
-        elif self.router.candidate_health.runtime_health_state(model) == "half_open_probe":
-            status = "underlying_model_half_open_probe"
-            reason = "底层真实模型正在执行唯一恢复探测"
-        elif self.router.candidate_health.runtime_health_state(model) == "cooling":
-            status = "underlying_model_cooling"
-            reason = model.cooldown_reason or "底层真实模型正在冷却"
-        elif self.router.candidate_health.runtime_health_state(model) == "observing":
-            status = "underlying_model_observing"
-            reason = model.last_error or "底层真实模型正在观察连续失败"
         elif member.last_error:
             status = "warning"
             reason = member.last_error
@@ -2786,6 +2845,10 @@ class RouterHandler(BaseHTTPRequestHandler):
             "health_state": health_state,
             "consecutive_failures": member.consecutive_failures,
             "attempt_window": list(getattr(member, "attempt_window", []) or []),
+            # 聚合成员使用自己的滚动窗口；底层模型的自动窗口不跨域投影。
+            "qualified_failure_timestamps": list(getattr(member, "qualified_failure_timestamps", []) or []),
+            "network_failure_timestamps": list(getattr(member, "network_failure_timestamps", []) or []),
+            "failure_window_ttl_seconds": self.router.candidate_health._ATTEMPT_WINDOW_TTL_SECONDS,
             "breaker_level": int(getattr(member, "breaker_level", 0) or 0),
             "cooldown_until": member.cooldown_until,
             "cooldown_reason": member.cooldown_reason,
@@ -2794,7 +2857,13 @@ class RouterHandler(BaseHTTPRequestHandler):
             "last_error": member.last_error,
             "last_success_at": getattr(member, "last_success_at", ""),
             "last_failure_at": getattr(member, "last_failure_at", ""),
-            "underlying_model_status": self._model_runtime_item(model)["derived_status"] if model else "missing",
+            # 仅保留人工停用/风险边界，不能把底层自动熔断状态泄漏到聚合成员。
+            "underlying_model_status": (
+                "missing" if not model
+                else "manual_disabled" if model.disabled_by_user
+                else "risk_isolated" if risk["risk_isolated"]
+                else "available"
+            ),
             **policy,
             **risk,
         }

@@ -47,6 +47,7 @@ def test_candidate_health_preserves_manual_member_disable_and_reload(tmp_path) -
     disabled = reloaded.find_aggregate_member("am2")
     assert cooling is not None and cooling.health_state == "observing"
     assert cooling.consecutive_failures == 1
+    assert cooling.cooldown_until == 0
     assert disabled is not None and disabled.enabled is False
 
 
@@ -60,6 +61,7 @@ def test_candidate_health_writes_model_states_without_second_copy(tmp_path) -> N
     assert reloaded.models[0].usable is True
     assert reloaded.models[0].health_state == "observing"
     assert reloaded.models[0].consecutive_failures == 1
+    assert reloaded.models[0].cooldown_until == 0
     assert reloaded.models[1].usable is False
     assert reloaded.models[1].cooldown_until == 0
 
@@ -79,13 +81,13 @@ def test_breaker_is_enabled_by_default_and_opens_after_three_of_five_failures(tm
 
     router._set_success(0)
     recovered = ConfigStore(path).models[0]
-    assert recovered.health_state == "normal"
-    assert recovered.consecutive_failures == 2
+    assert recovered.health_state == "observing"
+    assert recovered.consecutive_failures == 3
     assert recovered.breaker_level == 1
     assert recovered.breaker_until == 0
 
 
-def test_expired_breaker_remains_out_of_automatic_selection_until_manual_probe(tmp_path) -> None:
+def test_expired_breaker_auto_returns_to_observing_for_automatic_selection(tmp_path) -> None:
     _router_instance, path = _router(tmp_path)
     settings = SettingsStore(path)
     settings.update({"smart_breaker_enabled": True})
@@ -96,7 +98,7 @@ def test_expired_breaker_remains_out_of_automatic_selection_until_manual_probe(t
     model.breaker_until = int(time.time()) - 1
 
     assert list(router._iter_upstream_candidates(None, "g1"))[0].label == "first"
-    assert router.candidate_health.runtime_health_state(model) == "half_open_probe"
+    assert router.candidate_health.runtime_health_state(model) == "observing"
 
 
 def test_disabled_breaker_does_not_filter_persisted_open_state(tmp_path) -> None:
@@ -115,7 +117,7 @@ def test_disabled_breaker_does_not_filter_persisted_open_state(tmp_path) -> None
     assert model.usable is True
 
 
-def test_aggregate_reports_open_underlying_breaker_and_clears_it_when_disabled(tmp_path) -> None:
+def test_aggregate_ignores_open_underlying_automatic_breaker(tmp_path) -> None:
     _router_instance, path = _router(tmp_path)
     settings = SettingsStore(path)
     settings.update({"smart_breaker_enabled": True})
@@ -129,7 +131,7 @@ def test_aggregate_reports_open_underlying_breaker_and_clears_it_when_disabled(t
     model.cooldown_until = int(time.time()) + 60
 
     reason, _message, _group, _model = router.candidate_health.aggregate_member_skip_reason(member)
-    assert reason == "underlying_model_breaker_open"
+    assert reason == ""
 
     settings.update({"smart_breaker_enabled": False})
     router.candidate_health.clear_system_health_states()
@@ -167,7 +169,7 @@ def test_manual_probe_rejections_and_busy_restore_prior_health_without_counting(
     assert member.breaker_until == 0
 
 
-def test_aggregate_member_breaker_isolated_and_reset_on_success(tmp_path) -> None:
+def test_aggregate_member_breaker_isolated_and_success_keeps_observation_window(tmp_path) -> None:
     router, path = _router(tmp_path)
     settings = SettingsStore(path)
     settings.update({"smart_breaker_enabled": True})
@@ -188,7 +190,7 @@ def test_aggregate_member_breaker_isolated_and_reset_on_success(tmp_path) -> Non
     router._mark_aggregate_member_success(member.id)
     recovered = ConfigStore(path).find_aggregate_member(member.id)
     assert recovered is not None
-    assert recovered.health_state == "normal"
+    assert recovered.health_state == "observing"
     assert recovered.consecutive_failures == 3
     assert recovered.breaker_level == 1
     assert recovered.breaker_until == 0

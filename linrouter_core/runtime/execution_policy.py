@@ -33,6 +33,16 @@ class ExecutionPolicyService:
         raw: str,
         error_kind: str = "http",
     ) -> CandidateErrorClassification:
+        # 传输来源必须保留到日志与状态 API；只有本地适配器错误不应
+        # 作为候选健康证据，其余来源仍由 smart_breaker 的窗口统一判定。
+        if error_kind == "router_transport_error":
+            return CandidateErrorClassification(False, False, error_kind, error_kind, "request")
+        if error_kind in {
+            "initial_response_timeout",
+            "upstream_connect_failure",
+            "upstream_stream_terminal_failure",
+        }:
+            return CandidateErrorClassification(True, False, error_kind, error_kind, "upstream")
         if error_kind in ("network", "stream_timeout"):
             return CandidateErrorClassification(True, False, error_kind, error_kind, "upstream")
         if status_code is None:

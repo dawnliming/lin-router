@@ -139,6 +139,8 @@ def test_clear_cooldown_restores_member():
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
         config_path = f.name
         cfg = build_config(port)
+        # clear-cooldown 只验证显式固定冷却的恢复动作，不能依赖 smart_breaker 首错冷却。
+        cfg["aggregate_models"][0]["routing_policy"] = "fixed_cooldown"
         member_id = cfg["aggregate_members"][0]["id"]
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
@@ -156,10 +158,11 @@ def test_clear_cooldown_restores_member():
             assert getattr(err, "error_code", "") == "aggregate_members_unavailable", f"期望 aggregate_members_unavailable，实际 {err}"
 
         member = store.find_aggregate_member(member_id)
-        assert member.health_state == "observing", "成员应处于观察态"
-        assert member.consecutive_failures == 1
+        assert member.health_state == "cooling", "成员应立即进入冷却态"
+        assert member.consecutive_failures == 0
         assert member.last_error != "", "成员应有 last_error"
-        assert member.cooldown_reason == "", "观察态不应保留冷却原因"
+        assert member.cooldown_until > int(time.time())
+        assert member.cooldown_reason != "", "冷却态应保留冷却原因"
 
         # 调用清冷却 API
         now_str = router._now()
@@ -206,12 +209,12 @@ def test_underlying_model_unusable():
         store.save()
         assert router._aggregate_member_usable(member) is False, "底层模型被禁用时成员应不可用"
 
-        # 真实模型处于 cooldown 时，聚合成员应不可用
+        # 底层模型自动 cooldown 不跨域阻断聚合成员；聚合成员只看自己的健康状态。
         model.usable = False
         model.disabled_by_user = False
         model.cooldown_until = int(time.time()) + 300
         store.save()
-        assert router._aggregate_member_usable(member) is False, "底层模型 cooldown 时成员应不可用"
+        assert router._aggregate_member_usable(member) is True, "底层模型自动 cooldown 不应阻断聚合成员"
 
         # 恢复正常后可用
         model.usable = True
@@ -224,7 +227,7 @@ def test_underlying_model_unusable():
         Path(config_path).unlink(missing_ok=True)
 
 
-def test_aggregate_member_skip_reason_logged():
+def test_aggregate_member_skip_reason_is_not_written_to_request_logs():
     port = get_free_port()
     server = start_server(FailOnce500Handler, port)
 
@@ -236,7 +239,11 @@ def test_aggregate_member_skip_reason_logged():
 
     try:
         store = ConfigStore(config_path)
-        router = Router(store, settings_store=None)
+        router = Router(
+            store,
+            settings_store=None,
+            log_file=Path(config_path).with_suffix(".logs.jsonl"),
+        )
         ctx = aggregate_route_ctx(store, "lr-ag-single")
         payload = {"model": "agg-single", "messages": [{"role": "user", "content": "hi"}]}
 
@@ -248,7 +255,7 @@ def test_aggregate_member_skip_reason_logged():
             raise AssertionError("成员停用时应无可用候选")
         except Exception as err:
             assert getattr(err, "error_code", "") == "aggregate_members_unavailable"
-        assert any(log.event == "skip" and "skip_reason=member_disabled" in log.detail for log in router.logs)
+        assert not any(log.event == "skip" for log in router.logs)
 
         member.enabled = True
         model = store.find_model(member.model_id)
@@ -260,7 +267,7 @@ def test_aggregate_member_skip_reason_logged():
             raise AssertionError("底层模型停用时应无可用候选")
         except Exception as err:
             assert getattr(err, "error_code", "") == "aggregate_members_unavailable"
-        assert any(log.event == "skip" and "skip_reason=underlying_model_disabled" in log.detail for log in router.logs)
+        assert not any(log.event == "skip" for log in router.logs)
     finally:
         server.shutdown()
         Path(config_path).unlink(missing_ok=True)
@@ -269,7 +276,7 @@ def test_aggregate_member_skip_reason_logged():
 def main():
     test_clear_cooldown_restores_member()
     test_underlying_model_unusable()
-    test_aggregate_member_skip_reason_logged()
+    test_aggregate_member_skip_reason_is_not_written_to_request_logs()
     print("\nAll aggregate clear-cooldown tests passed.")
 
 

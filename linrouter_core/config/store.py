@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -179,7 +180,21 @@ class ConfigStore:
             tmp.parent.mkdir(parents=True, exist_ok=True)
             with tmp.open("w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
-            tmp.replace(self.path)
+            self._replace_config_file(tmp)
+
+    def _replace_config_file(self, tmp: Path) -> None:
+        """保留原子替换，在 Windows 短暂文件占用时做有限重试。"""
+        for attempt in range(4):
+            try:
+                tmp.replace(self.path)
+                return
+            except PermissionError as exc:
+                # 杀毒扫描或刚关闭的读取句柄会短暂阻塞 Windows replace；只对
+                # WinError 5 重试，其他权限或文件系统错误必须立即交给调用方。
+                is_windows_access_denied = os.name == "nt" and getattr(exc, "winerror", None) == 5
+                if not is_windows_access_denied or attempt == 3:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
 
     def _cleanup_orphan_members(self) -> bool:
         """删除引用不存在 group/model 的聚合成员。"""
@@ -206,7 +221,10 @@ class ConfigStore:
         before = (
             item.health_state,
             item.consecutive_failures,
+            getattr(item, "consecutive_network_failures", 0),
             list(getattr(item, "attempt_window", []) or []),
+            list(getattr(item, "qualified_failure_timestamps", []) or []),
+            list(getattr(item, "network_failure_timestamps", []) or []),
             int(getattr(item, "breaker_level", 0) or 0),
             item.last_failure_at,
             item.breaker_until,
@@ -218,7 +236,10 @@ class ConfigStore:
             getattr(item, "usable", None),
         )
         item.consecutive_failures = 0
+        item.consecutive_network_failures = 0
         item.attempt_window = []
+        item.qualified_failure_timestamps = []
+        item.network_failure_timestamps = []
         item.breaker_level = 0
         item.last_failure_at = 0
         item.breaker_until = 0
@@ -236,7 +257,10 @@ class ConfigStore:
         after = (
             item.health_state,
             item.consecutive_failures,
+            getattr(item, "consecutive_network_failures", 0),
             list(getattr(item, "attempt_window", []) or []),
+            list(getattr(item, "qualified_failure_timestamps", []) or []),
+            list(getattr(item, "network_failure_timestamps", []) or []),
             int(getattr(item, "breaker_level", 0) or 0),
             item.last_failure_at,
             item.breaker_until,
@@ -269,6 +293,73 @@ class ConfigStore:
     def _restore_health_snapshots(self, snapshots: List[Tuple[Any, Dict[str, Any]]]) -> None:
         for item, snapshot in snapshots:
             self._restore_health_item(item, snapshot)
+
+    @staticmethod
+    def _active_failure_timestamps(values: Any, now_ts: int) -> List[int]:
+        """读取滚动 5 分钟内的匿名失败时间，旧字符串窗口不参与状态判断。"""
+        cutoff = now_ts - 5 * 60
+        timestamps: List[int] = []
+        for value in values if isinstance(values, list) else []:
+            if isinstance(value, bool):
+                continue
+            try:
+                timestamp = int(value)
+            except (TypeError, ValueError):
+                continue
+            if timestamp >= cutoff:
+                timestamps.append(timestamp)
+        return sorted(timestamps)[-5:]
+
+    @classmethod
+    def _refresh_failure_window(cls, item: ModelConfig | AggregateMember, now_ts: int) -> bool:
+        qualified = cls._active_failure_timestamps(
+            getattr(item, "qualified_failure_timestamps", []), now_ts
+        )
+        network = cls._active_failure_timestamps(
+            getattr(item, "network_failure_timestamps", []), now_ts
+        )
+        before = (
+            list(getattr(item, "attempt_window", []) or []),
+            list(getattr(item, "qualified_failure_timestamps", []) or []),
+            list(getattr(item, "network_failure_timestamps", []) or []),
+            int(getattr(item, "consecutive_failures", 0) or 0),
+            int(getattr(item, "consecutive_network_failures", 0) or 0),
+            int(getattr(item, "last_failure_at", 0) or 0),
+        )
+        item.attempt_window = []
+        item.qualified_failure_timestamps = qualified
+        item.network_failure_timestamps = network
+        item.consecutive_failures = len(qualified)
+        item.consecutive_network_failures = len(network)
+        item.last_failure_at = qualified[-1] if qualified else 0
+        after = (
+            item.attempt_window,
+            item.qualified_failure_timestamps,
+            item.network_failure_timestamps,
+            item.consecutive_failures,
+            item.consecutive_network_failures,
+            item.last_failure_at,
+        )
+        return before != after
+
+    @staticmethod
+    def _clear_breaker_cycle(item: ModelConfig | AggregateMember, now_str: str) -> None:
+        """breaker 到期后只清除本轮自动证据，保留 breaker_level 的阶梯记忆。"""
+        item.cooldown_until = 0
+        item.cooldown_reason = ""
+        item.breaker_until = 0
+        item.breaker_reason = ""
+        item.attempt_window = []
+        item.qualified_failure_timestamps = []
+        item.network_failure_timestamps = []
+        item.consecutive_failures = 0
+        item.consecutive_network_failures = 0
+        item.last_failure_at = 0
+        item.last_error = ""
+        item.last_checked_at = now_str
+        item.health_state = "observing"
+        if isinstance(item, ModelConfig) and not item.disabled_by_user:
+            item.usable = True
 
     def _save_health_scope_locked(self, snapshots: List[Tuple[Any, Dict[str, Any]]], changed: bool) -> bool:
         if not changed:
@@ -1144,6 +1235,46 @@ class ConfigStore:
             self.save()
             return True
 
+    def recover_aggregate_member_auto_health(
+        self,
+        aggregate_id: str,
+        member_ids: List[str],
+    ) -> Tuple[bool, str, int]:
+        """一次保存恢复本聚合指定成员的自动健康状态，不触碰底层模型。"""
+        with self._lock:
+            aggregate = self.find_aggregate(aggregate_id)
+            if not aggregate:
+                return False, "aggregate_not_found", 0
+            current_revision = self.aggregate_member_revision(aggregate_id)
+            target_ids = set(member_ids)
+            members = [
+                member for member in self.aggregate_members
+                if member.aggregate_id == aggregate_id and member.id in target_ids
+            ]
+            if len(members) != len(target_ids):
+                return False, "aggregate_member_not_found", current_revision
+            if not members:
+                return True, "", current_revision
+
+            previous_members = [AggregateMember.from_dict(asdict(member)) for member in self.aggregate_members]
+            previous_revision_present = aggregate_id in self.aggregate_member_revisions
+            now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            for member in members:
+                # member.enabled 的人工开关不在这里修改；breaker_level 也必须保留。
+                self._clear_breaker_cycle(member, now_str)
+
+            revision = self._touch_aggregate_member_revision(aggregate_id)
+            try:
+                self.save()
+            except Exception:
+                self.aggregate_members = previous_members
+                if previous_revision_present:
+                    self.aggregate_member_revisions[aggregate_id] = current_revision
+                else:
+                    self.aggregate_member_revisions.pop(aggregate_id, None)
+                return False, "config_save_failed", current_revision
+            return True, "", revision
+
     def remove_members_for_group(self, group_id: str) -> int:
         with self._lock:
             before = len(self.aggregate_members)
@@ -1166,22 +1297,21 @@ class ConfigStore:
         with self._lock:
             now = int(time.time())
             changed = False
-            for model in self.models:
-                if model.health_state == "cooling" and model.cooldown_until and model.cooldown_until <= now:
-                    # 冷却到期只回到观察态；熔断到期必须由运行时领取半开探测租约，不能在刷新中放行。
-                    model.cooldown_until = 0
-                    model.cooldown_reason = ""
-                    model.health_state = "observing" if model.consecutive_failures else "normal"
-                    if not model.disabled_by_user:
-                        model.usable = True
-                    model.last_checked_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+            now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+            for item in [*self.models, *self.aggregate_members]:
+                changed = self._refresh_failure_window(item, now) or changed
+                if item.health_state == "breaker_open" and int(item.breaker_until or 0) <= now:
+                    # breaker 到期自动回到观察态，不再占用下一次真实请求作为半开探测。
+                    self._clear_breaker_cycle(item, now_str)
                     changed = True
-            for member in self.aggregate_members:
-                if member.health_state == "cooling" and member.cooldown_until and member.cooldown_until <= now:
-                    member.cooldown_until = 0
-                    member.cooldown_reason = ""
-                    member.health_state = "observing" if member.consecutive_failures else "normal"
-                    member.last_checked_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+                    continue
+                if item.health_state == "cooling" and item.cooldown_until and item.cooldown_until <= now:
+                    item.cooldown_until = 0
+                    item.cooldown_reason = ""
+                    item.health_state = "observing" if item.consecutive_failures else "normal"
+                    if isinstance(item, ModelConfig) and not item.disabled_by_user:
+                        item.usable = True
+                    item.last_checked_at = now_str
                     changed = True
             if changed:
                 self.save()

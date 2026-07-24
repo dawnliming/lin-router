@@ -121,7 +121,7 @@ def test_risk_ui_source_has_dynamic_runtime_patch_and_confirmed_release_contract
 
     assert "risk_isolated: '风险隔离'" in config
     assert "上游风控保护" in config
-    assert "近 5 次合格失败" in config
+    assert "最近5次失败" in config
     assert "[data-group-risk-alert]" in runtime
     assert "patchModelRiskAlert" in runtime
     assert "onOpenRiskDiagnosis" in actions
